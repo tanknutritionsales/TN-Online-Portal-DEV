@@ -7,16 +7,16 @@ import { createHmac, randomBytes, randomUUID, scryptSync, timingSafeEqual } from
 
 const moduleUrl = import.meta.url || "";
 const modulePath = moduleUrl ? fileURLToPath(moduleUrl) : "";
-const __dirname = modulePath ? path.dirname(modulePath) : process.cwd();
-const publicDir = path.join(__dirname, "public");
-const dataDir = path.join(__dirname, "data");
+const appRootDir = modulePath ? path.dirname(modulePath) : process.cwd();
+const publicDir = path.join(appRootDir, "public");
+const dataDir = path.join(appRootDir, "data");
 const proofsDir = path.join(dataDir, "proofs");
 const productImagesDir = path.join(publicDir, "product-images");
 const ordersPath = path.join(dataDir, "orders.json");
 const usersPath = path.join(dataDir, "users.json");
 const shopSettingsPath = path.join(dataDir, "shop-settings.json");
 
-const env = loadDotEnv(path.join(__dirname, ".env"));
+const env = loadDotEnv(path.join(appRootDir, ".env"));
 const port = Number(process.env.PORT || env.PORT || 3141);
 const isProduction = process.env.NETLIFY || process.env.NODE_ENV === "production";
 const shopifyStoreSubdomain = process.env.SHOPIFY_STORE_SUBDOMAIN || env.SHOPIFY_STORE_SUBDOMAIN || "";
