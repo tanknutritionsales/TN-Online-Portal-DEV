@@ -1,0 +1,8 @@
+node_modules/
+.env
+data/*.json
+!data/*.example.json
+data/proofs/
+public/product-images/
+memory/
+*.log

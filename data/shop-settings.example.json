@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "updatedAt": null,
+  "settings": {
+    "featured": {
+      "mode": "collection",
+      "title": "Featured",
+      "subtitle": "",
+      "collectionQuery": "",
+      "customProductIds": []
+    },
+    "payment": {
+      "accountName": "",
+      "bankName": "",
+      "accountNumber": "",
+      "branchCode": "",
+      "note": ""
+    },
+    "references": {
+      "standardFormat": "OP-{YYYY}{MM}{DD}-{RAND4}",
+      "specialFormat": "SO-{YYYY}{MM}{DD}-{RAND4}"
+    }
+  }
+}

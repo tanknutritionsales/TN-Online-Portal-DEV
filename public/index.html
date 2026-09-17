@@ -1,0 +1,424 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Online Portal</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <main>
+      <section id="loginScreen" class="login-screen">
+        <div class="login-card panel">
+          <img class="login-logo" src="/assets/tank-nutrition-logo.png" alt="Tank Nutrition">
+          <p class="eyebrow">Online Portal</p>
+          <h1>Login</h1>
+          <form id="loginForm" class="form-stack">
+            <label>Username<input name="login" autocomplete="username" required></label>
+            <label>Password<input name="password" type="password" autocomplete="current-password" required></label>
+            <button class="primary" type="submit">Login</button>
+          </form>
+          <button id="showCreateAccount" class="ghost" type="button">Create account</button>
+        </div>
+      </section>
+
+      <section id="createAccountScreen" class="create-screen" hidden>
+        <div class="panel create-card">
+          <div class="screen-heading">
+            <button id="backToLogin" class="back-button" type="button" aria-label="Back to login">Back</button>
+            <div>
+              <p class="eyebrow">Online Portal</p>
+              <h1>Create account</h1>
+            </div>
+          </div>
+          <form id="registerForm" class="account-form">
+            <section>
+              <h2>Account</h2>
+              <div class="field-grid">
+                <label>Username <span>*</span><input name="username" autocomplete="username" required></label>
+                <label>Name <span>*</span><input name="name" autocomplete="name" required></label>
+                <label>Email <span>*</span><input name="email" type="email" autocomplete="email" required></label>
+                <label>Password <span>*</span><input name="password" type="password" autocomplete="new-password" minlength="4" required></label>
+              </div>
+            </section>
+
+            <section>
+              <h2>Contact</h2>
+              <div class="phone-row">
+                <label>Code <span>*</span>
+                  <select name="phoneArea" required>
+                    <option value="+27">+27 SA</option>
+                    <option value="+264">+264 NA</option>
+                    <option value="+267">+267 BW</option>
+                    <option value="+263">+263 ZW</option>
+                    <option value="+258">+258 MZ</option>
+                    <option value="+230">+230 MU</option>
+                  </select>
+                </label>
+                <label>Phone number <span>*</span><input name="phoneNumber" inputmode="numeric" autocomplete="tel-national" placeholder="82 123 4567" pattern="[0-9 ]{7,16}" maxlength="16" required></label>
+              </div>
+            </section>
+
+            <section>
+              <h2>Delivery address</h2>
+              <div class="field-grid">
+                <label class="wide">Street address <span>*</span><input name="line1" autocomplete="address-line1" required></label>
+                <label class="wide">Apartment, unit or complex<input name="line2" autocomplete="address-line2"></label>
+                <label>Suburb <span>*</span><input name="suburb" required></label>
+                <label>City <span>*</span><input name="city" autocomplete="address-level2" required></label>
+                <label>Province <span>*</span>
+                  <select name="province" autocomplete="address-level1" required>
+                    <option value="">Select province</option>
+                    <option>Eastern Cape</option>
+                    <option>Free State</option>
+                    <option>Gauteng</option>
+                    <option>KwaZulu-Natal</option>
+                    <option>Limpopo</option>
+                    <option>Mpumalanga</option>
+                    <option>Northern Cape</option>
+                    <option>North West</option>
+                    <option>Western Cape</option>
+                  </select>
+                </label>
+                <label>Postal code <span>*</span><input name="postalCode" inputmode="numeric" autocomplete="postal-code" pattern="[0-9]{4}" maxlength="4" placeholder="0000" required></label>
+              </div>
+            </section>
+
+            <button class="primary" type="submit">Create account</button>
+          </form>
+        </div>
+      </section>
+
+      <section id="appScreen" class="app-screen" hidden>
+        <header class="topbar">
+          <div class="brand-lockup">
+            <img src="/assets/tank-nutrition-logo.png" alt="Tank Nutrition">
+            <div>
+              <p class="eyebrow">Online Portal</p>
+              <h1 id="screenTitle">Shop</h1>
+            </div>
+          </div>
+          <nav id="mainNav" aria-label="Portal views">
+            <button class="tab customer-tab is-active" data-view="order">Shop</button>
+            <button class="tab customer-tab cart-tab icon-tab" data-view="cart" aria-label="Cart">
+              <svg aria-hidden="true" viewBox="0 0 24 24" focusable="false">
+                <path d="M6.2 6h14.1l-1.7 8.1a2 2 0 0 1-2 1.6H8.9a2 2 0 0 1-2-1.6L5.4 3.9H2.8V2.4h3.9L7 4.5 7.2 6Zm1.3 1.5 1.2 6.3c.1.3.3.5.7.5h7.2c.3 0 .6-.2.7-.5l1.3-6.3H7.5ZM9.2 21.6a2 2 0 1 1 0-4.1 2 2 0 0 1 0 4.1Zm7 0a2 2 0 1 1 0-4.1 2 2 0 0 1 0 4.1Z"></path>
+              </svg>
+              <span class="visually-hidden">Cart</span>
+              <span id="cartBubble" class="cart-bubble" hidden>0</span>
+            </button>
+            <button class="tab customer-tab" data-view="orders">My orders</button>
+            <button class="tab customer-tab" data-view="account">My account</button>
+            <button class="tab admin-tab" data-view="admin" hidden>Admin</button>
+          </nav>
+          <div class="account-pill">
+            <span id="accountName">Signed in</span>
+            <button id="logoutButton" type="button">Logout</button>
+            <button id="themeToggle" class="theme-toggle" type="button" aria-label="Switch to dark mode" title="Switch to dark mode">
+              <svg class="theme-icon sun-icon" aria-hidden="true" viewBox="0 0 24 24" focusable="false">
+                <path d="M12 17.2a5.2 5.2 0 1 0 0-10.4 5.2 5.2 0 0 0 0 10.4Zm0-1.7a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7ZM11.2 2h1.6v3.1h-1.6V2Zm0 16.9h1.6V22h-1.6v-3.1ZM2 11.2h3.1v1.6H2v-1.6Zm16.9 0H22v1.6h-3.1v-1.6ZM4.2 5.3l1.1-1.1 2.2 2.2-1.1 1.1-2.2-2.2Zm12.3 12.3 1.1-1.1 2.2 2.2-1.1 1.1-2.2-2.2Zm2.2-13.4 1.1 1.1-2.2 2.2-1.1-1.1 2.2-2.2ZM6.4 16.5l1.1 1.1-2.2 2.2-1.1-1.1 2.2-2.2Z"></path>
+              </svg>
+              <svg class="theme-icon moon-icon" aria-hidden="true" viewBox="0 0 24 24" focusable="false">
+                <path d="M20.2 15.3A7.6 7.6 0 0 1 8.7 3.8a8.8 8.8 0 1 0 11.5 11.5ZM12 20.2a7.1 7.1 0 0 1-5-12.1 9.2 9.2 0 0 0 8.9 8.9 7.1 7.1 0 0 1-3.9 1.2Z"></path>
+              </svg>
+            </button>
+          </div>
+        </header>
+
+        <section class="view is-active" id="view-order">
+          <div class="order-shell">
+            <section class="panel catalog">
+              <div class="shop-lead">
+                <div>
+                  <p class="eyebrow">Shop</p>
+                  <h2>Browse products</h2>
+                  <p class="muted">Select your products and submit a secure EFT order request.</p>
+                </div>
+                <button id="refreshCatalog" class="secondary" type="button">Refresh</button>
+              </div>
+              <section id="featuredSection" class="featured-section" aria-labelledby="featuredTitle" hidden>
+                <div class="section-heading compact-heading">
+                  <div>
+                    <p class="eyebrow">Featured</p>
+                    <h3 id="featuredTitle">Featured Dex</h3>
+                    <p id="featuredSubtitle" class="muted small"></p>
+                  </div>
+                  <div class="slider-actions" aria-label="Featured products">
+                    <button type="button" data-slider-step="-1" aria-label="Previous featured products">Prev</button>
+                    <button type="button" data-slider-step="1" aria-label="Next featured products">Next</button>
+                  </div>
+                </div>
+                <div id="featuredSlider" class="featured-slider"></div>
+              </section>
+              <section class="brand-section" aria-labelledby="brandCollectionsHeading">
+                <div class="section-heading compact-heading">
+                  <h3 id="brandCollectionsHeading">Brands</h3>
+                  <button id="clearBrandFilter" class="text-button" type="button">All brands</button>
+                </div>
+                <div id="brandCollections" class="brand-collections"></div>
+              </section>
+              <div class="shop-controls">
+                <label class="search-field" for="catalogSearch">
+                  <span>Search</span>
+                  <input id="catalogSearch" type="search" autocomplete="off" placeholder="Search products">
+                </label>
+                <details id="filterMenu" class="filter-menu">
+                  <summary>Filter</summary>
+                  <div class="filter-panel">
+                    <section>
+                      <h3>Type</h3>
+                      <div class="check-list">
+                        <label class="check-option"><input type="checkbox" data-type-filter="vial"> Vials</label>
+                        <label class="check-option"><input type="checkbox" data-type-filter="oral"> Orals</label>
+                        <label class="check-option"><input type="checkbox" data-type-filter="pen"> Pens</label>
+                        <label class="check-option"><input type="checkbox" data-type-filter="nasal"> Nasal</label>
+                      </div>
+                    </section>
+                    <section>
+                      <h3>Availability</h3>
+                      <div class="check-list">
+                        <label class="check-option"><input id="inStockFilter" type="checkbox"> In stock</label>
+                      </div>
+                    </section>
+                    <button id="clearProductFilters" class="text-button" type="button">Clear filters</button>
+                  </div>
+                </details>
+              </div>
+              <div id="catalogSummary" class="catalog-summary"></div>
+              <div id="productsTopPager" class="product-pager"></div>
+              <div id="products" class="products"></div>
+              <div id="productsBottomPager" class="product-pager bottom"></div>
+            </section>
+          </div>
+        </section>
+
+        <section class="view" id="view-cart">
+          <div class="cart-page">
+            <section class="panel checkout">
+              <div class="section-heading">
+                <div>
+                  <p class="eyebrow">EFT order</p>
+                  <h2>Cart</h2>
+                </div>
+                <span id="cartCount" class="pill">0 items</span>
+              </div>
+              <div id="cartItems" class="cart-items empty">No products selected.</div>
+              <div class="total-row">
+                <span>Total</span>
+                <strong id="cartTotal">R0.00</strong>
+              </div>
+              <form id="orderForm" class="form-stack delivery-form">
+                <section id="checkoutAddressPanel" class="checkout-address-panel"></section>
+                <label>Delivery notes<textarea name="notes" rows="2"></textarea></label>
+                <div class="cart-actions">
+                  <button class="secondary" id="openSpecialOrder" type="button">Special order</button>
+                  <button class="primary" type="submit">Submit order</button>
+                </div>
+              </form>
+            </section>
+          </div>
+        </section>
+
+        <section class="view" id="view-orders">
+          <div class="panel status-panel">
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">Orders</p>
+                <h2>My orders</h2>
+              </div>
+              <button id="refreshOrders" class="secondary" type="button">Refresh</button>
+            </div>
+            <div id="statusOrders" class="orders-list"></div>
+          </div>
+        </section>
+
+        <section class="view" id="view-account">
+          <div class="account-page">
+            <section class="panel status-panel">
+              <div class="section-heading">
+                <div>
+                  <p class="eyebrow">Account</p>
+                  <h2>My account</h2>
+                </div>
+              </div>
+              <div id="accountDetails" class="account-details"></div>
+            </section>
+          </div>
+        </section>
+
+        <section class="view" id="view-admin">
+          <div class="panel status-panel">
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">Admin</p>
+                <h2>Operations</h2>
+              </div>
+              <button id="refreshAdminPanel" class="secondary" type="button">Refresh</button>
+            </div>
+            <div class="admin-tabs" aria-label="Admin order views">
+              <button class="admin-view-tab is-active" type="button" data-admin-view="pending">Awaiting confirmation</button>
+              <button class="admin-view-tab" type="button" data-admin-view="ready">Ready to pack</button>
+              <button class="admin-view-tab" type="button" data-admin-view="completed">Completed</button>
+              <button class="admin-view-tab" type="button" data-admin-view="accounts">Accounts</button>
+              <button class="admin-view-tab" type="button" data-admin-view="system-status">System status</button>
+              <button class="admin-view-tab" type="button" data-admin-view="shop-settings">Shop settings</button>
+            </div>
+            <div id="adminOrdersSummary" class="catalog-summary"></div>
+            <div id="adminOrders" class="orders-list"></div>
+          </div>
+        </section>
+      </section>
+    </main>
+
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <div id="confirmAccountRemove" class="modal-backdrop" hidden>
+      <div class="confirm-modal" role="dialog" aria-modal="true" aria-labelledby="removeAccountTitle">
+        <form id="removeAccountForm">
+          <h2 id="removeAccountTitle">Confirm account removal</h2>
+          <p id="removeAccountText" class="muted"></p>
+          <label>Admin password
+            <input id="removeAccountPassword" name="password" type="password" autocomplete="current-password" required>
+          </label>
+          <div class="modal-actions">
+            <button class="secondary" type="button" data-cancel-remove-account>Cancel</button>
+            <button class="danger-button" type="submit">Remove account</button>
+          </div>
+        </form>
+      </div>
+    </div>
+    <div id="confirmAddressRemove" class="modal-backdrop" hidden>
+      <div class="confirm-modal" role="dialog" aria-modal="true" aria-labelledby="removeAddressTitle">
+        <form id="removeAddressForm">
+          <h2 id="removeAddressTitle">Remove delivery address</h2>
+          <p id="removeAddressText" class="muted"></p>
+          <div class="modal-actions">
+            <button class="secondary" type="button" data-cancel-remove-address>Cancel</button>
+            <button class="danger-button" type="submit">Remove address</button>
+          </div>
+        </form>
+      </div>
+    </div>
+    <div id="orderFlowModal" class="modal-backdrop" hidden>
+      <div class="confirm-modal wide-modal" role="dialog" aria-modal="true" aria-labelledby="orderFlowTitle">
+        <div class="modal-shell">
+          <h2 id="orderFlowTitle">Order summary</h2>
+          <div id="orderFlowContent"></div>
+          <div id="orderFlowActions" class="modal-actions"></div>
+        </div>
+      </div>
+    </div>
+    <div id="specialOrderModal" class="modal-backdrop" hidden>
+      <div class="confirm-modal wide-modal" role="dialog" aria-modal="true" aria-labelledby="specialOrderTitle">
+        <form id="specialOrderForm" class="account-address-form">
+          <div class="section-heading compact-heading">
+            <div>
+              <p class="eyebrow">Special order</p>
+              <h2 id="specialOrderTitle">Request a larger quantity</h2>
+            </div>
+          </div>
+          <section class="settings-grid">
+            <label class="wide">Product
+              <select id="specialProductSelect" name="productId" required></select>
+            </label>
+            <label>Quantity <span>*</span><input name="quantity" type="number" min="1" max="999" value="1" required></label>
+            <label class="wide">Delivery address
+              <select id="specialAddressSelect" name="addressId" required></select>
+            </label>
+          </section>
+          <button class="secondary inline-add" id="addSpecialAddress" type="button">Add address</button>
+          <label>Request note<textarea name="specialOrderNote" rows="3" placeholder="Quantity, timing, or special instructions"></textarea></label>
+          <label>Delivery notes<textarea name="deliveryNotes" rows="2"></textarea></label>
+          <div class="modal-actions">
+            <button class="secondary" type="button" data-cancel-special-order>Cancel</button>
+            <button class="primary" type="submit">Submit special order</button>
+          </div>
+        </form>
+      </div>
+    </div>
+    <div id="adminAccountModal" class="modal-backdrop" hidden>
+      <div class="confirm-modal wide-modal" role="dialog" aria-modal="true" aria-labelledby="adminAccountTitle">
+        <form id="adminAccountForm" class="admin-account-form">
+          <div class="section-heading compact-heading">
+            <div>
+              <p class="eyebrow">Accounts</p>
+              <h2 id="adminAccountTitle">Create account</h2>
+            </div>
+          </div>
+          <section class="settings-grid">
+            <label>Role
+              <select name="role" required>
+                <option value="customer">Customer</option>
+                <option value="admin">Admin</option>
+              </select>
+            </label>
+            <label>Username <span>*</span><input name="username" autocomplete="off" required></label>
+            <label>Name <span>*</span><input name="name" autocomplete="name" required></label>
+            <label data-admin-customer-field>Email <span>*</span><input name="email" type="email" autocomplete="email" required></label>
+            <label>Password <span>*</span><input name="password" type="password" minlength="4" autocomplete="new-password" required></label>
+            <label data-admin-customer-field>Area code
+              <select name="phoneArea">
+                <option value="+27">+27 South Africa</option>
+                <option value="+264">+264 Namibia</option>
+                <option value="+267">+267 Botswana</option>
+                <option value="+263">+263 Zimbabwe</option>
+                <option value="+266">+266 Lesotho</option>
+                <option value="+268">+268 Eswatini</option>
+              </select>
+            </label>
+            <label data-admin-customer-field>Phone <input name="phoneNumber" inputmode="numeric" autocomplete="tel-national" placeholder="82 123 4567"></label>
+            <label data-admin-customer-field>Street address <span>*</span><input name="line1" autocomplete="address-line1"></label>
+            <label data-admin-customer-field>Complex / unit <input name="line2" autocomplete="address-line2"></label>
+            <label data-admin-customer-field>Suburb <span>*</span><input name="suburb" autocomplete="address-level3"></label>
+            <label data-admin-customer-field>City <span>*</span><input name="city" autocomplete="address-level2"></label>
+            <label data-admin-customer-field>Province <span>*</span><input name="province" autocomplete="address-level1"></label>
+            <label data-admin-customer-field>Postal code <span>*</span><input name="postalCode" inputmode="numeric" pattern="[0-9]{4}" maxlength="4"></label>
+          </section>
+          <div class="modal-actions">
+            <button class="secondary" type="button" data-cancel-admin-account>Cancel</button>
+            <button class="primary" type="submit">Create account</button>
+          </div>
+        </form>
+      </div>
+    </div>
+    <div id="addressModal" class="modal-backdrop" hidden>
+      <div class="confirm-modal wide-modal" role="dialog" aria-modal="true" aria-labelledby="addressModalTitle">
+        <form id="addressForm" class="account-address-form">
+          <div class="section-heading compact-heading">
+            <div>
+              <p class="eyebrow">Delivery</p>
+              <h2 id="addressModalTitle">Add delivery address</h2>
+            </div>
+          </div>
+          <section class="settings-grid">
+            <label>Address label <span>*</span><input name="label" maxlength="80" placeholder="Home, Office, Warehouse" required></label>
+            <label>Street address <span>*</span><input name="line1" autocomplete="address-line1" required></label>
+            <label>Apartment, unit or complex<input name="line2" autocomplete="address-line2"></label>
+            <label>Suburb <span>*</span><input name="suburb" autocomplete="address-level3" required></label>
+            <label>City <span>*</span><input name="city" autocomplete="address-level2" required></label>
+            <label>Province <span>*</span>
+              <select name="province" required>
+                <option value="">Select province</option>
+                <option>Eastern Cape</option>
+                <option>Free State</option>
+                <option>Gauteng</option>
+                <option>KwaZulu-Natal</option>
+                <option>Limpopo</option>
+                <option>Mpumalanga</option>
+                <option>Northern Cape</option>
+                <option>North West</option>
+                <option>Western Cape</option>
+              </select>
+            </label>
+            <label>Postal code <span>*</span><input name="postalCode" inputmode="numeric" pattern="[0-9]{4}" maxlength="4" required></label>
+          </section>
+          <label class="check-option"><input name="isDefault" type="checkbox"> Use as default delivery address</label>
+          <div class="modal-actions">
+            <button class="secondary" type="button" data-cancel-address>Cancel</button>
+            <button class="primary" type="submit">Save address</button>
+          </div>
+        </form>
+      </div>
+    </div>
+    <script src="/app.js?v=20260916-admin-cleanup-1" type="module"></script>
+  </body>
+</html>
