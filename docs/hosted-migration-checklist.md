@@ -30,6 +30,8 @@ SHOPIFY_ORDER_SYNC_ENABLED=false
 SHOPIFY_ORDER_INVENTORY_BEHAVIOUR=DECREMENT_OBEYING_POLICY
 SHOPIFY_ORDER_SEND_RECEIPT=false
 DATABASE_URL=<Netlify Database connection string>
+DATA_STORAGE_MODE=blobs
+DATA_BLOB_STORE=op-runtime-data
 PROOF_STORAGE_MODE=blobs
 PROOF_BLOB_STORE=op-payment-proofs
 ```
@@ -53,11 +55,12 @@ BANK_BRANCH_CODE=<customer-facing branch code>
 - Production refuses unsafe default values for `SESSION_SECRET`, `INTERNAL_API_TOKEN`, and `ADMIN_PASSWORD`.
 - Source no longer contains the real Shopify store subdomain.
 - Local JSON files remain supported for development.
+- Hosted v0.1 can persist users, orders, and shop settings in Netlify Blobs with `DATA_STORAGE_MODE=blobs`.
 
 ## Still Needed Before Production Use
 
-- Add the database storage adapter for accounts, addresses, shop settings, orders, order items, POP metadata, status events, and tracking.
-- POP file uploads use Netlify Blobs when `PROOF_STORAGE_MODE=blobs`; order/database records store only metadata and the private blob key.
+- Replace the v0.1 runtime JSON Blob adapter with the database storage adapter for accounts, addresses, shop settings, orders, order items, POP metadata, status events, and tracking.
+- POP file uploads use Netlify Blobs when `PROOF_STORAGE_MODE=blobs`; order records store only metadata and the private blob key.
 - Seed/import only into a preview or explicitly approved production environment.
 - Rotate any secret that was pasted in chat or used during local testing.
 - Re-enable `SHOPIFY_ORDER_SYNC_ENABLED` only when paid-order hosted testing is approved.

@@ -33,6 +33,8 @@ const sessionSecret = process.env.SESSION_SECRET || env.SESSION_SECRET || "dev-s
 const sessionCookieName = "op_session";
 const sessionMaxAge = 60 * 60 * 24 * 7;
 const maxJsonBodyBytes = Number(process.env.MAX_JSON_BODY_BYTES || env.MAX_JSON_BODY_BYTES || 7_000_000);
+const dataStorageMode = process.env.DATA_STORAGE_MODE || env.DATA_STORAGE_MODE || (isProduction ? "blobs" : "local");
+const dataBlobStoreName = process.env.DATA_BLOB_STORE || env.DATA_BLOB_STORE || "op-runtime-data";
 const proofStorageMode = process.env.PROOF_STORAGE_MODE || env.PROOF_STORAGE_MODE || (isProduction ? "blobs" : "local");
 const proofBlobStoreName = process.env.PROOF_BLOB_STORE || env.PROOF_BLOB_STORE || "op-payment-proofs";
 const retailSharkInternalUrl = process.env.RETAIL_SHARK_INTERNAL_URL || env.RETAIL_SHARK_INTERNAL_URL || "";
@@ -101,6 +103,37 @@ function loadDotEnv(filePath) {
 
 function boolEnv(value) {
   return ["1", "true", "yes", "on"].includes(String(value || "").trim().toLowerCase());
+}
+
+function dataStorageUsesBlobs() {
+  return String(dataStorageMode || "").toLowerCase() === "blobs";
+}
+
+async function runtimeDataBlobStore() {
+  const { getStore } = await import("@netlify/blobs");
+  return getStore(dataBlobStoreName);
+}
+
+async function readDataJson(key, filePath, fallback) {
+  if (dataStorageUsesBlobs()) {
+    const store = await runtimeDataBlobStore();
+    const payload = await store.get(`${key}.json`, { type: "json", consistency: "strong" });
+    return payload || fallback;
+  }
+  await mkdir(dataDir, { recursive: true });
+  if (!existsSync(filePath)) return fallback;
+  return JSON.parse(await readFile(filePath, "utf8"));
+}
+
+async function writeDataJson(key, filePath, payload) {
+  if (dataStorageUsesBlobs()) {
+    const store = await runtimeDataBlobStore();
+    await store.setJSON(`${key}.json`, payload, { consistency: "strong" });
+    return payload;
+  }
+  await mkdir(dataDir, { recursive: true });
+  await writeFile(filePath, JSON.stringify(payload, null, 2));
+  return payload;
 }
 
 function validateRuntimeConfig() {
@@ -210,42 +243,30 @@ async function bodyJson(req) {
 }
 
 async function readOrdersData() {
-  await mkdir(dataDir, { recursive: true });
-  if (!existsSync(ordersPath)) return { version: 1, updatedAt: null, orders: [] };
-  const data = JSON.parse(await readFile(ordersPath, "utf8"));
+  const data = await readDataJson("orders", ordersPath, { version: 1, updatedAt: null, orders: [] });
   return { version: 1, updatedAt: data.updatedAt || null, orders: Array.isArray(data.orders) ? data.orders : [] };
 }
 
 async function writeOrdersData(data) {
-  await mkdir(dataDir, { recursive: true });
   const payload = { version: 1, updatedAt: new Date().toISOString(), orders: data.orders || [] };
-  await writeFile(ordersPath, JSON.stringify(payload, null, 2));
-  return payload;
+  return writeDataJson("orders", ordersPath, payload);
 }
 
 async function readUsersData() {
-  await mkdir(dataDir, { recursive: true });
-  if (!existsSync(usersPath)) {
-    const seeded = {
-      version: 1,
-      updatedAt: new Date().toISOString(),
-      users: [demoUser(), demoAdmin()],
-    };
-    await writeFile(usersPath, JSON.stringify(seeded, null, 2));
-    return seeded;
-  }
-  const data = JSON.parse(await readFile(usersPath, "utf8"));
+  const data = await readDataJson("users", usersPath, {
+    version: 1,
+    updatedAt: new Date().toISOString(),
+    users: [demoUser(), demoAdmin()],
+  });
   const normalized = normalizeUsersData(data);
   if (normalized.changed) await writeUsersData(normalized);
   return normalized;
 }
 
 async function writeUsersData(data) {
-  await mkdir(dataDir, { recursive: true });
   const normalized = normalizeUsersData(data);
   const payload = { version: 1, updatedAt: new Date().toISOString(), users: normalized.users || [] };
-  await writeFile(usersPath, JSON.stringify(payload, null, 2));
-  return payload;
+  return writeDataJson("users", usersPath, payload);
 }
 
 function normalizeUsersData(data = {}) {
@@ -345,17 +366,13 @@ function normalizeShopSettings(input = {}) {
 }
 
 async function readShopSettingsData() {
-  await mkdir(dataDir, { recursive: true });
-  if (!existsSync(shopSettingsPath)) return { version: 1, updatedAt: null, settings: defaultShopSettings() };
-  const data = JSON.parse(await readFile(shopSettingsPath, "utf8"));
+  const data = await readDataJson("shop-settings", shopSettingsPath, { version: 1, updatedAt: null, settings: defaultShopSettings() });
   return { version: 1, updatedAt: data.updatedAt || null, settings: normalizeShopSettings(data.settings || data) };
 }
 
 async function writeShopSettingsData(settings) {
-  await mkdir(dataDir, { recursive: true });
   const payload = { version: 1, updatedAt: new Date().toISOString(), settings: normalizeShopSettings(settings) };
-  await writeFile(shopSettingsPath, JSON.stringify(payload, null, 2));
-  return payload;
+  return writeDataJson("shop-settings", shopSettingsPath, payload);
 }
 
 function hashPassword(password, salt = randomBytes(16).toString("hex")) {

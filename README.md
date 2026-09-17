@@ -152,13 +152,15 @@ SHOPIFY_STORE_SUBDOMAIN
 SHOPIFY_ADMIN_ACCESS_TOKEN or SHOPIFY_APP_CLIENT_ID / SHOPIFY_APP_CLIENT_SECRET
 INTERNAL_API_TOKEN
 DATABASE_URL
+DATA_STORAGE_MODE=blobs
+DATA_BLOB_STORE=op-runtime-data
 PROOF_STORAGE_MODE=blobs
 PROOF_BLOB_STORE=op-payment-proofs
 ```
 
 The current local server now uses signed stateless cookies, so multiple browser sessions and future serverless instances can share the same session format once `SESSION_SECRET` is configured.
 
-Local POP uploads use `data/proofs/`. Hosted POP uploads should use private Netlify Blobs through the protected app API; only proof metadata and blob keys belong in database rows.
+Local testing uses JSON files under `data/`. Hosted v0.1 can use Netlify Blobs for runtime JSON data with `DATA_STORAGE_MODE=blobs` until the database adapter is added. Local POP uploads use `data/proofs/`; hosted POP uploads should use private Netlify Blobs through the protected app API.
 
 Keep `.env`, `data/*.json`, `data/proofs/`, `public/product-images/`, and `memory/` out of GitHub. Those are ignored locally because they may contain private runtime settings, customer records, POP files, cached images, or project memory.
 
