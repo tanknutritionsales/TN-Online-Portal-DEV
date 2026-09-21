@@ -449,6 +449,12 @@ function verifyPassword(password, stored) {
   return actual.length === expected.length && timingSafeEqual(actual, expected);
 }
 
+function secureTextEqual(left, right) {
+  const actual = createHmac("sha256", sessionSecret).update(String(left || "")).digest();
+  const expected = createHmac("sha256", sessionSecret).update(String(right || "")).digest();
+  return timingSafeEqual(actual, expected);
+}
+
 function isInsideDirectory(filePath, directory) {
   const relative = path.relative(directory, filePath);
   return Boolean(relative) && !relative.startsWith("..") && !path.isAbsolute(relative);
@@ -613,7 +619,44 @@ async function loginAdmin(input) {
   const login = cleanText(input.login || input.username || input.email, 180).toLowerCase();
   const admin = data.users.find((entry) => entry.role === "admin" && (entry.username === login || entry.email === login));
   if (admin && verifyPassword(input.password, admin.passwordHash)) return admin;
+  if (envAdminLoginMatches(login, input.password)) return repairEnvAdminAccount(data);
   throw Object.assign(new Error("Admin username or password is incorrect."), { status: 401 });
+}
+
+function envAdminLoginMatches(login, password) {
+  const configuredUsername = cleanText(adminUsername, 80).toLowerCase();
+  const configuredPassword = String(adminPassword || "");
+  if (!configuredUsername || !configuredPassword) return false;
+  return login === configuredUsername && secureTextEqual(password, configuredPassword);
+}
+
+async function repairEnvAdminAccount(data) {
+  const username = cleanText(adminUsername, 80).toLowerCase();
+  const now = new Date().toISOString();
+  let admin =
+    data.users.find((entry) => entry.role === "admin" && entry.username === username) ||
+    data.users.find((entry) => entry.role === "admin" && entry.id === "demo-admin") ||
+    data.users.find((entry) => entry.role === "admin");
+
+  if (!admin) {
+    admin = demoAdmin();
+    data.users.push(admin);
+  }
+
+  admin.role = "admin";
+  admin.username = username;
+  admin.name = cleanText(admin.name || "Admin", 120);
+  admin.email = cleanText(admin.email || `${username}@admin.local`, 180).toLowerCase();
+  admin.phoneArea = cleanText(admin.phoneArea || "+27", 12);
+  admin.phoneNumber = "";
+  admin.phone = "";
+  admin.defaultAddress = emptyAddress();
+  admin.addresses = [];
+  admin.preferences = normalizeCustomerPreferences(admin.preferences);
+  admin.passwordHash = hashPassword(adminPassword);
+  admin.updatedAt = now;
+  await writeUsersData(data);
+  return admin;
 }
 
 async function requireCustomer(req) {
