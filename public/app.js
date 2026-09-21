@@ -165,11 +165,23 @@ async function login(event) {
       await showApp({ admin: payload.admin });
       return;
     }
-    const payload = await api("/api/auth/login", {
-      method: "POST",
-      body: JSON.stringify({ login: loginValue, password }),
-    });
-    await showApp({ user: payload.user });
+    try {
+      const payload = await api("/api/auth/login", {
+        method: "POST",
+        body: JSON.stringify({ login: loginValue, password }),
+      });
+      await showApp({ user: payload.user });
+    } catch (customerError) {
+      try {
+        const payload = await api("/api/auth/admin-login", {
+          method: "POST",
+          body: JSON.stringify({ username: loginValue, password }),
+        });
+        await showApp({ admin: payload.admin });
+      } catch {
+        throw customerError;
+      }
+    }
   } catch (error) {
     toast(error.message);
   }
