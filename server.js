@@ -1680,6 +1680,7 @@ function collectionImageForVendor(vendor, lookup) {
 }
 
 async function cacheCatalogImages(products) {
+  if (isProduction) return products;
   await mkdir(productImagesDir, { recursive: true });
   return Promise.all(
     products.map(async (product) => {
