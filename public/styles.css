@@ -1584,12 +1584,18 @@ nav {
 
 .payment-box {
   display: grid;
-  gap: 4px;
+  gap: 7px;
   margin-top: 12px;
-  padding: 12px;
-  border: 1px solid #f2c3c5;
+  padding: 14px;
+  border: 1px solid #f3a6aa;
   border-radius: 8px;
-  background: var(--red-soft);
+  background: #fff5f5;
+  color: #181818;
+  box-shadow: inset 3px 0 0 var(--red);
+}
+
+.payment-box strong {
+  color: #111;
 }
 
 .special-status,
@@ -1643,18 +1649,46 @@ nav {
 }
 
 .payment-box span {
-  color: #343434;
+  color: #3d3d3d;
+  line-height: 1.35;
 }
 
 .payment-box.is-confirmed {
-  border-color: var(--soft-line);
-  background: color-mix(in srgb, var(--panel) 82%, #888);
-  color: var(--muted);
+  border-color: #d8d8d8;
+  background: #eeeeee;
+  color: #666;
+  box-shadow: inset 3px 0 0 #9a9a9a;
 }
 
 .payment-box.is-confirmed strong,
 .payment-box.is-confirmed span {
-  color: var(--muted);
+  color: #666;
+}
+
+:root[data-theme="dark"] .payment-box {
+  border-color: #ff8f95;
+  background: #2a1718;
+  color: #f7f7f7;
+}
+
+:root[data-theme="dark"] .payment-box strong {
+  color: #ffffff;
+}
+
+:root[data-theme="dark"] .payment-box span {
+  color: #e8d9da;
+}
+
+:root[data-theme="dark"] .payment-box.is-confirmed {
+  border-color: #444;
+  background: #252525;
+  color: #aaa;
+  box-shadow: inset 3px 0 0 #6f6f6f;
+}
+
+:root[data-theme="dark"] .payment-box.is-confirmed strong,
+:root[data-theme="dark"] .payment-box.is-confirmed span {
+  color: #aaa;
 }
 
 .proof-form {
