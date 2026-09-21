@@ -1506,6 +1506,7 @@ function renderAdminOrder(order) {
       : view === "completed"
         ? `<p class="muted">Fulfilled and completed.</p>`
         : "";
+  const paymentNote = order.proof?.note ? `<p class="muted"><strong>Payment note:</strong> ${escapeHtml(order.proof.note)}</p>` : "";
   const specialReview = order.specialOrder ? renderAdminSpecialOrder(order) : "";
   const shopifySync = renderShopifySync(order);
   return `
@@ -1526,6 +1527,7 @@ function renderAdminOrder(order) {
           ? `<a href="/api/admin/orders/${encodeURIComponent(order.id)}/proof" target="_blank" rel="noopener">${escapeHtml(order.proof.filename)}</a>`
           : "Not uploaded"
       }</p>
+      ${paymentNote}
       ${shopifySync}
       ${
         canConfirm || canSyncShopify

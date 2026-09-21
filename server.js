@@ -899,6 +899,13 @@ function specialOrderReadyForPayment(order) {
 function staffOrder(order) {
   return {
     ...publicOrder(order),
+    proof: order.proof
+      ? {
+          filename: order.proof.filename,
+          uploadedAt: order.proof.uploadedAt,
+          note: order.proof.note || "",
+        }
+      : null,
     delivery: order.delivery,
     staffNotes: order.staffNotes || "",
     paymentConfirmedAt: order.paymentConfirmedAt || null,
