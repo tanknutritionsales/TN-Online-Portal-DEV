@@ -942,6 +942,58 @@ nav {
   display: none;
 }
 
+.special-line-action {
+  display: flex;
+  align-items: end;
+}
+
+.special-order-items {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.special-order-items.empty {
+  color: var(--muted);
+  font-size: 0.9rem;
+  font-weight: 800;
+}
+
+.special-order-item {
+  display: grid;
+  grid-template-columns: 1fr 38px;
+  gap: 10px;
+  align-items: center;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--soft-line);
+}
+
+.special-order-item:last-child {
+  border-bottom: 0;
+}
+
+.special-order-item strong,
+.special-order-item span {
+  display: block;
+}
+
+.special-order-item span {
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.special-order-item button {
+  min-height: 34px;
+  border-radius: 6px;
+  background: var(--black);
+  color: #fff;
+  font-weight: 950;
+}
+
 .cart-note {
   margin: 0;
   padding: 10px;

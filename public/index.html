@@ -321,6 +321,10 @@
               <select id="specialProductSelect" name="productId" required></select>
             </label>
             <label>Quantity <span>*</span><input name="quantity" type="number" min="1" max="999" value="1" required></label>
+            <div class="special-line-action">
+              <button class="secondary inline-add" id="addSpecialProduct" type="button">Add product</button>
+            </div>
+            <div id="specialOrderItems" class="special-order-items empty" aria-live="polite"><span>No products added yet.</span></div>
             <label class="wide">Delivery address
               <select id="specialAddressSelect" name="addressId" required></select>
             </label>

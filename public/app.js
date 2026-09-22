@@ -20,6 +20,7 @@ const state = {
   adminView: "pending",
   adminAccounts: [],
   adminAccountFilter: "all",
+  specialOrderItems: [],
   editingAdminAccountId: "",
   systemStatus: null,
   pendingAccountRemoval: null,
@@ -736,13 +737,17 @@ function renderAddressBlock(address) {
 function openSpecialOrderModal() {
   const form = qs("#specialOrderForm");
   form.reset();
+  state.specialOrderItems = [];
   renderSpecialProductOptions();
   renderSpecialAddressOptions();
+  renderSpecialOrderItems();
   qs("#specialOrderModal").hidden = false;
 }
 
 function closeSpecialOrderModal() {
   qs("#specialOrderModal").hidden = true;
+  state.specialOrderItems = [];
+  renderSpecialOrderItems();
 }
 
 function renderSpecialProductOptions() {
@@ -764,14 +769,70 @@ function renderSpecialAddressOptions() {
     : `<option value="">No saved addresses</option>`;
 }
 
+function specialOrderItemFromForm(form) {
+  const product = state.products.find((entry) => entry.id === form.productId.value);
+  const quantity = Math.max(1, Math.floor(Number(form.quantity.value || 1)));
+  if (!product?.variant) {
+    toast("Choose a product.");
+    return null;
+  }
+  return {
+    variantId: product.variant.id,
+    productTitle: product.title,
+    variantTitle: product.variant.title,
+    sku: product.variant.sku,
+    price: Number(product.variant.price),
+    quantity,
+  };
+}
+
+function addSpecialOrderItem() {
+  const form = qs("#specialOrderForm");
+  const item = specialOrderItemFromForm(form);
+  if (!item) return;
+  const existing = state.specialOrderItems.find((entry) => entry.variantId === item.variantId);
+  if (existing) existing.quantity += item.quantity;
+  else state.specialOrderItems.push(item);
+  form.quantity.value = "1";
+  renderSpecialOrderItems();
+}
+
+function removeSpecialOrderItem(variantId) {
+  state.specialOrderItems = state.specialOrderItems.filter((item) => item.variantId !== variantId);
+  renderSpecialOrderItems();
+}
+
+function renderSpecialOrderItems() {
+  const container = qs("#specialOrderItems");
+  if (!container) return;
+  if (!state.specialOrderItems.length) {
+    container.className = "special-order-items empty";
+    container.innerHTML = `<span>No products added yet.</span>`;
+    return;
+  }
+  container.className = "special-order-items";
+  container.innerHTML = state.specialOrderItems
+    .map(
+      (item) => `
+        <div class="special-order-item">
+          <div>
+            <strong>${escapeHtml(item.productTitle)}</strong>
+            <span>${escapeHtml(item.quantity)} x ${money.format(item.price)}</span>
+          </div>
+          <button type="button" data-remove-special-item="${escapeHtml(item.variantId)}" aria-label="Remove ${escapeHtml(item.productTitle)}">x</button>
+        </div>
+      `,
+    )
+    .join("");
+}
+
 async function submitSpecialOrder(event) {
   event.preventDefault();
   const form = event.target;
-  const product = state.products.find((entry) => entry.id === form.productId.value);
   const address = userAddresses().find((entry) => entry.id === form.addressId.value);
-  const quantity = Math.max(1, Math.floor(Number(form.quantity.value || 1)));
-  if (!product?.variant) return toast("Choose a product.");
   if (!address) return toast("Choose or add a delivery address.");
+  const items = state.specialOrderItems.length ? state.specialOrderItems.map((item) => ({ ...item })) : [specialOrderItemFromForm(form)].filter(Boolean);
+  if (!items.length) return;
   state.pendingOrderDraft = {
     kind: "special",
     delivery: {
@@ -780,16 +841,7 @@ async function submitSpecialOrder(event) {
       notes: form.deliveryNotes.value,
       method: "Courier",
     },
-    items: [
-      {
-        variantId: product.variant.id,
-        productTitle: product.title,
-        variantTitle: product.variant.title,
-        sku: product.variant.sku,
-        price: Number(product.variant.price),
-        quantity,
-      },
-    ],
+    items,
     specialOrder: true,
     specialOrderNote: form.specialOrderNote.value,
   };
@@ -1853,6 +1905,9 @@ document.addEventListener("click", (event) => {
   if (event.target.closest("#addCheckoutAddress")) openAddressModal("checkout");
   if (event.target.closest("#addSpecialAddress")) openAddressModal("special");
   if (event.target.closest("#openSpecialOrder")) openSpecialOrderModal();
+  if (event.target.closest("#addSpecialProduct")) addSpecialOrderItem();
+  const removeSpecialItem = event.target.closest("[data-remove-special-item]");
+  if (removeSpecialItem) removeSpecialOrderItem(removeSpecialItem.dataset.removeSpecialItem);
   if (event.target.closest("[data-cancel-special-order]")) closeSpecialOrderModal();
   if (event.target.closest("[data-close-order-flow]")) closeOrderFlowModal();
   if (event.target.closest("[data-confirm-order]")) confirmPendingOrder();
