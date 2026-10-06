@@ -448,11 +448,15 @@ async function readUsersData() {
   const data = await readDataJson("users", usersPath, {
     version: 1,
     updatedAt: new Date().toISOString(),
-    users: [demoUser(), demoAdmin()],
+    users: seedUsers(),
   });
   const normalized = normalizeUsersData(data);
   if (normalized.changed) await writeUsersData(normalized);
   return normalized;
+}
+
+function seedUsers() {
+  return isProduction ? [demoAdmin()] : [demoUser(), demoAdmin()];
 }
 
 async function writeUsersData(data) {
