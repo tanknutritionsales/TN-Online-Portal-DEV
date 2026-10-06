@@ -43,6 +43,8 @@ const retailSharkInternalUrl = process.env.RETAIL_SHARK_INTERNAL_URL || env.RETA
 const retailSharkInternalToken = process.env.RETAIL_SHARK_INTERNAL_TOKEN || env.RETAIL_SHARK_INTERNAL_TOKEN || "";
 
 let shopifyClientCredentialsToken = null;
+let databasePool = null;
+let databaseReady = false;
 
 validateRuntimeConfig();
 
@@ -111,12 +113,17 @@ function dataStorageUsesBlobs() {
   return String(dataStorageMode || "").toLowerCase() === "blobs";
 }
 
+function dataStorageUsesDatabase() {
+  return ["postgres", "database", "db"].includes(String(dataStorageMode || "").toLowerCase());
+}
+
 async function runtimeDataBlobStore() {
   const { getStore } = await import("@netlify/blobs");
   return getStore(dataBlobStoreName);
 }
 
 async function readDataJson(key, filePath, fallback) {
+  if (dataStorageUsesDatabase()) return readDataFromDatabase(key, fallback);
   if (dataStorageUsesBlobs()) {
     const store = await runtimeDataBlobStore();
     const payload = await store.get(`${key}.json`, { type: "json", consistency: "strong" });
@@ -128,6 +135,7 @@ async function readDataJson(key, filePath, fallback) {
 }
 
 async function writeDataJson(key, filePath, payload) {
+  if (dataStorageUsesDatabase()) return writeDataToDatabase(key, payload);
   if (dataStorageUsesBlobs()) {
     const store = await runtimeDataBlobStore();
     await store.setJSON(`${key}.json`, payload, { consistency: "strong" });
@@ -136,6 +144,188 @@ async function writeDataJson(key, filePath, payload) {
   await mkdir(dataDir, { recursive: true });
   await writeFile(filePath, JSON.stringify(payload, null, 2));
   return payload;
+}
+
+async function databaseConnectionString() {
+  if (process.env.NETLIFY_DB_URL) return process.env.NETLIFY_DB_URL;
+  if (process.env.DATABASE_URL) return process.env.DATABASE_URL;
+  try {
+    const { getConnectionString } = await import("@netlify/database");
+    return getConnectionString();
+  } catch {
+    return "";
+  }
+}
+
+async function database() {
+  if (databasePool) return databasePool;
+  const connectionString = await databaseConnectionString();
+  if (!connectionString) throw new Error("Database connection string is not configured.");
+  const pg = await import("pg");
+  const Pool = pg.Pool || pg.default?.Pool;
+  databasePool = new Pool({ connectionString, max: 4, idleTimeoutMillis: 10_000 });
+  return databasePool;
+}
+
+async function ensureDatabaseSchema() {
+  if (databaseReady) return;
+  const pool = await database();
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS op_users (
+      id text PRIMARY KEY,
+      username text NOT NULL UNIQUE,
+      email text NOT NULL UNIQUE,
+      role text NOT NULL,
+      data jsonb NOT NULL,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      updated_at timestamptz NOT NULL DEFAULT now()
+    );
+    CREATE TABLE IF NOT EXISTS op_orders (
+      id text PRIMARY KEY,
+      reference text NOT NULL UNIQUE,
+      customer_id text,
+      payment_status text NOT NULL DEFAULT 'pending',
+      fulfillment_status text NOT NULL DEFAULT 'not_ready',
+      data jsonb NOT NULL,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      updated_at timestamptz NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS op_orders_customer_id_idx ON op_orders (customer_id);
+    CREATE INDEX IF NOT EXISTS op_orders_status_idx ON op_orders (payment_status, fulfillment_status);
+    CREATE TABLE IF NOT EXISTS op_shop_settings (
+      id text PRIMARY KEY,
+      data jsonb NOT NULL,
+      updated_at timestamptz NOT NULL DEFAULT now()
+    );
+  `);
+  databaseReady = true;
+}
+
+async function readDataFromDatabase(key, fallback) {
+  await ensureDatabaseSchema();
+  const pool = await database();
+  if (key === "orders") {
+    const { rows } = await pool.query("SELECT data, updated_at FROM op_orders ORDER BY created_at DESC");
+    return {
+      version: 1,
+      updatedAt: newestTimestamp(rows.map((row) => row.updated_at)) || fallback.updatedAt || null,
+      orders: rows.map((row) => row.data),
+    };
+  }
+  if (key === "users") {
+    const { rows } = await pool.query("SELECT data, updated_at FROM op_users ORDER BY role, lower(data->>'name'), username");
+    if (!rows.length) return fallback;
+    return {
+      version: 1,
+      updatedAt: newestTimestamp(rows.map((row) => row.updated_at)) || fallback.updatedAt || null,
+      users: rows.map((row) => row.data),
+    };
+  }
+  if (key === "shop-settings") {
+    const { rows } = await pool.query("SELECT data, updated_at FROM op_shop_settings WHERE id = 'default' LIMIT 1");
+    if (!rows.length) return fallback;
+    return { version: 1, updatedAt: rows[0].updated_at?.toISOString?.() || null, settings: rows[0].data };
+  }
+  return fallback;
+}
+
+function newestTimestamp(values) {
+  const newest = values
+    .map((value) => (value ? new Date(value).getTime() : 0))
+    .filter(Boolean)
+    .sort((a, b) => b - a)[0];
+  return newest ? new Date(newest).toISOString() : null;
+}
+
+async function writeDataToDatabase(key, payload) {
+  await ensureDatabaseSchema();
+  if (key === "orders") return writeOrdersToDatabase(payload);
+  if (key === "users") return writeUsersToDatabase(payload);
+  if (key === "shop-settings") return writeShopSettingsToDatabase(payload);
+  return payload;
+}
+
+async function writeOrdersToDatabase(payload) {
+  const pool = await database();
+  const now = new Date().toISOString();
+  for (const order of payload.orders || []) {
+    await pool.query(
+      `INSERT INTO op_orders (id, reference, customer_id, payment_status, fulfillment_status, data, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb, COALESCE($7::timestamptz, now()), $8::timestamptz)
+       ON CONFLICT (id) DO UPDATE SET
+         reference = EXCLUDED.reference,
+         customer_id = EXCLUDED.customer_id,
+         payment_status = EXCLUDED.payment_status,
+         fulfillment_status = EXCLUDED.fulfillment_status,
+         data = EXCLUDED.data,
+         updated_at = EXCLUDED.updated_at`,
+      [
+        order.id,
+        order.reference,
+        order.customer?.id || null,
+        order.paymentStatus || "pending",
+        order.fulfillmentStatus || "not_ready",
+        JSON.stringify(order),
+        order.createdAt || null,
+        order.updatedAt || now,
+      ],
+    );
+  }
+  return payload;
+}
+
+async function writeUsersToDatabase(payload) {
+  const pool = await database();
+  const now = new Date().toISOString();
+  try {
+    for (const user of payload.users || []) {
+      await pool.query(
+        `INSERT INTO op_users (id, username, email, role, data, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5::jsonb, COALESCE($6::timestamptz, now()), $7::timestamptz)
+         ON CONFLICT (id) DO UPDATE SET
+           username = EXCLUDED.username,
+           email = EXCLUDED.email,
+           role = EXCLUDED.role,
+           data = EXCLUDED.data,
+           updated_at = EXCLUDED.updated_at`,
+        [
+          user.id,
+          user.username,
+          user.email || `${user.username}@admin.local`,
+          user.role === "admin" ? "admin" : "customer",
+          JSON.stringify(user),
+          user.createdAt || null,
+          user.updatedAt || now,
+        ],
+      );
+    }
+  } catch (error) {
+    if (isUniqueViolation(error)) throw Object.assign(new Error("User already exists."), { status: 409 });
+    throw error;
+  }
+  return payload;
+}
+
+async function writeShopSettingsToDatabase(payload) {
+  const pool = await database();
+  await pool.query(
+    `INSERT INTO op_shop_settings (id, data, updated_at)
+     VALUES ('default', $1::jsonb, now())
+     ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, updated_at = EXCLUDED.updated_at`,
+    [JSON.stringify(payload.settings || defaultShopSettings())],
+  );
+  return payload;
+}
+
+async function deleteUserFromDatabase(userId) {
+  if (!dataStorageUsesDatabase()) return;
+  await ensureDatabaseSchema();
+  const pool = await database();
+  await pool.query("DELETE FROM op_users WHERE id = $1", [userId]);
+}
+
+function isUniqueViolation(error) {
+  return error?.code === "23505";
 }
 
 function validateRuntimeConfig() {
@@ -519,7 +709,7 @@ async function registerCustomer(input) {
   if (!addressComplete(defaultAddress)) throw Object.assign(new Error("Complete the required delivery address fields."), { status: 400 });
   if (password.length < 4) throw Object.assign(new Error("Use at least 4 characters for now."), { status: 400 });
   if (data.users.some((user) => user.username === username || user.email === email)) {
-    throw Object.assign(new Error("An account already exists for this username or email."), { status: 409 });
+    throw Object.assign(new Error("User already exists."), { status: 409 });
   }
   const user = {
     id: randomUUID(),
@@ -710,7 +900,7 @@ async function createAccountByAdmin(input) {
   }
   if (password.length < 4) throw Object.assign(new Error("Use at least 4 characters for now."), { status: 400 });
   if (data.users.some((user) => user.username === username || user.email === email)) {
-    throw Object.assign(new Error("An account already exists for this username or email."), { status: 409 });
+    throw Object.assign(new Error("User already exists."), { status: 409 });
   }
   const user = {
     id: randomUUID(),
@@ -745,12 +935,13 @@ async function updateAccountByAdmin(accountId, input, admin) {
   if (!username) throw Object.assign(new Error("Username is required."), { status: 400 });
   if (!name) throw Object.assign(new Error("Name is required."), { status: 400 });
   if (password && password.length < 4) throw Object.assign(new Error("Use at least 4 characters for the password."), { status: 400 });
-  if (data.users.some((user) => user.id !== target.id && user.username === username)) {
-    throw Object.assign(new Error("An account already exists for this username."), { status: 409 });
+  const email = cleanText(input.email || target.email || `${username}@admin.local`, 180).toLowerCase();
+  if (data.users.some((user) => user.id !== target.id && (user.username === username || user.email === email))) {
+    throw Object.assign(new Error("User already exists."), { status: 409 });
   }
   target.username = username;
   target.name = name;
-  target.email = cleanText(input.email || target.email || `${username}@admin.local`, 180).toLowerCase();
+  target.email = email;
   if (password) target.passwordHash = hashPassword(password);
   target.updatedAt = new Date().toISOString();
   await writeUsersData(data);
@@ -771,6 +962,7 @@ async function removeAccountByAdmin(accountId, input, admin) {
   }
   data.users = data.users.filter((user) => user.id !== target.id);
   await writeUsersData(data);
+  await deleteUserFromDatabase(target.id);
   return target;
 }
 
@@ -990,8 +1182,7 @@ function customerStatus(order) {
   if (order.specialOrder?.status === "pending") return "Special order review";
   if (order.specialOrder?.status === "declined") return "Special order declined";
   if (order.fulfillmentStatus === "shipped") return "Shipped";
-  if (order.fulfillmentStatus === "back_order") return "Not ready";
-  if (order.paymentStatus === "confirmed") return "Payment confirmed";
+  if (order.paymentStatus === "confirmed" || order.paymentIssue?.type === "paid_pending") return "Marked as paid, processing";
   if (specialOrderReadyForPayment(order) && order.paymentLink?.url) return "Payment required";
   if (specialOrderReadyForPayment(order)) return "Awaiting payment link";
   if (order.specialOrder?.status === "countered") return "Special order countered";
@@ -1891,7 +2082,8 @@ async function checkShopifyStatus(checkedAt) {
 async function checkOrdersStatus(checkedAt) {
   try {
     const data = await readOrdersData();
-    return statusEntry("orders", "Orders database", "online", `${data.orders.length} order${data.orders.length === 1 ? "" : "s"} available in local storage.`, checkedAt);
+    const storeLabel = dataStorageUsesDatabase() ? "Postgres" : dataStorageUsesBlobs() ? "Netlify Blobs" : "local storage";
+    return statusEntry("orders", "Orders database", "online", `${data.orders.length} order${data.orders.length === 1 ? "" : "s"} available in ${storeLabel}.`, checkedAt);
   } catch (error) {
     return statusEntry("orders", "Orders database", "error", friendlyStatusError(error), checkedAt);
   }

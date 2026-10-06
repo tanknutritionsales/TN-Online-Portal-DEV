@@ -16,6 +16,8 @@
     "node": ">=20"
   },
   "dependencies": {
-    "@netlify/blobs": "^8.2.0"
+    "@netlify/blobs": "^8.2.0",
+    "@netlify/database": "^2.0.1",
+    "pg": "^8.23.1"
   }
 }

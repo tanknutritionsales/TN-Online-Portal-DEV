@@ -145,13 +145,10 @@ function switchView(view) {
 }
 
 async function initSession() {
-  try {
-    const session = await api("/api/auth/me");
-    if (session.user || session.admin) await showApp(session);
-    else showAuth();
-  } catch {
-    showAuth();
-  }
+  await api("/api/auth/logout", { method: "POST", body: "{}" }).catch(() => null);
+  state.cart.clear();
+  renderCart();
+  showAuth();
 }
 
 async function login(event) {
@@ -1067,7 +1064,7 @@ function renderCustomerOrder(order) {
   const trackButton = shipments.length
     ? `<button type="button" data-view-order-tracking="${escapeHtml(order.id)}">Track Order</button>`
     : "";
-  const paymentActionLabel = order.canPay ? "Pay now" : order.paymentLink ? "Payment details" : "View order";
+  const paymentActionLabel = order.paymentIssue?.type === "paid_pending" ? "Payment details" : order.canPay ? "Pay now" : order.paymentLink ? "Payment details" : "View order";
   const special = order.specialOrder ? renderSpecialOrderStatus(order.specialOrder) : "";
   const reviewNote = !order.paymentLink && order.paymentStatus !== "confirmed" && order.specialOrder?.status !== "declined"
     ? `<p class="muted">${escapeHtml(paymentReviewNote(order))}</p>`
@@ -1106,10 +1103,18 @@ function paymentIssueLabel(type) {
     link_not_opening: "Link will not open",
     amount_wrong: "Amount looks wrong",
     payment_failed: "Payment failed",
-    paid_pending: "Paid but still pending",
+    paid_pending: "Marked as paid",
     other: "Other payment issue",
   };
   return labels[type] || labels.other;
+}
+
+function customerPaymentNotice(order) {
+  if (!order.paymentIssue) return "";
+  if (order.paymentIssue.type === "paid_pending") {
+    return "Order marked as paid. Our team is reviewing the payment.";
+  }
+  return `Payment support request recorded: ${paymentIssueLabel(order.paymentIssue.type)}`;
 }
 
 function renderSpecialOrderStatus(specialOrder) {
@@ -1131,11 +1136,12 @@ function renderSpecialOrderStatus(specialOrder) {
 function paymentInstructions(order) {
   const confirmed = order.paymentStatus === "confirmed";
   const paymentLink = order.paymentLink || {};
+  const markedPaid = order.paymentIssue?.type === "paid_pending";
   const paymentLines = [`Order reference: ${order.reference}`, `Amount: ${money.format(order.total)}`, paymentLink.url && `Payment link: ${paymentLink.url}`].filter(Boolean);
   const paymentActions = paymentLink.url && !confirmed
     ? `
       <div class="payment-support-actions">
-        <button type="button" data-paid-notice="${escapeHtml(order.id)}">I have paid</button>
+        ${markedPaid ? "" : `<button type="button" data-paid-notice="${escapeHtml(order.id)}">I have paid</button>`}
         <button type="button" data-report-payment-issue="${escapeHtml(order.id)}">Payment link not working</button>
       </div>
     `
@@ -1150,7 +1156,7 @@ function paymentInstructions(order) {
       ${paymentLink.reference ? `<span>Payment reference: ${escapeHtml(paymentLink.reference)}</span>` : ""}
       ${paymentLink.note ? `<span>${escapeHtml(paymentLink.note)}</span>` : ""}
       ${paymentLink.url && !confirmed ? `<a class="primary button-link payment-link-button" href="${escapeHtml(paymentLink.url)}" target="_blank" rel="noopener">Pay now</a>` : ""}
-      ${order.paymentIssue ? `<span class="payment-issue-note">Payment issue reported: ${escapeHtml(paymentIssueLabel(order.paymentIssue.type))}</span>` : ""}
+      ${order.paymentIssue ? `<span class="payment-issue-note">${escapeHtml(customerPaymentNotice(order))}</span>` : ""}
       ${!paymentLink.url && !confirmed ? `<span>Your secure payment link will appear here once the order has been reviewed.</span>` : ""}
       ${paymentActions}
       <div class="payment-copy-actions">
@@ -1171,7 +1177,7 @@ function showPaymentIssueModal(order) {
           <option value="link_not_opening">Link will not open</option>
           <option value="amount_wrong">Amount looks wrong</option>
           <option value="payment_failed">Payment failed</option>
-          <option value="paid_pending">Paid but still pending</option>
+          <option value="paid_pending">Marked as paid</option>
           <option value="other">Other</option>
         </select>
       </label>
@@ -1217,7 +1223,7 @@ async function reportPaidNotice(orderId) {
       method: "POST",
       body: "{}",
     });
-    toast("Thanks. We will check your payment.");
+    toast("Order marked as paid. We will verify it shortly.");
     await loadCustomerOrders();
     const updated = payload.order || state.customerOrders.find((order) => order.id === orderId);
     if (updated) showPaymentModal(updated);
@@ -1693,6 +1699,21 @@ async function submitShopSettings(event) {
   }
 }
 
+function adminOrderStatusLabel(order) {
+  if (order.fulfillmentStatus === "shipped") return "Completed";
+  if (order.specialOrder?.status === "declined") return "Declined";
+  if (order.paymentStatus === "confirmed") {
+    if (order.fulfillmentStatus === "back_order") return "Back order";
+    return "Ready to pack";
+  }
+  if (order.paymentIssue?.type === "paid_pending") return "Payment to verify";
+  if (order.paymentIssue && order.paymentIssue.status !== "resolved") return "Payment support";
+  if (order.specialOrder?.status === "pending") return "Review required";
+  if (order.specialOrder?.status === "countered") return "Counter sent";
+  if (order.paymentLink?.url) return "Payment required";
+  return "Awaiting confirmation";
+}
+
 function renderAdminOrder(order) {
   const readyForPayment = !order.specialOrder || ["accepted", "countered"].includes(order.specialOrder.status);
   const hasPaymentEvidence = Boolean(order.paymentLink?.url || order.proof);
@@ -1713,38 +1734,41 @@ function renderAdminOrder(order) {
   const specialReview = order.specialOrder ? renderAdminSpecialOrder(order) : "";
   const manualTracking = renderManualTrackingForm(order);
   const shopifySync = renderShopifySync(order);
+  const statusLabel = adminOrderStatusLabel(order);
   return `
-    <article class="order-card" data-admin-order-id="${escapeHtml(order.id)}">
-      <header>
+    <details class="order-card admin-order-card" data-admin-order-id="${escapeHtml(order.id)}">
+      <summary class="admin-order-summary">
         <div>
           <strong>${escapeHtml(order.reference)}</strong>
           <p class="muted">${escapeHtml(order.customer.name)} - ${escapeHtml(order.customer.email)}</p>
         </div>
-        <span class="status-badge">${escapeHtml(order.paymentStatus)}</span>
-      </header>
-      <ul>${order.items.map((item) => `<li>${item.quantity} x ${escapeHtml(item.productTitle)}</li>`).join("")}</ul>
-      <p><strong>Total:</strong> ${money.format(order.total)}</p>
-      ${workflowNote}
-      ${specialReview}
-      ${paymentIssue}
-      ${paymentLinkForm}
-      ${manualTracking}
-      ${
-        order.proof
-          ? `<p class="muted">Legacy POP: <a href="/api/admin/orders/${encodeURIComponent(order.id)}/proof" target="_blank" rel="noopener">${escapeHtml(order.proof.filename)}</a></p>`
-          : ""
-      }
-      ${paymentNote}
-      ${shopifySync}
-      ${
-        canConfirm || canSyncShopify
-          ? `<div class="order-actions">
-              ${canConfirm ? `<button type="button" data-confirm="${order.id}">Confirm Yoco payment</button>` : ""}
-              ${canSyncShopify ? `<button type="button" data-sync-shopify="${order.id}">Sync to Shopify</button>` : ""}
-            </div>`
-          : ""
-      }
-    </article>
+        <span class="status-badge">${escapeHtml(statusLabel)}</span>
+      </summary>
+      <div class="admin-order-details">
+        <ul>${order.items.map((item) => `<li>${item.quantity} x ${escapeHtml(item.productTitle)}</li>`).join("")}</ul>
+        <p><strong>Total:</strong> ${money.format(order.total)}</p>
+        ${workflowNote}
+        ${specialReview}
+        ${paymentIssue}
+        ${paymentLinkForm}
+        ${manualTracking}
+        ${
+          order.proof
+            ? `<p class="muted">Legacy POP: <a href="/api/admin/orders/${encodeURIComponent(order.id)}/proof" target="_blank" rel="noopener">${escapeHtml(order.proof.filename)}</a></p>`
+            : ""
+        }
+        ${paymentNote}
+        ${shopifySync}
+        ${
+          canConfirm || canSyncShopify
+            ? `<div class="order-actions">
+                ${canConfirm ? `<button type="button" data-confirm="${order.id}">Confirm Yoco payment</button>` : ""}
+                ${canSyncShopify ? `<button type="button" data-sync-shopify="${order.id}">Sync to Shopify</button>` : ""}
+              </div>`
+            : ""
+        }
+      </div>
+    </details>
   `;
 }
 
