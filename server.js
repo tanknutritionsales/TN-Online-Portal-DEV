@@ -197,6 +197,11 @@ async function ensureDatabaseSchema() {
       data jsonb NOT NULL,
       updated_at timestamptz NOT NULL DEFAULT now()
     );
+    CREATE TABLE IF NOT EXISTS op_storage_meta (
+      key text PRIMARY KEY,
+      value jsonb NOT NULL,
+      updated_at timestamptz NOT NULL DEFAULT now()
+    );
   `);
   databaseReady = true;
 }
@@ -214,6 +219,8 @@ async function readDataFromDatabase(key, fallback) {
   }
   if (key === "users") {
     const { rows } = await pool.query("SELECT data, updated_at FROM op_users ORDER BY role, lower(data->>'name'), username");
+    const migrated = await maybeMigrateLegacyUsers(rows.map((row) => row.data));
+    if (migrated) return readDataFromDatabase(key, fallback);
     if (!rows.length) return fallback;
     return {
       version: 1,
@@ -235,6 +242,60 @@ function newestTimestamp(values) {
     .filter(Boolean)
     .sort((a, b) => b - a)[0];
   return newest ? new Date(newest).toISOString() : null;
+}
+
+async function readLegacyBlobData(key) {
+  try {
+    const store = await runtimeDataBlobStore();
+    return await store.get(`${key}.json`, { type: "json", consistency: "strong" });
+  } catch {
+    return null;
+  }
+}
+
+async function storageMetaValue(key) {
+  const pool = await database();
+  const { rows } = await pool.query("SELECT value FROM op_storage_meta WHERE key = $1 LIMIT 1", [key]);
+  return rows[0]?.value || null;
+}
+
+async function setStorageMetaValue(key, value) {
+  const pool = await database();
+  await pool.query(
+    `INSERT INTO op_storage_meta (key, value, updated_at)
+     VALUES ($1, $2::jsonb, now())
+     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at`,
+    [key, JSON.stringify(value)],
+  );
+}
+
+async function maybeMigrateLegacyUsers(existingUsers) {
+  if ((await storageMetaValue("legacy-users-migrated"))?.done) return false;
+  const legacy = await readLegacyBlobData("users");
+  if (!legacy || !Array.isArray(legacy.users)) {
+    await setStorageMetaValue("legacy-users-migrated", { done: true, migrated: 0, at: new Date().toISOString() });
+    return false;
+  }
+  const legacyUsers = normalizeUsersData(legacy || {}).users || [];
+  if (!legacyUsers.length) {
+    await setStorageMetaValue("legacy-users-migrated", { done: true, migrated: 0, at: new Date().toISOString() });
+    return false;
+  }
+  const pool = await database();
+  const onlyDefaultAdmin = existingUsers.length > 0 && existingUsers.every((user) => user.id === "demo-admin");
+  if (onlyDefaultAdmin) await pool.query("DELETE FROM op_users");
+  const baseUsers = onlyDefaultAdmin ? [] : existingUsers;
+  const existingKeys = new Set(baseUsers.flatMap((user) => [user.id, user.username, user.email].filter(Boolean)));
+  const users = [...baseUsers];
+  for (const user of legacyUsers) {
+    const keys = [user.id, user.username, user.email].filter(Boolean);
+    if (keys.some((key) => existingKeys.has(key))) continue;
+    users.push(user);
+    keys.forEach((key) => existingKeys.add(key));
+  }
+  await writeUsersToDatabase({ users });
+  await setStorageMetaValue("legacy-users-migrated", { done: true, migrated: legacyUsers.length, at: new Date().toISOString() });
+  return true;
 }
 
 async function writeDataToDatabase(key, payload) {
