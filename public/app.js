@@ -21,6 +21,8 @@ const state = {
   adminAccounts: [],
   adminAccountFilter: "all",
   specialOrderItems: [],
+  specialProductSearch: "",
+  selectedSpecialProductId: "",
   editingAdminAccountId: "",
   systemStatus: null,
   pendingAccountRemoval: null,
@@ -664,7 +666,7 @@ function openOrderSummaryModal(draft) {
 
 function showPaymentModal(order) {
   state.activePaymentOrder = order;
-  const paymentUnlocked = order.canUploadProof || order.proof || order.paymentStatus === "confirmed";
+  const paymentUnlocked = order.canPay || order.paymentLink || order.paymentStatus === "confirmed";
   qs("#orderFlowTitle").textContent = `${paymentUnlocked ? "Payment details" : "Order details"} - ${order.reference}`;
   qs("#orderFlowContent").innerHTML = `
     <div class="summary-stack">
@@ -675,8 +677,8 @@ function showPaymentModal(order) {
       </section>
       ${
         paymentUnlocked
-          ? `${paymentInstructions(order)}${order.proof ? `<p class="muted">POP uploaded: ${escapeHtml(order.proof.filename)}</p>` : order.canUploadProof ? proofForm(order.id) : `<p class="muted">${escapeHtml(order.customerStatus)}</p>`}`
-          : `<section class="summary-panel"><p class="eyebrow">Status</p><h3>${escapeHtml(order.customerStatus)}</h3>${order.specialOrder ? renderSpecialOrderStatus(order.specialOrder) : ""}</section>`
+          ? `${paymentInstructions(order)}${order.paymentStatus === "confirmed" ? `<p class="muted">${escapeHtml(order.customerStatus)}</p>` : ""}`
+          : `<section class="summary-panel"><p class="eyebrow">Status</p><h3>${escapeHtml(order.customerStatus)}</h3>${order.specialOrder ? renderSpecialOrderStatus(order.specialOrder) : ""}<p class="muted">${escapeHtml(paymentReviewNote(order))}</p></section>`
       }
     </div>
   `;
@@ -685,22 +687,34 @@ function showPaymentModal(order) {
 }
 
 function showTrackingModal(order) {
-  const tracking = order.tracking || {};
+  const shipments = customerShipments(order);
   qs("#orderFlowTitle").textContent = `Track order - ${order.reference}`;
   qs("#orderFlowContent").innerHTML = `
     <div class="summary-stack">
-      <section class="summary-panel">
-        <p class="eyebrow">Shipment</p>
-        <h3>${escapeHtml(tracking.courier || "Courier")}</h3>
-        <p><strong>Tracking Number:</strong> ${escapeHtml(tracking.number || "Not supplied")}</p>
-      </section>
+      ${shipments
+        .map(
+          (shipment, index) => `
+            <section class="summary-panel">
+              <p class="eyebrow">${shipments.length > 1 ? `Shipment ${index + 1}` : "Shipment"}</p>
+              <h3>${escapeHtml(shipment.courier || "Courier")}</h3>
+              <p><strong>Tracking Number:</strong> ${escapeHtml(shipment.number || "Not supplied")}</p>
+            </section>
+          `,
+        )
+        .join("")}
     </div>
   `;
   qs("#orderFlowActions").innerHTML = `
     <button class="secondary" type="button" data-close-order-flow>Close</button>
-    ${tracking.url ? `<a class="primary button-link" href="${escapeHtml(tracking.url)}" target="_blank" rel="noopener">Track shipment</a>` : ""}
+    ${shipments.map((shipment, index) => (shipment.url ? `<a class="primary button-link" href="${escapeHtml(shipment.url)}" target="_blank" rel="noopener">${shipments.length > 1 ? `Track shipment ${index + 1}` : "Track shipment"}</a>` : "")).join("")}
   `;
   qs("#orderFlowModal").hidden = false;
+}
+
+function customerShipments(order) {
+  const shipments = Array.isArray(order.shipments) ? order.shipments : [];
+  if (shipments.length) return shipments;
+  return order.tracking?.number ? [order.tracking] : [];
 }
 
 function showOrderSubmittedModal(order) {
@@ -713,7 +727,7 @@ function showOrderSubmittedModal(order) {
         <h3>${escapeHtml(order.reference)}</h3>
         <p class="muted">${escapeHtml(order.customerStatus)}</p>
       </section>
-      <p class="muted">${order.specialOrder ? "We will review this request and unlock payment details if it is approved or countered." : "Your order has been submitted."}</p>
+      <p class="muted">${escapeHtml(paymentReviewNote(order))}</p>
     </div>
   `;
   qs("#orderFlowActions").innerHTML = `<button class="primary" type="button" data-close-order-flow>Done</button>`;
@@ -738,6 +752,8 @@ function openSpecialOrderModal() {
   const form = qs("#specialOrderForm");
   form.reset();
   state.specialOrderItems = [];
+  state.specialProductSearch = "";
+  state.selectedSpecialProductId = "";
   renderSpecialProductOptions();
   renderSpecialAddressOptions();
   renderSpecialOrderItems();
@@ -747,17 +763,40 @@ function openSpecialOrderModal() {
 function closeSpecialOrderModal() {
   qs("#specialOrderModal").hidden = true;
   state.specialOrderItems = [];
+  state.specialProductSearch = "";
+  state.selectedSpecialProductId = "";
   renderSpecialOrderItems();
 }
 
 function renderSpecialProductOptions() {
-  const select = qs("#specialProductSelect");
-  if (!select) return;
-  select.innerHTML = state.products.length
-    ? state.products
-        .map((product) => `<option value="${escapeHtml(product.id)}">${escapeHtml(product.vendor ? `${product.vendor} - ${product.title}` : product.title)}</option>`)
+  const input = qs("#specialProductSearch");
+  const hidden = qs("#specialProductId");
+  const results = qs("#specialProductResults");
+  if (!input || !hidden || !results) return;
+  input.value = state.specialProductSearch;
+  hidden.value = state.selectedSpecialProductId;
+  if (!state.products.length) {
+    results.innerHTML = `<p class="muted">Load products from Shop first.</p>`;
+    return;
+  }
+  const query = normalizeSearch(state.specialProductSearch);
+  const products = state.products
+    .filter((product) => productMatchesSearch(product, query));
+  results.innerHTML = products.length
+    ? products
+        .map((product) => {
+          const selected = product.id === state.selectedSpecialProductId;
+          const price = product.variant ? money.format(Number(product.variant.price || 0)) : "No price";
+          const availability = product.variant?.inStock ? "In stock" : "Out of stock";
+          return `
+            <button class="special-product-option${selected ? " is-selected" : ""}" type="button" data-special-product-id="${escapeHtml(product.id)}">
+              <span>${escapeHtml(product.title)}</span>
+              <small>${escapeHtml([product.vendor, product.productType, product.variant?.sku, price, availability].filter(Boolean).join(" - "))}</small>
+            </button>
+          `;
+        })
         .join("")
-    : `<option value="">Load products from Shop first</option>`;
+    : `<p class="muted">No products match that search.</p>`;
 }
 
 function renderSpecialAddressOptions() {
@@ -770,7 +809,8 @@ function renderSpecialAddressOptions() {
 }
 
 function specialOrderItemFromForm(form) {
-  const product = state.products.find((entry) => entry.id === form.productId.value);
+  const productId = form.productId.value || state.selectedSpecialProductId;
+  const product = state.products.find((entry) => entry.id === productId);
   const quantity = Math.max(1, Math.floor(Number(form.quantity.value || 1)));
   if (!product?.variant) {
     toast("Choose a product.");
@@ -794,6 +834,10 @@ function addSpecialOrderItem() {
   if (existing) existing.quantity += item.quantity;
   else state.specialOrderItems.push(item);
   form.quantity.value = "1";
+  state.specialProductSearch = "";
+  state.selectedSpecialProductId = "";
+  form.productId.value = "";
+  renderSpecialProductOptions();
   renderSpecialOrderItems();
 }
 
@@ -1016,14 +1060,18 @@ async function loadCustomerOrders() {
 }
 
 function renderCustomerOrder(order) {
-  const proof = order.proof ? `<p class="muted">POP uploaded: ${escapeHtml(order.proof.filename)}</p>` : "";
-  const tracking = order.tracking?.number
-    ? `<p><strong>Tracking Number:</strong> ${escapeHtml(order.tracking.number)}</p>`
+  const shipments = customerShipments(order);
+  const tracking = shipments.length
+    ? `<p><strong>Tracking Number:</strong> ${escapeHtml(shipments[0].number)}${shipments.length > 1 ? ` + ${shipments.length - 1} more` : ""}</p>`
     : "";
-  const trackButton = order.fulfillmentStatus === "shipped" && order.tracking?.number
+  const trackButton = shipments.length
     ? `<button type="button" data-view-order-tracking="${escapeHtml(order.id)}">Track Order</button>`
     : "";
+  const paymentActionLabel = order.canPay ? "Pay now" : order.paymentLink ? "Payment details" : "View order";
   const special = order.specialOrder ? renderSpecialOrderStatus(order.specialOrder) : "";
+  const reviewNote = !order.paymentLink && order.paymentStatus !== "confirmed" && order.specialOrder?.status !== "declined"
+    ? `<p class="muted">${escapeHtml(paymentReviewNote(order))}</p>`
+    : "";
   return `
     <article class="order-card" data-order-id="${order.id}">
       <header>
@@ -1036,14 +1084,32 @@ function renderCustomerOrder(order) {
       <ul>${order.items.map((item) => `<li>${item.quantity} x ${escapeHtml(item.productTitle)}</li>`).join("")}</ul>
       <p><strong>Total:</strong> ${money.format(order.total)}</p>
       ${special}
+      ${reviewNote}
       ${tracking}
-      ${proof}
       <div class="order-actions">
-        <button type="button" data-view-order-payment="${escapeHtml(order.id)}">${order.canUploadProof ? "Payment details" : "View order"}</button>
+        <button type="button" data-view-order-payment="${escapeHtml(order.id)}">${paymentActionLabel}</button>
         ${trackButton}
       </div>
     </article>
   `;
+}
+
+function paymentReviewNote(order) {
+  if (order.specialOrder) {
+    return "Your special order request has been submitted. Our team will review availability and confirm what we can supply, typically within 12-24 hours. If approved, your secure payment link will appear here.";
+  }
+  return "Your order has been submitted. Our team will review availability and send your secure payment link, typically within 12-24 hours.";
+}
+
+function paymentIssueLabel(type) {
+  const labels = {
+    link_not_opening: "Link will not open",
+    amount_wrong: "Amount looks wrong",
+    payment_failed: "Payment failed",
+    paid_pending: "Paid but still pending",
+    other: "Other payment issue",
+  };
+  return labels[type] || labels.other;
 }
 
 function renderSpecialOrderStatus(specialOrder) {
@@ -1063,22 +1129,101 @@ function renderSpecialOrderStatus(specialOrder) {
 }
 
 function paymentInstructions(order) {
-  const banking = state.banking || {};
   const confirmed = order.paymentStatus === "confirmed";
-  const bankLines = [
-    banking.accountName && `<span>Account: ${escapeHtml(banking.accountName)}</span>`,
-    banking.bankName && `<span>Bank: ${escapeHtml(banking.bankName)}</span>`,
-    banking.accountNumber && `<span>Number: ${escapeHtml(banking.accountNumber)}</span>`,
-    banking.branchCode && `<span>Branch: ${escapeHtml(banking.branchCode)}</span>`,
-  ].filter(Boolean);
+  const paymentLink = order.paymentLink || {};
+  const paymentLines = [`Order reference: ${order.reference}`, `Amount: ${money.format(order.total)}`, paymentLink.url && `Payment link: ${paymentLink.url}`].filter(Boolean);
+  const paymentActions = paymentLink.url && !confirmed
+    ? `
+      <div class="payment-support-actions">
+        <button type="button" data-paid-notice="${escapeHtml(order.id)}">I have paid</button>
+        <button type="button" data-report-payment-issue="${escapeHtml(order.id)}">Payment link not working</button>
+      </div>
+    `
+    : "";
   return `
     <div class="payment-box${confirmed ? " is-confirmed" : ""}">
-      <strong>EFT reference: ${escapeHtml(order.reference)}</strong>
+      <div class="payment-line important">
+        <strong>${confirmed ? "Payment confirmed" : "Secure Yoco payment"}</strong>
+        <button type="button" data-copy-value="${escapeHtml(order.reference)}" data-copy-label="order reference">Copy reference</button>
+      </div>
       <span>Amount: ${money.format(order.total)}</span>
-      ${bankLines.length ? bankLines.join("") : `<span>Banking details will be supplied before production testing.</span>`}
-      ${banking.note ? `<span>${escapeHtml(banking.note)}</span>` : ""}
+      ${paymentLink.reference ? `<span>Payment reference: ${escapeHtml(paymentLink.reference)}</span>` : ""}
+      ${paymentLink.note ? `<span>${escapeHtml(paymentLink.note)}</span>` : ""}
+      ${paymentLink.url && !confirmed ? `<a class="primary button-link payment-link-button" href="${escapeHtml(paymentLink.url)}" target="_blank" rel="noopener">Pay now</a>` : ""}
+      ${order.paymentIssue ? `<span class="payment-issue-note">Payment issue reported: ${escapeHtml(paymentIssueLabel(order.paymentIssue.type))}</span>` : ""}
+      ${!paymentLink.url && !confirmed ? `<span>Your secure payment link will appear here once the order has been reviewed.</span>` : ""}
+      ${paymentActions}
+      <div class="payment-copy-actions">
+        ${paymentLink.url ? `<button type="button" data-copy-value="${escapeHtml(paymentLink.url)}" data-copy-label="payment link">Copy payment link</button>` : ""}
+        <button type="button" data-copy-value="${escapeHtml(paymentLines.join("\n"))}" data-copy-label="payment details">Copy payment details</button>
+      </div>
     </div>
   `;
+}
+
+function showPaymentIssueModal(order) {
+  state.activePaymentOrder = order;
+  qs("#orderFlowTitle").textContent = `Report payment issue - ${order.reference}`;
+  qs("#orderFlowContent").innerHTML = `
+    <form id="paymentIssueForm" class="payment-issue-form" data-payment-issue="${escapeHtml(order.id)}">
+      <label>Issue type
+        <select name="type" required>
+          <option value="link_not_opening">Link will not open</option>
+          <option value="amount_wrong">Amount looks wrong</option>
+          <option value="payment_failed">Payment failed</option>
+          <option value="paid_pending">Paid but still pending</option>
+          <option value="other">Other</option>
+        </select>
+      </label>
+      <label>Message
+        <textarea name="message" rows="4" placeholder="Tell us what happened"></textarea>
+      </label>
+      <p class="muted">This will alert our team to check the Yoco link and your order.</p>
+    </form>
+  `;
+  qs("#orderFlowActions").innerHTML = `
+    <button class="secondary" type="button" data-close-order-flow>Cancel</button>
+    <button class="primary" type="submit" form="paymentIssueForm">Submit issue</button>
+  `;
+  qs("#orderFlowModal").hidden = false;
+}
+
+async function submitPaymentIssueForm(event) {
+  event.preventDefault();
+  const form = event.target;
+  const orderId = form.dataset.paymentIssue;
+  const formData = new FormData(form);
+  try {
+    const payload = await api(`/api/orders/${encodeURIComponent(orderId)}/payment-issue`, {
+      method: "POST",
+      body: JSON.stringify({
+        type: formData.get("type"),
+        message: formData.get("message"),
+      }),
+    });
+    toast("Payment issue reported.");
+    await loadCustomerOrders();
+    closeOrderFlowModal();
+    const updated = payload.order || state.customerOrders.find((order) => order.id === orderId);
+    if (updated) showPaymentModal(updated);
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
+async function reportPaidNotice(orderId) {
+  try {
+    const payload = await api(`/api/orders/${encodeURIComponent(orderId)}/paid-notice`, {
+      method: "POST",
+      body: "{}",
+    });
+    toast("Thanks. We will check your payment.");
+    await loadCustomerOrders();
+    const updated = payload.order || state.customerOrders.find((order) => order.id === orderId);
+    if (updated) showPaymentModal(updated);
+  } catch (error) {
+    toast(error.message);
+  }
 }
 
 function proofForm(orderId) {
@@ -1549,17 +1694,24 @@ async function submitShopSettings(event) {
 }
 
 function renderAdminOrder(order) {
-  const canConfirm = order.paymentStatus !== "confirmed" && (!order.specialOrder || ["accepted", "countered"].includes(order.specialOrder.status));
-  const canSyncShopify = order.paymentStatus === "confirmed" && !order.shopifyOrder?.id;
+  const readyForPayment = !order.specialOrder || ["accepted", "countered"].includes(order.specialOrder.status);
+  const hasPaymentEvidence = Boolean(order.paymentLink?.url || order.proof);
+  const canConfirm = order.paymentStatus !== "confirmed" && readyForPayment && hasPaymentEvidence;
+  const hasShopifyRelevantItems = !order.specialOrder || (order.officeItems || []).length > 0;
+  const canSyncShopify = hasShopifyRelevantItems && order.paymentStatus === "confirmed" && !order.shopifyOrder?.id;
   const view = adminOrderView(order);
+  const hasManualItems = Boolean((order.externalItems || []).length);
   const workflowNote =
     view === "ready"
-      ? `<p class="muted">Payment confirmed. This order is ready for packing and tracking in Retail Shark.</p>`
+      ? `<p class="muted">${escapeHtml(readyWorkflowMessage(order, hasShopifyRelevantItems, hasManualItems))}</p>`
       : view === "completed"
         ? `<p class="muted">Fulfilled and completed.</p>`
         : "";
   const paymentNote = order.proof?.note ? `<p class="muted"><strong>Payment note:</strong> ${escapeHtml(order.proof.note)}</p>` : "";
+  const paymentLinkForm = renderAdminPaymentLinkForm(order, readyForPayment);
+  const paymentIssue = renderAdminPaymentIssue(order);
   const specialReview = order.specialOrder ? renderAdminSpecialOrder(order) : "";
+  const manualTracking = renderManualTrackingForm(order);
   const shopifySync = renderShopifySync(order);
   return `
     <article class="order-card" data-admin-order-id="${escapeHtml(order.id)}">
@@ -1574,23 +1726,75 @@ function renderAdminOrder(order) {
       <p><strong>Total:</strong> ${money.format(order.total)}</p>
       ${workflowNote}
       ${specialReview}
-      <p class="muted">POP: ${
+      ${paymentIssue}
+      ${paymentLinkForm}
+      ${manualTracking}
+      ${
         order.proof
-          ? `<a href="/api/admin/orders/${encodeURIComponent(order.id)}/proof" target="_blank" rel="noopener">${escapeHtml(order.proof.filename)}</a>`
-          : "Not uploaded"
-      }</p>
+          ? `<p class="muted">Legacy POP: <a href="/api/admin/orders/${encodeURIComponent(order.id)}/proof" target="_blank" rel="noopener">${escapeHtml(order.proof.filename)}</a></p>`
+          : ""
+      }
       ${paymentNote}
       ${shopifySync}
       ${
         canConfirm || canSyncShopify
           ? `<div class="order-actions">
-              ${canConfirm ? `<button type="button" data-confirm="${order.id}">Confirm payment</button>` : ""}
+              ${canConfirm ? `<button type="button" data-confirm="${order.id}">Confirm Yoco payment</button>` : ""}
               ${canSyncShopify ? `<button type="button" data-sync-shopify="${order.id}">Sync to Shopify</button>` : ""}
             </div>`
           : ""
       }
     </article>
   `;
+}
+
+function renderAdminPaymentIssue(order) {
+  const issue = order.paymentIssue;
+  if (!issue || issue.status === "resolved") return "";
+  return `
+    <div class="payment-issue-panel">
+      <div>
+        <strong>${escapeHtml(paymentIssueLabel(issue.type))}</strong>
+        <span>Reported ${issue.reportedAt ? new Date(issue.reportedAt).toLocaleString() : "by customer"}</span>
+      </div>
+      ${issue.message ? `<p>${escapeHtml(issue.message)}</p>` : ""}
+      <button type="button" data-resolve-payment-issue="${escapeHtml(order.id)}">Mark resolved</button>
+    </div>
+  `;
+}
+
+function renderAdminPaymentLinkForm(order, readyForPayment) {
+  if (order.paymentStatus === "confirmed") {
+    return order.paymentLink?.url
+      ? `<div class="payment-link-panel"><strong>Yoco payment</strong><a href="${escapeHtml(order.paymentLink.url)}" target="_blank" rel="noopener">${escapeHtml(order.paymentLink.reference || order.reference)}</a><span>Confirmed</span></div>`
+      : "";
+  }
+  if (!readyForPayment) {
+    return `<div class="payment-link-panel"><strong>Yoco payment link</strong><span>Review this order before attaching payment.</span></div>`;
+  }
+  const link = order.paymentLink || {};
+  return `
+    <form class="payment-link-panel" data-payment-link="${escapeHtml(order.id)}">
+      <div>
+        <strong>Yoco payment link</strong>
+        <span>${link.url ? "Payment link attached. Update it only if the Yoco link was recreated." : "Create the payment link in Yoco, then paste it here for the customer."}</span>
+      </div>
+      <label class="wide">Payment link <input name="url" type="url" value="${escapeHtml(link.url || "")}" placeholder="https://pay.yoco.com/..." required></label>
+      <label>Reference <input name="reference" value="${escapeHtml(link.reference || order.reference)}" placeholder="${escapeHtml(order.reference)}"></label>
+      <label>Note <input name="note" value="${escapeHtml(link.note || "")}" placeholder="Optional customer note"></label>
+      <button type="submit">${link.url ? "Update payment link" : "Attach payment link"}</button>
+    </form>
+  `;
+}
+
+function readyWorkflowMessage(order, hasShopifyRelevantItems, hasManualItems) {
+  if (order.specialOrder && hasShopifyRelevantItems && hasManualItems) {
+    return "Payment confirmed. Retail Shark will handle its allocation; add external shipment tracking here when available.";
+  }
+  if (order.specialOrder && hasManualItems) {
+    return "Payment confirmed. Add external shipment tracking here when available.";
+  }
+  return "Payment confirmed. This order is ready for packing and tracking in Retail Shark.";
 }
 
 function renderShopifySync(order) {
@@ -1605,6 +1809,7 @@ function renderShopifySync(order) {
   if (!sync.status || sync.status === "not_started") return `<p class="muted">Shopify: Not synced yet.</p>`;
   const labels = {
     disabled: "Sync disabled",
+    external: "Not required",
     syncing: "Syncing",
     error: "Sync error",
     synced: "Synced",
@@ -1625,22 +1830,21 @@ function renderAdminSpecialOrder(order) {
     specialOrder.status === "pending"
       ? `
         <div class="special-actions">
-          <button type="button" data-special-action="accept" data-order-id="${escapeHtml(order.id)}">Approve request</button>
+          <form class="counter-form" data-special-review="accept" data-order-id="${escapeHtml(order.id)}">
+            <p class="muted">Allocate approved units before payment is unlocked. The combined Retail Shark and external quantity cannot exceed the requested quantity.</p>
+            <div class="counter-lines fulfillment-lines">
+              ${renderFulfillmentAllocationInputs(order.items)}
+            </div>
+            <button type="submit">Approve with allocation</button>
+          </form>
           <form class="inline-admin-form" data-special-review="decline" data-order-id="${escapeHtml(order.id)}">
             <input name="reason" placeholder="Decline reason">
             <button type="submit">Decline</button>
           </form>
           <form class="counter-form" data-special-review="counter" data-order-id="${escapeHtml(order.id)}">
+            <p class="muted">Enter the approved split. Retail Shark plus external quantities become the order total and cannot exceed the requested quantity.</p>
             <div class="counter-lines">
-              ${order.items
-                .map(
-                  (item) => `
-                    <label>${escapeHtml(item.productTitle)}
-                      <input name="${escapeHtml(item.variantId)}" type="number" min="0" max="999" value="${item.quantity}">
-                    </label>
-                  `,
-                )
-                .join("")}
+              ${renderCounterAllocationInputs(order.items)}
             </div>
             <input name="note" placeholder="Counter note">
             <button type="submit">Send counter</button>
@@ -1655,9 +1859,102 @@ function renderAdminSpecialOrder(order) {
         ${specialOrder.note ? `<p class="muted">${escapeHtml(specialOrder.note)}</p>` : ""}
       </div>
       <ul>${originalItems.map((item) => `<li>${item.quantity} x ${escapeHtml(item.productTitle)}</li>`).join("")}</ul>
+      ${renderAdminFulfillmentSummary(order)}
       ${specialOrder.counterNote ? `<p class="muted">Counter note: ${escapeHtml(specialOrder.counterNote)}</p>` : ""}
       ${specialOrder.declineReason ? `<p class="muted">Decline reason: ${escapeHtml(specialOrder.declineReason)}</p>` : ""}
       ${pendingControls}
+    </div>
+  `;
+}
+
+function renderManualTrackingForm(order) {
+  const manualItems = order.externalItems || [];
+  if (!order.specialOrder || !manualItems.length) return "";
+  const tracking = order.externalTracking || {};
+  const items = manualItems.map((item) => `<li>${escapeHtml(item.quantity)} x ${escapeHtml(item.productTitle)}</li>`).join("");
+  if (order.paymentStatus !== "confirmed") {
+    return `
+      <div class="manual-tracking-panel">
+        <strong>External shipment tracking</strong>
+        <ul>${items}</ul>
+        <p class="muted">Tracking can be added after payment is confirmed.</p>
+      </div>
+    `;
+  }
+  return `
+    <form class="manual-tracking-panel" data-manual-tracking="${escapeHtml(order.id)}">
+      <div>
+        <strong>External shipment tracking</strong>
+        <p class="muted">Add tracking here for the externally fulfilled part of this special order.</p>
+      </div>
+      <ul>${items}</ul>
+      <div class="tracking-grid">
+        <label>Courier <input name="courier" value="${escapeHtml(tracking.courier || "")}" placeholder="Courier name"></label>
+        <label>Tracking number <input name="number" value="${escapeHtml(tracking.number || "")}" placeholder="Tracking number" required></label>
+        <label class="wide">Tracking URL <input name="url" type="url" value="${escapeHtml(tracking.url || "")}" placeholder="https://"></label>
+        <label class="wide">Internal note <input name="note" value="${escapeHtml(tracking.note || "")}" placeholder="Optional admin note"></label>
+      </div>
+      <button type="submit">${tracking.number ? "Update tracking" : "Save tracking"}</button>
+    </form>
+  `;
+}
+
+function renderFulfillmentAllocationInputs(items) {
+  return items
+    .map(
+      (item) => `
+        <div class="fulfillment-allocation-row" data-special-allocation-row data-variant-id="${escapeHtml(item.variantId)}" data-total="${escapeHtml(item.quantity)}">
+          <strong>${escapeHtml(item.productTitle)}</strong>
+          <span>Requested: ${escapeHtml(item.quantity)}</span>
+          <label>Retail Shark / Shopify
+            <input name="office-${escapeHtml(item.variantId)}" type="number" min="0" max="999" value="${escapeHtml(item.quantity)}">
+          </label>
+          <label>External
+            <input name="external-${escapeHtml(item.variantId)}" type="number" min="0" max="999" value="0">
+          </label>
+        </div>
+      `,
+    )
+    .join("");
+}
+
+function renderCounterAllocationInputs(items) {
+  return items
+    .map(
+      (item) => `
+        <div class="fulfillment-allocation-row" data-special-allocation-row data-variant-id="${escapeHtml(item.variantId)}" data-total="${escapeHtml(item.quantity)}">
+          <strong>${escapeHtml(item.productTitle)}</strong>
+          <span>Requested: ${escapeHtml(item.quantity)}</span>
+          <label>Retail Shark / Shopify
+            <input name="office-${escapeHtml(item.variantId)}" type="number" min="0" max="999" value="${escapeHtml(item.quantity)}">
+          </label>
+          <label>External
+            <input name="external-${escapeHtml(item.variantId)}" type="number" min="0" max="999" value="0">
+          </label>
+        </div>
+      `,
+    )
+    .join("");
+}
+
+function renderAdminFulfillmentSummary(order) {
+  const allocations = order.specialOrder?.fulfillmentAllocations || [];
+  if (!allocations.length) return "";
+  return `
+    <div class="fulfillment-summary">
+      <strong>Fulfillment split</strong>
+      <ul>
+        ${allocations
+          .map(
+            (item) => `
+              <li>
+                <span>${escapeHtml(item.productTitle || order.items.find((entry) => entry.variantId === item.variantId)?.productTitle || "Product")}</span>
+                <small>Retail Shark: ${escapeHtml(item.officeQuantity || 0)} / External: ${escapeHtml(item.externalQuantity || 0)}</small>
+              </li>
+            `,
+          )
+          .join("")}
+      </ul>
     </div>
   `;
 }
@@ -1683,11 +1980,36 @@ function submitSpecialReviewForm(event) {
     submitSpecialOrderReview(form.dataset.orderId, "decline", { reason: form.reason.value });
     return;
   }
-  const counterItems = [...form.querySelectorAll(".counter-lines input")].map((input) => ({
-    variantId: input.name,
-    quantity: input.value,
+  const allocations = collectSpecialAllocations(form);
+  const invalidAllocation = allocations.find((item) => Number(item.officeQuantity || 0) + Number(item.externalQuantity || 0) > Number(item.requestedQuantity || 0));
+  if (invalidAllocation) {
+    toast("Approved quantity cannot exceed the requested quantity.");
+    return;
+  }
+  if (action === "accept") {
+    submitSpecialOrderReview(form.dataset.orderId, "accept", { allocations });
+    return;
+  }
+  const counterItems = allocations.map((item) => ({
+    variantId: item.variantId,
+    quantity: Number(item.officeQuantity || 0) + Number(item.externalQuantity || 0),
   }));
-  submitSpecialOrderReview(form.dataset.orderId, "counter", { counterItems, note: form.note.value });
+  submitSpecialOrderReview(form.dataset.orderId, "counter", { counterItems, allocations, note: form.note.value });
+}
+
+function collectSpecialAllocations(form) {
+  return [...form.querySelectorAll("[data-special-allocation-row]")].map((row) => {
+    const variantId = row.dataset.variantId;
+    const inputs = [...row.querySelectorAll("input")];
+    const officeInput = inputs.find((input) => input.name === `office-${variantId}`);
+    const externalInput = inputs.find((input) => input.name === `external-${variantId}`);
+    return {
+      variantId,
+      requestedQuantity: Number(row.dataset.total || 0),
+      officeQuantity: officeInput?.value || 0,
+      externalQuantity: externalInput?.value || 0,
+    };
+  });
 }
 
 async function confirmPayment(orderId) {
@@ -1697,7 +2019,41 @@ async function confirmPayment(orderId) {
       body: JSON.stringify({ confirmedBy: "admin" }),
     });
     const sync = payload.order?.shopifySync;
-    toast(sync?.status === "error" ? `Payment confirmed. Shopify sync failed: ${sync.message}` : "Payment confirmed.");
+    toast(sync?.status === "error" ? `Yoco payment confirmed. Shopify sync failed: ${sync.message}` : "Yoco payment confirmed.");
+    await loadAdminOrders();
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
+async function submitPaymentLink(event) {
+  event.preventDefault();
+  const form = event.target;
+  const orderId = form.dataset.paymentLink;
+  const formData = new FormData(form);
+  try {
+    await api(`/api/admin/orders/${encodeURIComponent(orderId)}/payment-link`, {
+      method: "POST",
+      body: JSON.stringify({
+        url: formData.get("url"),
+        reference: formData.get("reference"),
+        note: formData.get("note"),
+      }),
+    });
+    toast("Yoco payment link saved.");
+    await loadAdminOrders();
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
+async function resolvePaymentIssue(orderId) {
+  try {
+    await api(`/api/admin/orders/${encodeURIComponent(orderId)}/payment-issue/resolve`, {
+      method: "POST",
+      body: "{}",
+    });
+    toast("Payment issue resolved.");
     await loadAdminOrders();
   } catch (error) {
     toast(error.message);
@@ -1712,6 +2068,28 @@ async function syncShopifyOrder(orderId) {
   } catch (error) {
     toast(error.message);
     await loadAdminOrders();
+  }
+}
+
+async function submitManualTracking(event) {
+  event.preventDefault();
+  const form = event.target;
+  const orderId = form.dataset.manualTracking;
+  const formData = new FormData(form);
+  try {
+    await api(`/api/admin/orders/${encodeURIComponent(orderId)}/external-tracking`, {
+      method: "POST",
+      body: JSON.stringify({
+        courier: formData.get("courier"),
+        number: formData.get("number"),
+        url: formData.get("url"),
+        note: formData.get("note"),
+      }),
+    });
+    toast("Tracking saved.");
+    await loadAdminOrders();
+  } catch (error) {
+    toast(error.message);
   }
 }
 
@@ -1801,6 +2179,12 @@ function searchableProductText(product) {
   return normalizeSearch([product.title, product.vendor, product.productType, product.variant?.sku, ...(product.tags || [])].join(" "));
 }
 
+function productMatchesSearch(product, query) {
+  if (!query) return true;
+  const text = searchableProductText(product);
+  return query.split(" ").filter(Boolean).every((token) => text.includes(token));
+}
+
 function typeLabel(typeId) {
   return productTypes.find((type) => type.id === typeId)?.label || titleFromId(typeId);
 }
@@ -1816,6 +2200,28 @@ function escapeHtml(value) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#039;");
+}
+
+async function copyText(value, label = "text") {
+  const text = String(value || "");
+  if (!text) return;
+  try {
+    if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(text);
+    else {
+      const input = document.createElement("textarea");
+      input.value = text;
+      input.setAttribute("readonly", "");
+      input.style.position = "fixed";
+      input.style.opacity = "0";
+      document.body.appendChild(input);
+      input.select();
+      document.execCommand("copy");
+      input.remove();
+    }
+    toast(`Copied ${label}.`);
+  } catch {
+    toast(`Could not copy ${label}.`);
+  }
 }
 
 document.addEventListener("click", (event) => {
@@ -1836,6 +2242,18 @@ document.addEventListener("click", (event) => {
 
   const confirm = event.target.closest("[data-confirm]");
   if (confirm) confirmPayment(confirm.dataset.confirm);
+
+  const paidNotice = event.target.closest("[data-paid-notice]");
+  if (paidNotice) reportPaidNotice(paidNotice.dataset.paidNotice);
+
+  const reportPaymentIssue = event.target.closest("[data-report-payment-issue]");
+  if (reportPaymentIssue) {
+    const order = state.customerOrders?.find((entry) => entry.id === reportPaymentIssue.dataset.reportPaymentIssue) || state.activePaymentOrder;
+    if (order) showPaymentIssueModal(order);
+  }
+
+  const resolveIssue = event.target.closest("[data-resolve-payment-issue]");
+  if (resolveIssue) resolvePaymentIssue(resolveIssue.dataset.resolvePaymentIssue);
 
   const syncShopify = event.target.closest("[data-sync-shopify]");
   if (syncShopify) syncShopifyOrder(syncShopify.dataset.syncShopify);
@@ -1908,6 +2326,15 @@ document.addEventListener("click", (event) => {
   if (event.target.closest("#addSpecialProduct")) addSpecialOrderItem();
   const removeSpecialItem = event.target.closest("[data-remove-special-item]");
   if (removeSpecialItem) removeSpecialOrderItem(removeSpecialItem.dataset.removeSpecialItem);
+  const specialProduct = event.target.closest("[data-special-product-id]");
+  if (specialProduct) {
+    const product = state.products.find((entry) => entry.id === specialProduct.dataset.specialProductId);
+    state.selectedSpecialProductId = specialProduct.dataset.specialProductId;
+    state.specialProductSearch = product ? `${product.vendor ? `${product.vendor} - ` : ""}${product.title}` : state.specialProductSearch;
+    renderSpecialProductOptions();
+  }
+  const copy = event.target.closest("[data-copy-value]");
+  if (copy) copyText(copy.dataset.copyValue, copy.dataset.copyLabel || "text");
   if (event.target.closest("[data-cancel-special-order]")) closeSpecialOrderModal();
   if (event.target.closest("[data-close-order-flow]")) closeOrderFlowModal();
   if (event.target.closest("[data-confirm-order]")) confirmPendingOrder();
@@ -1972,6 +2399,18 @@ qs("#catalogSearch").addEventListener("input", (event) => {
 });
 
 document.addEventListener("input", (event) => {
+  if (event.target.matches("#specialProductSearch")) {
+    state.specialProductSearch = event.target.value.trim();
+    state.selectedSpecialProductId = "";
+    qs("#specialProductId").value = "";
+    renderSpecialProductOptions();
+    const input = qs("#specialProductSearch");
+    if (input) {
+      input.focus();
+      input.setSelectionRange(input.value.length, input.value.length);
+    }
+  }
+
   if (event.target.matches("#adminProductPickSearch")) {
     syncDraftCustomSelections();
     state.adminProductSearch = event.target.value.trim();
@@ -1989,7 +2428,10 @@ document.addEventListener("submit", (event) => {
   if (event.target.matches("#registerForm")) register(event);
   if (event.target.matches("#orderForm")) submitOrder(event);
   if (event.target.matches(".proof-form")) uploadProof(event);
+  if (event.target.matches(".payment-issue-form")) submitPaymentIssueForm(event);
+  if (event.target.matches("[data-payment-link]")) submitPaymentLink(event);
   if (event.target.matches("[data-special-review]")) submitSpecialReviewForm(event);
+  if (event.target.matches("[data-manual-tracking]")) submitManualTracking(event);
   if (event.target.matches(".shop-settings-form")) submitShopSettings(event);
   if (event.target.matches("#adminAccountForm")) submitAdminAccount(event);
   if (event.target.matches("#removeAccountForm")) submitRemoveAccount(event);

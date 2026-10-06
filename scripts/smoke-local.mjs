@@ -63,19 +63,18 @@ const order = await customer.request("/api/orders", {
   }),
 });
 
-await customer.request(`/api/orders/${encodeURIComponent(order.order.id)}/proof`, {
-  method: "POST",
-  body: JSON.stringify({
-    filename: "smoke-pop.txt",
-    note: "Smoke test POP",
-    dataUrl: "data:text/plain;base64,c21va2UgcG9w",
-  }),
-});
-
 const admin = new Session();
 await admin.request("/api/auth/admin-login", {
   method: "POST",
   body: JSON.stringify({ username: "admin", password: "admin" }),
+});
+await admin.request(`/api/admin/orders/${encodeURIComponent(order.order.id)}/payment-link`, {
+  method: "POST",
+  body: JSON.stringify({
+    url: "https://pay.yoco.com/smoke-test",
+    reference: order.order.reference,
+    note: "Smoke test Yoco link",
+  }),
 });
 const confirmed = await admin.request(`/api/admin/orders/${encodeURIComponent(order.order.id)}/confirm-payment`, {
   method: "POST",

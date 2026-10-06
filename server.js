@@ -881,15 +881,71 @@ function publicOrder(order) {
     deliveryFee: order.deliveryFee,
     total: order.total,
     paymentStatus: order.paymentStatus,
+    paymentProvider: order.paymentProvider || "yoco",
+    paymentLink: publicPaymentLink(order.paymentLink),
+    paymentIssue: publicPaymentIssue(order.paymentIssue),
     fulfillmentStatus: order.fulfillmentStatus,
-    specialOrder: order.specialOrder || null,
+    specialOrder: publicSpecialOrder(order.specialOrder),
     customerStatus: customerStatus(order),
     proof: order.proof ? { filename: order.proof.filename, uploadedAt: order.proof.uploadedAt } : null,
-    canUploadProof: order.paymentStatus !== "confirmed" && readyForPayment,
+    canUploadProof: false,
+    canPay: order.paymentStatus !== "confirmed" && readyForPayment && Boolean(order.paymentLink?.url),
     tracking: order.tracking || null,
+    shipments: customerShipments(order),
     createdAt: order.createdAt,
     updatedAt: order.updatedAt,
   };
+}
+
+function publicPaymentLink(paymentLink) {
+  if (!paymentLink?.url) return null;
+  return {
+    provider: paymentLink.provider || "yoco",
+    url: paymentLink.url,
+    reference: paymentLink.reference || "",
+    note: paymentLink.note || "",
+    amount: Number(paymentLink.amount || 0),
+    attachedAt: paymentLink.attachedAt || null,
+  };
+}
+
+function publicPaymentIssue(paymentIssue) {
+  if (!paymentIssue || paymentIssue.status === "resolved") return null;
+  return {
+    status: paymentIssue.status || "open",
+    type: paymentIssue.type || "other",
+    message: paymentIssue.message || "",
+    reportedAt: paymentIssue.reportedAt || null,
+  };
+}
+
+function publicSpecialOrder(specialOrder) {
+  if (!specialOrder) return null;
+  return {
+    status: specialOrder.status,
+    note: specialOrder.note || "",
+    counterNote: specialOrder.counterNote || "",
+    declineReason: specialOrder.declineReason || "",
+  };
+}
+
+function customerShipments(order) {
+  return [
+    order.tracking?.number
+      ? {
+          courier: order.tracking.courier,
+          number: order.tracking.number,
+          url: order.tracking.url,
+        }
+      : null,
+    order.externalTracking?.number
+      ? {
+          courier: order.externalTracking.courier,
+          number: order.externalTracking.number,
+          url: order.externalTracking.url,
+        }
+      : null,
+  ].filter(Boolean);
 }
 
 function specialOrderReadyForPayment(order) {
@@ -899,6 +955,12 @@ function specialOrderReadyForPayment(order) {
 function staffOrder(order) {
   return {
     ...publicOrder(order),
+    specialOrder: order.specialOrder || null,
+    paymentLink: order.paymentLink || null,
+    paymentIssue: order.paymentIssue || null,
+    officeItems: officeFulfillmentItems(order),
+    externalItems: externalFulfillmentItems(order),
+    externalTracking: order.externalTracking || null,
     proof: order.proof
       ? {
           filename: order.proof.filename,
@@ -916,23 +978,35 @@ function staffOrder(order) {
   };
 }
 
+function retailSharkOrder(order) {
+  return {
+    ...staffOrder(order),
+    items: officeFulfillmentItems(order),
+    externalItems: externalFulfillmentItems(order),
+  };
+}
+
 function customerStatus(order) {
   if (order.specialOrder?.status === "pending") return "Special order review";
   if (order.specialOrder?.status === "declined") return "Special order declined";
-  if (order.specialOrder?.status === "countered") return "Special order countered";
   if (order.fulfillmentStatus === "shipped") return "Shipped";
   if (order.fulfillmentStatus === "back_order") return "Not ready";
   if (order.paymentStatus === "confirmed") return "Payment confirmed";
+  if (specialOrderReadyForPayment(order) && order.paymentLink?.url) return "Payment required";
+  if (specialOrderReadyForPayment(order)) return "Awaiting payment link";
+  if (order.specialOrder?.status === "countered") return "Special order countered";
   return "Payment pending";
 }
 
 function orderReadyForRetailShark(order) {
   if (order.paymentStatus !== "confirmed" || order.fulfillmentStatus === "shipped") return false;
+  if (order.specialOrder && !officeFulfillmentItems(order).length) return false;
   if (!shopifyOrderSyncEnabled) return true;
   return Boolean(order.shopifyOrder?.id);
 }
 
 function orderCompletedForRetailShark(order) {
+  if (order.specialOrder && !officeFulfillmentItems(order).length) return false;
   return order.paymentStatus === "confirmed" && order.fulfillmentStatus === "shipped";
 }
 
@@ -1029,6 +1103,9 @@ async function createOrder(input, user) {
     reference: await buildReference(isSpecialOrder ? "special" : "standard"),
     ...request,
     paymentStatus: "pending",
+    paymentProvider: "yoco",
+    paymentLink: null,
+    paymentIssue: null,
     fulfillmentStatus: "not_ready",
     tracking: null,
     proof: null,
@@ -1069,12 +1146,66 @@ async function uploadProof(orderId, input, user) {
   return order;
 }
 
+async function reportPaymentIssue(orderId, input, user) {
+  const data = await readOrdersData();
+  const order = data.orders.find((entry) => entry.id === orderId && entry.customer?.id === user.id);
+  if (!order) throw Object.assign(new Error("Order not found."), { status: 404 });
+  if (order.paymentStatus === "confirmed") throw Object.assign(new Error("Payment has already been confirmed."), { status: 409 });
+  const type = cleanText(input.type || "other", 40);
+  const allowedTypes = new Set(["link_not_opening", "amount_wrong", "payment_failed", "paid_pending", "other"]);
+  const now = new Date().toISOString();
+  order.paymentIssue = {
+    status: "open",
+    type: allowedTypes.has(type) ? type : "other",
+    message: cleanText(input.message, 700),
+    reportedAt: now,
+    reportedBy: user.id,
+    resolvedAt: null,
+    resolvedBy: null,
+  };
+  order.updatedAt = now;
+  order.statusEvents.push({ at: now, actor: "customer", type: "payment_issue_reported", label: paymentIssueLabel(order.paymentIssue.type) });
+  await writeOrdersData(data);
+  return order;
+}
+
+async function reportCustomerPaid(orderId, user) {
+  return reportPaymentIssue(orderId, { type: "paid_pending", message: "Customer reported that payment has been completed." }, user);
+}
+
+async function resolvePaymentIssue(orderId, admin) {
+  const data = await readOrdersData();
+  const order = data.orders.find((entry) => entry.id === orderId);
+  if (!order) throw Object.assign(new Error("Order not found."), { status: 404 });
+  if (!order.paymentIssue || order.paymentIssue.status === "resolved") return order;
+  const now = new Date().toISOString();
+  order.paymentIssue.status = "resolved";
+  order.paymentIssue.resolvedAt = now;
+  order.paymentIssue.resolvedBy = cleanText(admin.username || "admin", 120);
+  order.updatedAt = now;
+  order.statusEvents.push({ at: now, actor: "admin", type: "payment_issue_resolved", label: "Payment issue resolved" });
+  await writeOrdersData(data);
+  return order;
+}
+
+function paymentIssueLabel(type) {
+  const labels = {
+    link_not_opening: "Payment link issue reported",
+    amount_wrong: "Payment amount issue reported",
+    payment_failed: "Payment failed issue reported",
+    paid_pending: "Customer reported payment completed",
+    other: "Payment issue reported",
+  };
+  return labels[type] || labels.other;
+}
+
 async function confirmPayment(orderId, input, admin) {
   const data = await readOrdersData();
   const order = data.orders.find((entry) => entry.id === orderId);
   if (!order) throw Object.assign(new Error("Order not found."), { status: 404 });
   if (order.specialOrder?.status === "pending") throw Object.assign(new Error("Review the special order before confirming payment."), { status: 409 });
   if (order.specialOrder?.status === "declined") throw Object.assign(new Error("Declined special orders cannot be confirmed."), { status: 409 });
+  if (!order.paymentLink?.url && !order.proof) throw Object.assign(new Error("Attach the Yoco payment link before confirming payment."), { status: 409 });
   const now = new Date().toISOString();
   const wasConfirmed = order.paymentStatus === "confirmed";
   if (!wasConfirmed) {
@@ -1082,7 +1213,12 @@ async function confirmPayment(orderId, input, admin) {
     order.fulfillmentStatus = order.fulfillmentStatus === "back_order" ? "back_order" : "not_ready";
     order.paymentConfirmedAt = now;
     order.paymentConfirmedBy = cleanText(input.confirmedBy || admin.username || "admin", 120);
-    order.statusEvents.push({ at: now, actor: "admin", type: "payment_confirmed", label: "Payment confirmed" });
+    if (order.paymentIssue && order.paymentIssue.status !== "resolved") {
+      order.paymentIssue.status = "resolved";
+      order.paymentIssue.resolvedAt = now;
+      order.paymentIssue.resolvedBy = order.paymentConfirmedBy;
+    }
+    order.statusEvents.push({ at: now, actor: "admin", type: "payment_confirmed", label: "Yoco payment confirmed" });
   }
   if (shopifyOrderSyncEnabled && !order.shopifyOrder?.id) {
     await syncOrderToShopify(order, admin, { throwOnError: false });
@@ -1095,6 +1231,34 @@ async function confirmPayment(orderId, input, admin) {
     };
   }
   order.updatedAt = new Date().toISOString();
+  await writeOrdersData(data);
+  return order;
+}
+
+async function attachPaymentLink(orderId, input, admin) {
+  const data = await readOrdersData();
+  const order = data.orders.find((entry) => entry.id === orderId);
+  if (!order) throw Object.assign(new Error("Order not found."), { status: 404 });
+  if (order.paymentStatus === "confirmed") throw Object.assign(new Error("Payment has already been confirmed."), { status: 409 });
+  if (order.specialOrder?.status === "pending") throw Object.assign(new Error("Review the special order before attaching a payment link."), { status: 409 });
+  if (order.specialOrder?.status === "declined") throw Object.assign(new Error("Declined special orders cannot receive a payment link."), { status: 409 });
+  const url = cleanText(input.url, 800);
+  if (!/^https:\/\/.+/i.test(url) && !/^http:\/\/localhost[:/]/i.test(url) && !/^http:\/\/127\.0\.0\.1[:/]/i.test(url)) {
+    throw Object.assign(new Error("Enter a valid Yoco payment link."), { status: 400 });
+  }
+  const now = new Date().toISOString();
+  order.paymentProvider = "yoco";
+  order.paymentLink = {
+    provider: "yoco",
+    url,
+    reference: cleanText(input.reference || order.reference, 160),
+    note: cleanText(input.note, 500),
+    amount: money(order.total),
+    attachedAt: now,
+    attachedBy: cleanText(admin.username || "admin", 120),
+  };
+  order.updatedAt = now;
+  order.statusEvents.push({ at: now, actor: "admin", type: "payment_link_attached", label: "Yoco payment link attached" });
   await writeOrdersData(data);
   return order;
 }
@@ -1119,19 +1283,28 @@ async function reviewSpecialOrder(orderId, input, admin) {
   order.specialOrder.reviewedAt = now;
   order.specialOrder.reviewedBy = admin.username || "admin";
   if (action === "accept") {
+    const allocations = normalizeFulfillmentAllocations(order.items, input.allocations);
+    const approvedItems = orderItemsFromAllocations(order.items, allocations);
+    order.items = approvedItems;
+    order.subtotal = money(approvedItems.reduce((sum, item) => sum + item.price * item.quantity, 0));
+    order.total = money(order.subtotal + money(order.deliveryFee || 0));
     order.specialOrder.status = "accepted";
+    order.specialOrder.fulfillmentAllocations = allocations.filter((entry) => entry.officeQuantity + entry.externalQuantity > 0);
     order.statusEvents.push({ at: now, actor: "admin", type: "special_order_accepted", label: "Special order approved" });
   } else if (action === "decline") {
     order.specialOrder.status = "declined";
     order.specialOrder.declineReason = cleanText(input.reason, 500);
+    order.specialOrder.fulfillmentAllocations = [];
     order.statusEvents.push({ at: now, actor: "admin", type: "special_order_declined", label: "Special order declined" });
   } else if (action === "counter") {
-    const counterItems = counterOrderItems(order.items, input.counterItems);
+    const allocations = normalizeFulfillmentAllocations(order.items, input.allocations);
+    const counterItems = counterOrderItems(order.items, input.counterItems, allocations);
     order.items = counterItems;
     order.subtotal = money(counterItems.reduce((sum, item) => sum + item.price * item.quantity, 0));
     order.total = money(order.subtotal + money(order.deliveryFee || 0));
     order.specialOrder.status = "countered";
     order.specialOrder.counterItems = counterItems.map((item) => ({ ...item }));
+    order.specialOrder.fulfillmentAllocations = allocations.filter((entry) => entry.officeQuantity + entry.externalQuantity > 0);
     order.specialOrder.counterNote = cleanText(input.note, 500);
     order.statusEvents.push({ at: now, actor: "admin", type: "special_order_countered", label: "Special order countered" });
   } else {
@@ -1142,15 +1315,70 @@ async function reviewSpecialOrder(orderId, input, admin) {
   return order;
 }
 
-function counterOrderItems(currentItems, inputItems) {
-  const quantityByVariant = new Map(
-    (Array.isArray(inputItems) ? inputItems : []).map((item) => [cleanText(item.variantId, 160), Math.max(0, Math.floor(Number(item.quantity || 0)))]),
+function counterOrderItems(currentItems, inputItems, allocations = []) {
+  const allocationQuantityByVariant = new Map(
+    allocations.map((item) => [item.variantId, Math.max(0, Number(item.officeQuantity || 0) + Number(item.externalQuantity || 0))]),
   );
-  const items = currentItems
-    .map((item) => ({ ...item, quantity: quantityByVariant.has(item.variantId) ? quantityByVariant.get(item.variantId) : item.quantity }))
-    .filter((item) => item.quantity > 0);
+  const quantityByVariant = allocationQuantityByVariant.size
+    ? allocationQuantityByVariant
+    : new Map((Array.isArray(inputItems) ? inputItems : []).map((item) => [cleanText(item.variantId, 160), Math.max(0, Math.floor(Number(item.quantity || 0)))]));
+  const items = currentItems.map((item) => ({ ...item, quantity: quantityByVariant.get(item.variantId) ?? item.quantity })).filter((item) => item.quantity > 0);
   if (!items.length) throw Object.assign(new Error("Counter with at least one supplied item."), { status: 400 });
   return items;
+}
+
+function normalizeFulfillmentAllocations(items, inputAllocations) {
+  const allocationByVariant = new Map(
+    (Array.isArray(inputAllocations) ? inputAllocations : []).map((entry) => [cleanText(entry.variantId, 160), entry]),
+  );
+  return (items || []).map((item) => {
+    const raw = allocationByVariant.get(item.variantId) || {};
+    const requestedQuantity = Math.max(0, Math.floor(Number(item.quantity || 0)));
+    const officeQuantity = Math.max(0, Math.floor(Number(raw.officeQuantity ?? requestedQuantity)));
+    const externalQuantity = Math.max(0, Math.floor(Number(raw.externalQuantity ?? 0)));
+    if (officeQuantity + externalQuantity > requestedQuantity) {
+      throw Object.assign(new Error(`The approved quantity for ${item.productTitle} cannot exceed the requested quantity.`), { status: 400 });
+    }
+    return {
+      variantId: item.variantId,
+      productTitle: item.productTitle,
+      requestedQuantity,
+      officeQuantity,
+      externalQuantity,
+    };
+  });
+}
+
+function orderItemsFromAllocations(items, allocations) {
+  const quantityByVariant = new Map(allocations.map((entry) => [entry.variantId, entry.officeQuantity + entry.externalQuantity]));
+  const approvedItems = (items || [])
+    .map((item) => ({ ...item, quantity: quantityByVariant.get(item.variantId) ?? item.quantity }))
+    .filter((item) => item.quantity > 0);
+  if (!approvedItems.length) throw Object.assign(new Error("Approve at least one supplied item."), { status: 400 });
+  return approvedItems;
+}
+
+function allocationQuantity(order, variantId, key) {
+  const allocation = (order.specialOrder?.fulfillmentAllocations || []).find((entry) => entry.variantId === variantId);
+  if (!allocation) return null;
+  return Math.max(0, Math.floor(Number(allocation[key] || 0)));
+}
+
+function officeFulfillmentItems(order) {
+  if (!order.specialOrder) return (order.items || []).map((item) => ({ ...item }));
+  if (!Array.isArray(order.specialOrder.fulfillmentAllocations) || !order.specialOrder.fulfillmentAllocations.length) {
+    return ["accepted", "countered"].includes(order.specialOrder.status) ? (order.items || []).map((item) => ({ ...item })) : [];
+  }
+  return (order.items || [])
+    .map((item) => ({ ...item, quantity: allocationQuantity(order, item.variantId, "officeQuantity") ?? item.quantity }))
+    .filter((item) => item.quantity > 0);
+}
+
+function externalFulfillmentItems(order) {
+  if (!order.specialOrder || !Array.isArray(order.specialOrder.fulfillmentAllocations)) return [];
+  return (order.items || [])
+    .map((item) => ({ ...item, quantity: allocationQuantity(order, item.variantId, "externalQuantity") || 0 }))
+    .filter((item) => item.quantity > 0);
 }
 
 async function updateTracking(orderId, input) {
@@ -1168,6 +1396,32 @@ async function updateTracking(orderId, input) {
   if (!order.tracking.number) throw new Error("Tracking number is required.");
   order.updatedAt = now;
   order.statusEvents.push({ at: now, actor: "staff", type: "tracking_added", label: "Tracking added" });
+  await writeOrdersData(data);
+  return order;
+}
+
+async function updateExternalTracking(orderId, input, admin) {
+  const data = await readOrdersData();
+  const order = data.orders.find((entry) => entry.id === orderId);
+  if (!order) throw Object.assign(new Error("Order not found."), { status: 404 });
+  if (order.paymentStatus !== "confirmed") throw Object.assign(new Error("Payment must be confirmed first."), { status: 409 });
+  if (!externalFulfillmentItems(order).length) throw Object.assign(new Error("This order does not have external fulfillment items."), { status: 409 });
+  const now = new Date().toISOString();
+  order.externalTracking = {
+    courier: cleanText(input.courier, 120),
+    number: cleanText(input.number, 180),
+    url: cleanText(input.url, 500),
+    note: cleanText(input.note, 500),
+    addedAt: now,
+    addedBy: cleanText(admin?.username || "admin", 120),
+  };
+  if (!order.externalTracking.number) throw new Error("Tracking number is required.");
+  if (!officeFulfillmentItems(order).length) {
+    order.fulfillmentStatus = "shipped";
+    order.shippedAt = now;
+  }
+  order.updatedAt = now;
+  order.statusEvents.push({ at: now, actor: "admin", type: "external_tracking_added", label: "External shipment tracking added" });
   await writeOrdersData(data);
   return order;
 }
@@ -1210,6 +1464,22 @@ async function syncOrderToShopify(order, admin, options = {}) {
   if (order.specialOrder?.status === "pending" || order.specialOrder?.status === "declined") {
     throw Object.assign(new Error("This special order is not ready for Shopify sync."), { status: 409 });
   }
+  if (!shopifyFulfillmentItems(order).length) {
+    order.shopifySync = {
+      status: "external",
+      attemptedAt: now,
+      attemptedBy: cleanText(admin?.username || "admin", 120),
+      syncedAt: new Date().toISOString(),
+      message: "No Retail Shark / Shopify items. Shopify order creation skipped.",
+    };
+    order.statusEvents.push({
+      at: new Date().toISOString(),
+      actor: "system",
+      type: "shopify_order_skipped",
+      label: "Shopify order skipped for external fulfillment",
+    });
+    return { created: false, order: null };
+  }
   if (order.shopifyOrder?.id) return { created: false, order: order.shopifyOrder };
   order.shopifySync = {
     status: "syncing",
@@ -1247,7 +1517,8 @@ async function syncOrderToShopify(order, admin, options = {}) {
 }
 
 async function createShopifyOrder(order) {
-  for (const item of order.items || []) {
+  const shopifyItems = shopifyFulfillmentItems(order);
+  for (const item of shopifyItems) {
     if (!String(item.variantId || "").startsWith("gid://shopify/ProductVariant/")) {
       throw new Error(`"${item.productTitle}" does not have a Shopify variant ID and cannot be synced.`);
     }
@@ -1276,7 +1547,7 @@ async function createShopifyOrder(order) {
     }
   `;
   const variables = {
-    order: buildShopifyOrderInput(order),
+    order: buildShopifyOrderInput(order, shopifyItems),
     options: {
       inventoryBehaviour: shopifyOrderInventoryBehaviour,
       sendReceipt: shopifyOrderSendReceipt,
@@ -1302,7 +1573,11 @@ async function createShopifyOrder(order) {
   };
 }
 
-function buildShopifyOrderInput(order) {
+function shopifyFulfillmentItems(order) {
+  return order.specialOrder ? officeFulfillmentItems(order) : (order.items || []).map((item) => ({ ...item }));
+}
+
+function buildShopifyOrderInput(order, lineItems = shopifyFulfillmentItems(order)) {
   const nameParts = splitCustomerName(order.customer?.name);
   const shippingAddress = shopifyMailingAddress(order.delivery?.address, order.customer);
   const input = {
@@ -1316,12 +1591,13 @@ function buildShopifyOrderInput(order) {
       },
     },
     financialStatus: "PAID",
-    lineItems: (order.items || []).map((item) => ({
+    lineItems: lineItems.map((item) => ({
       variantId: item.variantId,
       quantity: item.quantity,
       properties: [
         { name: "Online Portal reference", value: order.reference },
         ...(order.specialOrder ? [{ name: "Order type", value: "Special order" }] : []),
+        ...(order.specialOrder ? [{ name: "Fulfillment source", value: "Retail Shark" }] : []),
       ],
     })),
     shippingAddress,
@@ -1333,6 +1609,8 @@ function buildShopifyOrderInput(order) {
       `Online Portal reference: ${order.reference}`,
       `Payment verified by admin before Shopify order creation.`,
       order.specialOrder ? `Special order status: ${order.specialOrder.status}` : "",
+      order.specialOrder ? `Shopify includes Retail Shark allocation only.` : "",
+      externalFulfillmentItems(order).length ? `External fulfillment items: ${externalFulfillmentItems(order).map((item) => `${item.quantity} x ${item.productTitle}`).join("; ")}` : "",
       order.proof?.filename ? `POP file: ${order.proof.filename}` : "",
     ]
       .filter(Boolean)
@@ -1501,8 +1779,8 @@ async function catalogProducts() {
     }
   `;
   const [productNodes, collectionNodes] = await Promise.all([
-    fetchShopifyConnection(endpoint, accessToken, productsQuery, "products", { query: "status:active" }, 5),
-    fetchShopifyConnection(endpoint, accessToken, collectionsQuery, "collections", {}, 5),
+    fetchShopifyConnection(endpoint, accessToken, productsQuery, "products", { query: "status:active" }, 20),
+    fetchShopifyConnection(endpoint, accessToken, collectionsQuery, "collections", {}, 10),
   ]);
   const collectionImages = buildCollectionImageLookup(collectionNodes);
   const products = productNodes.map((product) => normalizeCatalogProduct(product, collectionImages)).filter((product) => product.variant);
@@ -2021,10 +2299,34 @@ async function handleApi(req, res, url) {
     const order = await uploadProof(decodeURIComponent(proofMatch[1]), await bodyJson(req), user);
     return json(res, 200, { ok: true, order: publicOrder(order) });
   }
+  const paymentIssueMatch = url.pathname.match(/^\/api\/orders\/([^/]+)\/payment-issue$/);
+  if (req.method === "POST" && paymentIssueMatch) {
+    const user = await requireCustomer(req);
+    const order = await reportPaymentIssue(decodeURIComponent(paymentIssueMatch[1]), await bodyJson(req), user);
+    return json(res, 200, { ok: true, order: publicOrder(order) });
+  }
+  const paidNoticeMatch = url.pathname.match(/^\/api\/orders\/([^/]+)\/paid-notice$/);
+  if (req.method === "POST" && paidNoticeMatch) {
+    const user = await requireCustomer(req);
+    const order = await reportCustomerPaid(decodeURIComponent(paidNoticeMatch[1]), user);
+    return json(res, 200, { ok: true, order: publicOrder(order) });
+  }
   const adminConfirmMatch = url.pathname.match(/^\/api\/admin\/orders\/([^/]+)\/confirm-payment$/);
   if (req.method === "POST" && adminConfirmMatch) {
     const admin = requireAdmin(req);
     const order = await confirmPayment(decodeURIComponent(adminConfirmMatch[1]), await bodyJson(req), admin);
+    return json(res, 200, { ok: true, order: staffOrder(order) });
+  }
+  const adminPaymentLinkMatch = url.pathname.match(/^\/api\/admin\/orders\/([^/]+)\/payment-link$/);
+  if (req.method === "POST" && adminPaymentLinkMatch) {
+    const admin = requireAdmin(req);
+    const order = await attachPaymentLink(decodeURIComponent(adminPaymentLinkMatch[1]), await bodyJson(req), admin);
+    return json(res, 200, { ok: true, order: staffOrder(order) });
+  }
+  const adminPaymentIssueResolveMatch = url.pathname.match(/^\/api\/admin\/orders\/([^/]+)\/payment-issue\/resolve$/);
+  if (req.method === "POST" && adminPaymentIssueResolveMatch) {
+    const admin = requireAdmin(req);
+    const order = await resolvePaymentIssue(decodeURIComponent(adminPaymentIssueResolveMatch[1]), admin);
     return json(res, 200, { ok: true, order: staffOrder(order) });
   }
   const adminShopifySyncMatch = url.pathname.match(/^\/api\/admin\/orders\/([^/]+)\/sync-shopify$/);
@@ -2037,6 +2339,12 @@ async function handleApi(req, res, url) {
   if (req.method === "POST" && adminSpecialOrderMatch) {
     const admin = requireAdmin(req);
     const order = await reviewSpecialOrder(decodeURIComponent(adminSpecialOrderMatch[1]), await bodyJson(req), admin);
+    return json(res, 200, { ok: true, order: staffOrder(order) });
+  }
+  const adminExternalTrackingMatch = url.pathname.match(/^\/api\/admin\/orders\/([^/]+)\/external-tracking$/);
+  if (req.method === "POST" && adminExternalTrackingMatch) {
+    const admin = requireAdmin(req);
+    const order = await updateExternalTracking(decodeURIComponent(adminExternalTrackingMatch[1]), await bodyJson(req), admin);
     return json(res, 200, { ok: true, order: staffOrder(order) });
   }
   if (req.method === "GET" && url.pathname === "/api/admin/orders") {
@@ -2093,13 +2401,13 @@ async function handleApi(req, res, url) {
   if (req.method === "GET" && url.pathname === "/api/internal/orders/confirmed") {
     requireInternal(req);
     const data = await readOrdersData();
-    const orders = data.orders.filter(orderReadyForRetailShark).map(staffOrder);
+    const orders = data.orders.filter(orderReadyForRetailShark).map(retailSharkOrder);
     return json(res, 200, { ok: true, orders });
   }
   if (req.method === "GET" && url.pathname === "/api/internal/orders/history") {
     requireInternal(req);
     const data = await readOrdersData();
-    const orders = data.orders.filter(orderCompletedForRetailShark).map(staffOrder);
+    const orders = data.orders.filter(orderCompletedForRetailShark).map(retailSharkOrder);
     return json(res, 200, { ok: true, orders });
   }
   const trackingMatch = url.pathname.match(/^\/api\/internal\/orders\/([^/]+)\/tracking$/);

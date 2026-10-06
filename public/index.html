@@ -211,7 +211,10 @@
                 <section id="checkoutAddressPanel" class="checkout-address-panel"></section>
                 <label>Delivery notes<textarea name="notes" rows="2"></textarea></label>
                 <div class="cart-actions">
-                  <button class="secondary" id="openSpecialOrder" type="button">Special order</button>
+                  <button class="special-order-trigger" id="openSpecialOrder" type="button">
+                    <span>Special order</span>
+                    <small>Request larger quantities or out-of-stock products</small>
+                  </button>
                   <button class="primary" type="submit">Submit order</button>
                 </div>
               </form>
@@ -313,13 +316,16 @@
           <div class="section-heading compact-heading">
             <div>
               <p class="eyebrow">Special order</p>
-              <h2 id="specialOrderTitle">Request a larger quantity</h2>
+              <h2 id="specialOrderTitle">Request larger quantities or out-of-stock products</h2>
             </div>
           </div>
           <section class="settings-grid">
-            <label class="wide">Product
-              <select id="specialProductSelect" name="productId" required></select>
-            </label>
+            <div class="wide special-product-picker">
+              <label for="specialProductSearch">Product search</label>
+              <input id="specialProductSearch" name="productSearch" type="search" placeholder="Search brand, product, SKU, type">
+              <input id="specialProductId" name="productId" type="hidden" required>
+              <div id="specialProductResults" class="special-product-results" role="listbox" aria-label="Special order products"></div>
+            </div>
             <label>Quantity <span>*</span><input name="quantity" type="number" min="1" max="999" value="1" required></label>
             <div class="special-line-action">
               <button class="secondary inline-add" id="addSpecialProduct" type="button">Add product</button>

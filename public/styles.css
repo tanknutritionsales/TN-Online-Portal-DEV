@@ -947,6 +947,50 @@ nav {
   align-items: end;
 }
 
+.special-product-picker {
+  display: grid;
+  gap: 8px;
+}
+
+.special-product-results {
+  display: grid;
+  gap: 8px;
+  max-height: 310px;
+  overflow: auto;
+  padding: 4px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.special-product-option {
+  display: grid;
+  gap: 3px;
+  width: 100%;
+  min-height: 54px;
+  border: 1px solid var(--soft-line);
+  border-radius: 8px;
+  background: #fff;
+  color: var(--ink);
+  padding: 9px 10px;
+  text-align: left;
+}
+
+.special-product-option span {
+  font-weight: 950;
+}
+
+.special-product-option small {
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 850;
+}
+
+.special-product-option.is-selected {
+  border-color: var(--red);
+  box-shadow: inset 4px 0 0 var(--red);
+}
+
 .special-order-items {
   grid-column: 1 / -1;
   display: grid;
@@ -1205,6 +1249,30 @@ nav {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1.3fr);
   gap: 10px;
+}
+
+.special-order-trigger {
+  display: grid;
+  gap: 3px;
+  min-height: 58px;
+  border: 1px solid #f2c3c5;
+  border-left: 4px solid var(--red);
+  border-radius: 8px;
+  background: #fff5f5;
+  color: var(--red-dark);
+  padding: 9px 12px;
+  text-align: left;
+}
+
+.special-order-trigger span {
+  font-weight: 950;
+}
+
+.special-order-trigger small {
+  color: #7d2226;
+  font-size: 0.78rem;
+  font-weight: 850;
+  line-height: 1.25;
 }
 
 .modal-shell {
@@ -1650,6 +1718,55 @@ nav {
   color: #111;
 }
 
+.payment-line,
+.payment-copy-actions,
+.payment-support-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.payment-line.important {
+  justify-content: space-between;
+}
+
+.payment-line button,
+.payment-copy-actions button,
+.payment-support-actions button {
+  min-height: 32px;
+  border-radius: 999px;
+  background: #171717;
+  color: #fff;
+  padding: 0 11px;
+  font-size: 0.78rem;
+  font-weight: 950;
+}
+
+.payment-copy-actions {
+  margin-top: 5px;
+}
+
+.payment-support-actions {
+  margin-top: 7px;
+}
+
+.payment-support-actions button:last-child {
+  background: #fff;
+  color: #171717;
+  border: 1px solid #d6d6d6;
+}
+
+.payment-issue-note {
+  display: inline-flex;
+  width: fit-content;
+  border-radius: 999px;
+  background: #fff;
+  border: 1px solid #efc163;
+  padding: 5px 9px;
+  font-weight: 900;
+}
+
 .special-status,
 .special-review {
   display: grid;
@@ -1687,6 +1804,175 @@ nav {
 .counter-lines label {
   grid-template-columns: 1fr 90px;
   align-items: center;
+}
+
+.fulfillment-lines,
+.fulfillment-allocation-row,
+.fulfillment-summary,
+.payment-link-panel,
+.payment-issue-panel,
+.manual-tracking-panel {
+  display: grid;
+  gap: 10px;
+}
+
+.fulfillment-allocation-row {
+  grid-template-columns: minmax(220px, 1.5fr) minmax(90px, 0.6fr) repeat(2, minmax(130px, 1fr));
+  align-items: end;
+  border: 1px solid var(--soft-line);
+  border-radius: 8px;
+  background: var(--panel);
+  padding: 10px;
+}
+
+.fulfillment-allocation-row > span {
+  color: var(--muted);
+  font-size: 0.82rem;
+  font-weight: 850;
+}
+
+.fulfillment-allocation-row label {
+  display: grid;
+  gap: 5px;
+  font-size: 0.78rem;
+}
+
+.fulfillment-summary {
+  padding: 10px;
+  border: 1px solid var(--soft-line);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.fulfillment-summary ul {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.fulfillment-summary li {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.fulfillment-summary small {
+  color: var(--muted);
+  font-weight: 850;
+}
+
+.manual-tracking-panel {
+  padding: 10px;
+  border: 1px solid var(--soft-line);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.payment-link-panel {
+  padding: 10px;
+  border: 1px solid var(--soft-line);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.payment-issue-panel {
+  padding: 10px;
+  border: 1px solid #efc163;
+  border-left: 4px solid #efc163;
+  border-radius: 8px;
+  background: #fff8e8;
+}
+
+.payment-issue-panel > div {
+  display: grid;
+  gap: 3px;
+}
+
+.payment-issue-panel span,
+.payment-issue-panel p {
+  color: #594015;
+}
+
+.payment-issue-panel button {
+  justify-self: start;
+  min-height: 36px;
+  border-radius: 8px;
+  background: #171717;
+  color: #fff;
+  padding: 0 13px;
+  font-weight: 950;
+}
+
+.payment-issue-form {
+  display: grid;
+  gap: 12px;
+}
+
+.payment-issue-form label {
+  display: grid;
+  gap: 6px;
+}
+
+.payment-link-panel > div {
+  display: grid;
+  gap: 3px;
+}
+
+.payment-link-panel span {
+  color: var(--muted);
+  font-size: 0.84rem;
+  font-weight: 850;
+}
+
+.payment-link-panel a {
+  color: var(--red);
+  font-weight: 950;
+  word-break: break-word;
+}
+
+.payment-link-panel label {
+  display: grid;
+  gap: 5px;
+}
+
+.payment-link-panel button {
+  justify-self: start;
+  min-height: 38px;
+  padding: 0 16px;
+  border-radius: 8px;
+  background: var(--red);
+  color: #fff;
+  font-weight: 950;
+}
+
+.manual-tracking-panel ul {
+  display: grid;
+  gap: 5px;
+  margin: 0;
+  padding-left: 18px;
+}
+
+.tracking-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.tracking-grid .wide {
+  grid-column: 1 / -1;
+}
+
+.manual-tracking-panel button {
+  justify-self: start;
+  min-height: 38px;
+  padding: 0 16px;
+  border-radius: 8px;
+  background: var(--red);
+  color: #fff;
+  font-weight: 950;
 }
 
 .special-actions button,
@@ -1729,6 +2015,38 @@ nav {
 
 :root[data-theme="dark"] .payment-box span {
   color: #e8d9da;
+}
+
+:root[data-theme="dark"] .special-order-trigger {
+  border-color: #5a282a;
+  background: #211516;
+  color: #fff;
+}
+
+:root[data-theme="dark"] .special-order-trigger small {
+  color: #ffb2b6;
+}
+
+:root[data-theme="dark"] .special-product-option {
+  background: #151515;
+  color: #f7f7f7;
+}
+
+:root[data-theme="dark"] .fulfillment-allocation-row,
+:root[data-theme="dark"] .fulfillment-summary,
+:root[data-theme="dark"] .payment-link-panel,
+:root[data-theme="dark"] .payment-issue-panel,
+:root[data-theme="dark"] .manual-tracking-panel {
+  background: #151515;
+}
+
+:root[data-theme="dark"] .payment-issue-panel {
+  border-color: #a97719;
+}
+
+:root[data-theme="dark"] .payment-issue-panel span,
+:root[data-theme="dark"] .payment-issue-panel p {
+  color: #f2d59c;
 }
 
 :root[data-theme="dark"] .payment-box.is-confirmed {
@@ -1894,6 +2212,8 @@ nav {
   .shop-controls,
   .settings-grid,
   .cart-actions,
+  .fulfillment-allocation-row,
+  .tracking-grid,
   .order-shell,
   .topbar {
     grid-template-columns: 1fr;
