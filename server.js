@@ -35,16 +35,18 @@ const sessionSecret = process.env.SESSION_SECRET || env.SESSION_SECRET || "dev-s
 const sessionCookieName = "op_session";
 const sessionMaxAge = 60 * 60 * 24 * 7;
 const maxJsonBodyBytes = Number(process.env.MAX_JSON_BODY_BYTES || env.MAX_JSON_BODY_BYTES || 7_000_000);
-const dataStorageMode = process.env.DATA_STORAGE_MODE || env.DATA_STORAGE_MODE || (isProduction ? "blobs" : "local");
+const dataStorageMode = process.env.DATA_STORAGE_MODE || env.DATA_STORAGE_MODE || (isProduction && (process.env.DATABASE_URL || env.DATABASE_URL) ? "postgres" : isProduction ? "blobs" : "local");
 const dataBlobStoreName = process.env.DATA_BLOB_STORE || env.DATA_BLOB_STORE || "op-runtime-data";
 const proofStorageMode = process.env.PROOF_STORAGE_MODE || env.PROOF_STORAGE_MODE || (isProduction ? "blobs" : "local");
 const proofBlobStoreName = process.env.PROOF_BLOB_STORE || env.PROOF_BLOB_STORE || "op-payment-proofs";
 const retailSharkInternalUrl = process.env.RETAIL_SHARK_INTERNAL_URL || env.RETAIL_SHARK_INTERNAL_URL || "";
 const retailSharkInternalToken = process.env.RETAIL_SHARK_INTERNAL_TOKEN || env.RETAIL_SHARK_INTERNAL_TOKEN || "";
+const termsVersion = "research-use-v1-2026-10-08";
 
 let shopifyClientCredentialsToken = null;
 let databasePool = null;
 let databaseReady = false;
+const rateLimitBuckets = new Map();
 
 validateRuntimeConfig();
 
@@ -107,6 +109,61 @@ function loadDotEnv(filePath) {
 
 function boolEnv(value) {
   return ["1", "true", "yes", "on"].includes(String(value || "").trim().toLowerCase());
+}
+
+function activePaymentProvider(settings) {
+  return settings?.payment?.activeProvider || "yoco";
+}
+
+function defaultPaymentProviders() {
+  return {
+    yoco: {
+      enabled: true,
+      label: "Yoco payment link",
+      customerTitle: "Secure Yoco payment",
+      adminTitle: "Yoco payment link",
+      payButtonLabel: "Pay now",
+      copyLabel: "payment link",
+      linkPlaceholder: "https://pay.yoco.com/...",
+      customerInstructions: "Use the secure Yoco link below to complete payment.",
+      adminInstructions: "Create the payment link in Yoco, then paste it here for the customer.",
+      confirmationLabel: "Yoco payment confirmed",
+      requireLink: true,
+      allowProofUpload: false,
+    },
+    eft: {
+      enabled: false,
+      label: "EFT manual payment",
+      customerTitle: "EFT payment",
+      adminTitle: "EFT payment details",
+      payButtonLabel: "View EFT details",
+      copyLabel: "EFT details",
+      linkPlaceholder: "",
+      accountName: process.env.BANK_ACCOUNT_NAME || env.BANK_ACCOUNT_NAME || "Tank Nutrition",
+      bankName: process.env.BANK_NAME || env.BANK_NAME || "",
+      accountNumber: process.env.BANK_ACCOUNT_NUMBER || env.BANK_ACCOUNT_NUMBER || "",
+      branchCode: process.env.BANK_BRANCH_CODE || env.BANK_BRANCH_CODE || "",
+      customerInstructions: "Use the banking details and order reference below. Our team will verify payment before processing.",
+      adminInstructions: "Review availability, then save the EFT details to unlock payment instructions for the customer.",
+      confirmationLabel: "EFT payment confirmed",
+      requireLink: false,
+      allowProofUpload: false,
+    },
+    manual: {
+      enabled: false,
+      label: "Manual/custom",
+      customerTitle: "Payment instructions",
+      adminTitle: "Manual payment instructions",
+      payButtonLabel: "View payment instructions",
+      copyLabel: "payment instructions",
+      linkPlaceholder: "https://",
+      customerInstructions: "Follow the payment instructions below. Our team will verify payment before processing.",
+      adminInstructions: "Enter the customer-facing payment instruction or optional payment URL.",
+      confirmationLabel: "Payment confirmed",
+      requireLink: false,
+      allowProofUpload: false,
+    },
+  };
 }
 
 function dataStorageUsesBlobs() {
@@ -435,6 +492,41 @@ function cookies(req) {
   );
 }
 
+function clientIp(req) {
+  return cleanText(String(req.headers["x-nf-client-connection-ip"] || req.headers["x-forwarded-for"] || req.socket?.remoteAddress || "unknown").split(",")[0], 80);
+}
+
+function rateLimit(req, bucket, limit, windowMs) {
+  const now = Date.now();
+  const key = `${bucket}:${clientIp(req)}`;
+  const entry = rateLimitBuckets.get(key) || { count: 0, resetAt: now + windowMs };
+  if (entry.resetAt <= now) {
+    entry.count = 0;
+    entry.resetAt = now + windowMs;
+  }
+  entry.count += 1;
+  rateLimitBuckets.set(key, entry);
+  if (entry.count > limit) {
+    throw Object.assign(new Error("Too many requests. Please try again shortly."), { status: 429 });
+  }
+}
+
+function applyRouteRateLimit(req, url) {
+  if (req.method === "GET") return;
+  if (url.pathname === "/api/auth/login" || url.pathname === "/api/auth/admin-login") return rateLimit(req, "login", 12, 10 * 60 * 1000);
+  if (url.pathname === "/api/auth/register") return rateLimit(req, "register", 5, 60 * 60 * 1000);
+  if (url.pathname === "/api/orders") return rateLimit(req, "orders", 20, 10 * 60 * 1000);
+  if (url.pathname.includes("/payment") || url.pathname.includes("/proof")) return rateLimit(req, "payment", 40, 10 * 60 * 1000);
+}
+
+function requirePortalClientHeader(req, url) {
+  if (req.method === "GET") return;
+  if (url.pathname.startsWith("/api/internal/")) return;
+  if (req.headers["x-op-client"] !== "portal") {
+    throw Object.assign(new Error("Invalid request source."), { status: 403 });
+  }
+}
+
 function sessionFromRequest(req) {
   const token = cookies(req)[sessionCookieName];
   if (!token) return null;
@@ -565,10 +657,12 @@ function normalizeStoredUser(user = {}) {
     defaultAddress: defaultAddressFromList(addresses, existingDefaultAddress),
     addresses,
     preferences: normalizeCustomerPreferences(user.preferences),
+    termsAcceptance: normalizeTermsAcceptance(user.termsAcceptance),
   };
 }
 
 function defaultShopSettings() {
+  const paymentProviders = defaultPaymentProviders();
   return {
     featured: {
       mode: "collection",
@@ -578,11 +672,10 @@ function defaultShopSettings() {
       customProductIds: [],
     },
     payment: {
-      accountName: process.env.BANK_ACCOUNT_NAME || env.BANK_ACCOUNT_NAME || "Tank Nutrition",
-      bankName: process.env.BANK_NAME || env.BANK_NAME || "",
-      accountNumber: process.env.BANK_ACCOUNT_NUMBER || env.BANK_ACCOUNT_NUMBER || "",
-      branchCode: process.env.BANK_BRANCH_CODE || env.BANK_BRANCH_CODE || "",
-      note: "Once POP has been uploaded, the order will be verified and tracking details will follow.",
+      activeProvider: "yoco",
+      reviewWindow: "12-24 hours",
+      note: "Once payment has been marked as paid, the order will be verified and tracking details will follow.",
+      providers: paymentProviders,
     },
     references: {
       standardFormat: "OP-{YYYY}{MM}{DD}-{RAND4}",
@@ -596,6 +689,7 @@ function normalizeShopSettings(input = {}) {
   const payment = input.payment || {};
   const references = input.references || {};
   const defaults = defaultShopSettings();
+  const providerDefaults = defaultPaymentProviders();
   const mode = cleanText(featured.mode, 20) === "custom" ? "custom" : "collection";
   const customProductIds = Array.isArray(featured.customProductIds)
     ? featured.customProductIds.map((id) => cleanText(id, 180)).filter(Boolean).slice(0, 24)
@@ -608,17 +702,54 @@ function normalizeShopSettings(input = {}) {
       collectionQuery: cleanText(featured.collectionQuery || "Dex", 80),
       customProductIds,
     },
-    payment: {
-      accountName: cleanText(payment.accountName || defaults.payment.accountName, 120),
-      bankName: cleanText(payment.bankName || defaults.payment.bankName, 120),
-      accountNumber: cleanText(payment.accountNumber || defaults.payment.accountNumber, 80),
-      branchCode: cleanText(payment.branchCode || defaults.payment.branchCode, 80),
-      note: cleanText(payment.note || defaults.payment.note, 500),
-    },
+    payment: normalizePaymentSettings(payment, defaults.payment, providerDefaults),
     references: {
       standardFormat: normalizeReferenceFormat(references.standardFormat || defaults.references.standardFormat, defaults.references.standardFormat),
       specialFormat: normalizeReferenceFormat(references.specialFormat || defaults.references.specialFormat, defaults.references.specialFormat),
     },
+  };
+}
+
+function normalizePaymentSettings(payment = {}, defaults = { activeProvider: "yoco", reviewWindow: "12-24 hours", note: "" }, providerDefaults = defaultPaymentProviders()) {
+  const legacyEft = {
+    accountName: cleanText(payment.accountName || providerDefaults.eft.accountName, 120),
+    bankName: cleanText(payment.bankName || providerDefaults.eft.bankName, 120),
+    accountNumber: cleanText(payment.accountNumber || providerDefaults.eft.accountNumber, 80),
+    branchCode: cleanText(payment.branchCode || providerDefaults.eft.branchCode, 80),
+  };
+  const rawProviders = payment.providers || {};
+  const providers = {};
+  for (const [key, providerDefault] of Object.entries(providerDefaults)) {
+    const input = rawProviders[key] || {};
+    providers[key] = {
+      ...providerDefault,
+      enabled: input.enabled === undefined ? Boolean(providerDefault.enabled) : Boolean(input.enabled),
+      label: cleanText(input.label || providerDefault.label, 80),
+      customerTitle: cleanText(input.customerTitle || providerDefault.customerTitle, 80),
+      adminTitle: cleanText(input.adminTitle || providerDefault.adminTitle, 80),
+      payButtonLabel: cleanText(input.payButtonLabel || providerDefault.payButtonLabel, 80),
+      copyLabel: cleanText(input.copyLabel || providerDefault.copyLabel, 80),
+      linkPlaceholder: cleanText(input.linkPlaceholder || providerDefault.linkPlaceholder, 180),
+      customerInstructions: cleanText(input.customerInstructions || providerDefault.customerInstructions, 700),
+      adminInstructions: cleanText(input.adminInstructions || providerDefault.adminInstructions, 700),
+      confirmationLabel: cleanText(input.confirmationLabel || providerDefault.confirmationLabel, 120),
+      requireLink: input.requireLink === undefined ? Boolean(providerDefault.requireLink) : Boolean(input.requireLink),
+      allowProofUpload: input.allowProofUpload === undefined ? Boolean(providerDefault.allowProofUpload) : Boolean(input.allowProofUpload),
+    };
+    if (key === "eft") {
+      providers[key].accountName = cleanText(input.accountName || legacyEft.accountName, 120);
+      providers[key].bankName = cleanText(input.bankName || legacyEft.bankName, 120);
+      providers[key].accountNumber = cleanText(input.accountNumber || legacyEft.accountNumber, 80);
+      providers[key].branchCode = cleanText(input.branchCode || legacyEft.branchCode, 80);
+    }
+  }
+  const active = ["yoco", "eft", "manual"].includes(payment.activeProvider) ? payment.activeProvider : defaults.activeProvider || "yoco";
+  providers[active].enabled = true;
+  return {
+    activeProvider: active,
+    reviewWindow: cleanText(payment.reviewWindow || defaults.reviewWindow || "12-24 hours", 80),
+    note: cleanText(payment.note || defaults.note, 500),
+    providers,
   };
 }
 
@@ -729,6 +860,13 @@ function publicUser(user) {
     defaultAddress: normalizeAddress(user.defaultAddress),
     addresses: normalizeAddressList(user.addresses, user.defaultAddress, user.role),
     preferences: normalizeCustomerPreferences(user.preferences),
+    termsAcceptance: user.termsAcceptance
+      ? {
+          version: user.termsAcceptance.version || "",
+          acceptedAt: user.termsAcceptance.acceptedAt || null,
+          ageConfirmed: Boolean(user.termsAcceptance.ageConfirmed),
+        }
+      : null,
   };
 }
 
@@ -757,6 +895,29 @@ function normalizeCustomerPreferences(input = {}) {
   };
 }
 
+function normalizeTermsAcceptance(input = {}) {
+  if (!input || typeof input !== "object") return null;
+  return {
+    version: cleanText(input.version, 80),
+    acceptedAt: cleanText(input.acceptedAt, 40),
+    ageConfirmed: Boolean(input.ageConfirmed),
+    researchUseOnly: Boolean(input.researchUseOnly),
+  };
+}
+
+function termsAcceptanceFromInput(input = {}) {
+  const terms = input.terms || {};
+  if (!terms.accepted || !terms.ageConfirmed || terms.version !== termsVersion) {
+    throw Object.assign(new Error("You must accept the terms and confirm you are 18 years or older."), { status: 400 });
+  }
+  return {
+    version: termsVersion,
+    acceptedAt: new Date().toISOString(),
+    ageConfirmed: true,
+    researchUseOnly: true,
+  };
+}
+
 async function registerCustomer(input) {
   const data = await readUsersData();
   const username = cleanText(input.username, 80).toLowerCase();
@@ -767,6 +928,7 @@ async function registerCustomer(input) {
   const phone = `${phoneArea} ${phoneNumber}`.trim();
   const defaultAddress = normalizeAddress(input.defaultAddress);
   const password = String(input.password || "");
+  const termsAcceptance = termsAcceptanceFromInput(input);
   if (!username) throw Object.assign(new Error("Username is required."), { status: 400 });
   if (!name) throw Object.assign(new Error("Name is required."), { status: 400 });
   if (!email || !email.includes("@")) throw Object.assign(new Error("Use a valid email address."), { status: 400 });
@@ -788,6 +950,7 @@ async function registerCustomer(input) {
     defaultAddress,
     addresses: [addressRecord({ ...defaultAddress, label: "Main address", isDefault: true })],
     preferences: { theme: "light" },
+    termsAcceptance,
     passwordHash: hashPassword(password),
     createdAt: new Date().toISOString(),
   };
@@ -1146,7 +1309,7 @@ function publicOrder(order) {
     customerStatus: customerStatus(order),
     proof: order.proof ? { filename: order.proof.filename, uploadedAt: order.proof.uploadedAt } : null,
     canUploadProof: false,
-    canPay: order.paymentStatus !== "confirmed" && readyForPayment && Boolean(order.paymentLink?.url),
+    canPay: order.paymentStatus !== "confirmed" && readyForPayment && Boolean(order.paymentLink),
     tracking: order.tracking || null,
     shipments: customerShipments(order),
     createdAt: order.createdAt,
@@ -1155,7 +1318,7 @@ function publicOrder(order) {
 }
 
 function publicPaymentLink(paymentLink) {
-  if (!paymentLink?.url) return null;
+  if (!paymentLink) return null;
   return {
     provider: paymentLink.provider || "yoco",
     url: paymentLink.url,
@@ -1174,6 +1337,16 @@ function publicPaymentIssue(paymentIssue) {
     message: paymentIssue.message || "",
     reportedAt: paymentIssue.reportedAt || null,
   };
+}
+
+function paymentProviderSettings(settings, providerId) {
+  const normalized = normalizeShopSettings(settings || {}).payment;
+  const id = providerId || normalized.activeProvider || "yoco";
+  return normalized.providers[id] || normalized.providers.yoco;
+}
+
+function orderPaymentReady(order) {
+  return Boolean(order.paymentLink || order.proof);
 }
 
 function publicSpecialOrder(specialOrder) {
@@ -1248,7 +1421,7 @@ function customerStatus(order) {
   if (order.specialOrder?.status === "declined") return "Special order declined";
   if (order.fulfillmentStatus === "shipped") return "Shipped";
   if (order.paymentStatus === "confirmed" || order.paymentIssue?.type === "paid_pending") return "Marked as paid, processing";
-  if (specialOrderReadyForPayment(order) && order.paymentLink?.url) return "Payment required";
+  if (specialOrderReadyForPayment(order) && order.paymentLink) return "Payment required";
   if (specialOrderReadyForPayment(order)) return "Awaiting payment link";
   if (order.specialOrder?.status === "countered") return "Special order countered";
   return "Payment pending";
@@ -1270,6 +1443,14 @@ async function buildReference(kind = "standard") {
   const settings = (await readShopSettingsData()).settings;
   const template = kind === "special" ? settings.references.specialFormat : settings.references.standardFormat;
   return formatReference(template);
+}
+
+async function buildUniqueReference(kind, existingOrders) {
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    const reference = await buildReference(kind);
+    if (!existingOrders.some((order) => order.reference === reference)) return reference;
+  }
+  throw Object.assign(new Error("Could not generate a unique order reference. Please try again."), { status: 409 });
 }
 
 function formatReference(template) {
@@ -1353,13 +1534,21 @@ async function createOrder(input, user) {
   const now = new Date().toISOString();
   const data = await readOrdersData();
   const isSpecialOrder = Boolean(input.specialOrder);
+  const idempotencyKey = cleanText(input.idempotencyKey, 160);
+  if (idempotencyKey) {
+    const existing = data.orders.find((order) => order.customer?.id === user.id && order.idempotencyKey === idempotencyKey);
+    if (existing) return existing;
+  }
   const request = await validateOrderRequest(input, user, { allowSpecial: isSpecialOrder });
+  const settings = (await readShopSettingsData()).settings;
+  const provider = activePaymentProvider(settings);
   const order = {
     id: randomUUID(),
-    reference: await buildReference(isSpecialOrder ? "special" : "standard"),
+    idempotencyKey,
+    reference: await buildUniqueReference(isSpecialOrder ? "special" : "standard", data.orders),
     ...request,
     paymentStatus: "pending",
-    paymentProvider: "yoco",
+    paymentProvider: provider,
     paymentLink: null,
     paymentIssue: null,
     fulfillmentStatus: "not_ready",
@@ -1461,7 +1650,9 @@ async function confirmPayment(orderId, input, admin) {
   if (!order) throw Object.assign(new Error("Order not found."), { status: 404 });
   if (order.specialOrder?.status === "pending") throw Object.assign(new Error("Review the special order before confirming payment."), { status: 409 });
   if (order.specialOrder?.status === "declined") throw Object.assign(new Error("Declined special orders cannot be confirmed."), { status: 409 });
-  if (!order.paymentLink?.url && !order.proof) throw Object.assign(new Error("Attach the Yoco payment link before confirming payment."), { status: 409 });
+  if (!orderPaymentReady(order)) throw Object.assign(new Error("Attach payment instructions before confirming payment."), { status: 409 });
+  const settings = (await readShopSettingsData()).settings;
+  const provider = paymentProviderSettings(settings, order.paymentProvider);
   const now = new Date().toISOString();
   const wasConfirmed = order.paymentStatus === "confirmed";
   if (!wasConfirmed) {
@@ -1474,7 +1665,7 @@ async function confirmPayment(orderId, input, admin) {
       order.paymentIssue.resolvedAt = now;
       order.paymentIssue.resolvedBy = order.paymentConfirmedBy;
     }
-    order.statusEvents.push({ at: now, actor: "admin", type: "payment_confirmed", label: "Yoco payment confirmed" });
+    order.statusEvents.push({ at: now, actor: "admin", type: "payment_confirmed", label: provider.confirmationLabel || "Payment confirmed" });
   }
   if (shopifyOrderSyncEnabled && !order.shopifyOrder?.id) {
     await syncOrderToShopify(order, admin, { throwOnError: false });
@@ -1498,23 +1689,27 @@ async function attachPaymentLink(orderId, input, admin) {
   if (order.paymentStatus === "confirmed") throw Object.assign(new Error("Payment has already been confirmed."), { status: 409 });
   if (order.specialOrder?.status === "pending") throw Object.assign(new Error("Review the special order before attaching a payment link."), { status: 409 });
   if (order.specialOrder?.status === "declined") throw Object.assign(new Error("Declined special orders cannot receive a payment link."), { status: 409 });
+  const settings = (await readShopSettingsData()).settings;
+  const providerId = cleanText(input.provider || order.paymentProvider || activePaymentProvider(settings), 30);
+  const provider = paymentProviderSettings(settings, providerId);
   const url = cleanText(input.url, 800);
-  if (!/^https:\/\/.+/i.test(url) && !/^http:\/\/localhost[:/]/i.test(url) && !/^http:\/\/127\.0\.0\.1[:/]/i.test(url)) {
-    throw Object.assign(new Error("Enter a valid Yoco payment link."), { status: 400 });
+  if (provider.requireLink && !url) throw Object.assign(new Error("Enter a valid payment link."), { status: 400 });
+  if (url && !/^https:\/\/.+/i.test(url) && !/^http:\/\/localhost[:/]/i.test(url) && !/^http:\/\/127\.0\.0\.1[:/]/i.test(url)) {
+    throw Object.assign(new Error("Enter a valid payment link."), { status: 400 });
   }
   const now = new Date().toISOString();
-  order.paymentProvider = "yoco";
+  order.paymentProvider = providerId;
   order.paymentLink = {
-    provider: "yoco",
+    provider: providerId,
     url,
     reference: cleanText(input.reference || order.reference, 160),
-    note: cleanText(input.note, 500),
+    note: cleanText(input.note || provider.customerInstructions, 700),
     amount: money(order.total),
     attachedAt: now,
     attachedBy: cleanText(admin.username || "admin", 120),
   };
   order.updatedAt = now;
-  order.statusEvents.push({ at: now, actor: "admin", type: "payment_link_attached", label: "Yoco payment link attached" });
+  order.statusEvents.push({ at: now, actor: "admin", type: "payment_link_attached", label: `${provider.label || "Payment"} attached` });
   await writeOrdersData(data);
   return order;
 }
@@ -1836,6 +2031,7 @@ function shopifyFulfillmentItems(order) {
 function buildShopifyOrderInput(order, lineItems = shopifyFulfillmentItems(order)) {
   const nameParts = splitCustomerName(order.customer?.name);
   const shippingAddress = shopifyMailingAddress(order.delivery?.address, order.customer);
+  const providerLabel = paymentProviderLabel(order.paymentLink?.provider || order.paymentProvider);
   const input = {
     email: order.customer?.email || undefined,
     phone: shopifyPhone(order.customer?.phone),
@@ -1867,16 +2063,17 @@ function buildShopifyOrderInput(order, lineItems = shopifyFulfillmentItems(order
       order.specialOrder ? `Special order status: ${order.specialOrder.status}` : "",
       order.specialOrder ? `Shopify includes Retail Shark allocation only.` : "",
       externalFulfillmentItems(order).length ? `External fulfillment items: ${externalFulfillmentItems(order).map((item) => `${item.quantity} x ${item.productTitle}`).join("; ")}` : "",
-      order.proof?.filename ? `POP file: ${order.proof.filename}` : "",
+      `Payment provider: ${providerLabel}`,
+      order.proof?.filename ? `Legacy proof file: ${order.proof.filename}` : "",
     ]
       .filter(Boolean)
       .join("\n"),
     customAttributes: [
       { key: "Online Portal reference", value: order.reference },
       { key: "Online Portal order ID", value: order.id },
-      { key: "Payment method", value: "EFT" },
+      { key: "Payment method", value: providerLabel },
     ],
-    tags: ["Online Portal", "EFT Paid", order.reference, ...(order.specialOrder ? ["Special Order"] : [])],
+    tags: ["Online Portal", "Payment Confirmed", providerLabel, order.reference, ...(order.specialOrder ? ["Special Order"] : [])],
   };
   if (money(order.deliveryFee) > 0) {
     input.shippingLines = [
@@ -1889,6 +2086,11 @@ function buildShopifyOrderInput(order, lineItems = shopifyFulfillmentItems(order
     ];
   }
   return pruneEmpty(input);
+}
+
+function paymentProviderLabel(provider) {
+  const labels = { yoco: "Yoco", eft: "EFT", manual: "Manual Payment" };
+  return labels[provider] || "Payment";
 }
 
 function moneyBag(amount, currencyCode = "ZAR") {
@@ -2468,6 +2670,8 @@ function requireInternal(req) {
 }
 
 async function handleApi(req, res, url) {
+  applyRouteRateLimit(req, url);
+  requirePortalClientHeader(req, url);
   if (req.method === "GET" && url.pathname === "/api/catalog") {
     await requirePortalAccess(req);
     return json(res, 200, { ok: true, ...publicCatalogPayload(await catalogProducts()) });
@@ -2542,13 +2746,13 @@ async function handleApi(req, res, url) {
   if (req.method === "POST" && url.pathname === "/api/orders") {
     const user = await requireCustomer(req);
     const order = await createOrder(await bodyJson(req), user);
-    return json(res, 201, { ok: true, order: publicOrder(order), banking: await bankingDetails() });
+    return json(res, 201, { ok: true, order: publicOrder(order) });
   }
   if (req.method === "GET" && url.pathname === "/api/orders") {
     const user = await requireCustomer(req);
     const data = await readOrdersData();
     const orders = data.orders.filter((order) => order.customer?.id === user.id).map(publicOrder);
-    return json(res, 200, { ok: true, orders, banking: await bankingDetails() });
+    return json(res, 200, { ok: true, orders });
   }
   const proofMatch = url.pathname.match(/^\/api\/orders\/([^/]+)\/proof$/);
   if (req.method === "POST" && proofMatch) {
@@ -2686,11 +2890,6 @@ async function handleApi(req, res, url) {
     return json(res, 200, { ok: true, order: staffOrder(order) });
   }
   return json(res, 404, { ok: false, error: "API route not found." });
-}
-
-async function bankingDetails() {
-  const data = await readShopSettingsData();
-  return data.settings.payment;
 }
 
 async function serveStatic(res, pathname) {

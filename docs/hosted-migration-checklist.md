@@ -8,7 +8,6 @@ Use this when creating the Online Portal GitHub repo and Netlify project.
 - `data/*.json`
 - `data/proofs/`
 - `public/product-images/`
-- `memory/`
 - `*.log`
 
 Only commit safe examples such as `data/*.example.json`.
@@ -30,10 +29,7 @@ SHOPIFY_ORDER_SYNC_ENABLED=false
 SHOPIFY_ORDER_INVENTORY_BEHAVIOUR=DECREMENT_OBEYING_POLICY
 SHOPIFY_ORDER_SEND_RECEIPT=false
 DATABASE_URL=<Netlify Database connection string>
-DATA_STORAGE_MODE=blobs
-DATA_BLOB_STORE=op-runtime-data
-PROOF_STORAGE_MODE=blobs
-PROOF_BLOB_STORE=op-payment-proofs
+DATA_STORAGE_MODE=postgres
 ```
 
 Optional when ready:
@@ -42,10 +38,9 @@ Optional when ready:
 RETAIL_SHARK_INTERNAL_URL=<Retail Shark internal API base URL>
 RETAIL_SHARK_INTERNAL_TOKEN=<Retail Shark internal token>
 MAX_JSON_BODY_BYTES=7000000
-BANK_ACCOUNT_NAME=<customer-facing EFT account name>
-BANK_NAME=<customer-facing bank name>
-BANK_ACCOUNT_NUMBER=<customer-facing account number>
-BANK_BRANCH_CODE=<customer-facing branch code>
+DATA_BLOB_STORE=op-runtime-data
+PROOF_STORAGE_MODE=blobs
+PROOF_BLOB_STORE=op-payment-proofs
 ```
 
 ## Current Hosted Prep State
@@ -55,12 +50,13 @@ BANK_BRANCH_CODE=<customer-facing branch code>
 - Production refuses unsafe default values for `SESSION_SECRET`, `INTERNAL_API_TOKEN`, and `ADMIN_PASSWORD`.
 - Source no longer contains the real Shopify store subdomain.
 - Local JSON files remain supported for development.
-- Hosted v0.1 can persist users, orders, and shop settings in Netlify Blobs with `DATA_STORAGE_MODE=blobs`.
+- Hosted production persists users, orders, and shop settings in Netlify Database/Postgres with `DATA_STORAGE_MODE=postgres`.
+- The current payment flow uses admin-attached Yoco payment links. EFT/manual payment providers are configurable fallback modules in admin settings.
 
 ## Still Needed Before Production Use
 
-- Replace the v0.1 runtime JSON Blob adapter with the database storage adapter for accounts, addresses, shop settings, orders, order items, POP metadata, status events, and tracking.
-- POP file uploads use Netlify Blobs when `PROOF_STORAGE_MODE=blobs`; order records store only metadata and the private blob key.
-- Seed/import only into a preview or explicitly approved production environment.
+- Confirm Netlify Database/Postgres has current users/admin accounts and the intended payment settings.
+- Confirm Retail Shark and Online Portal share the same internal token and hosted URL settings.
+- Confirm Yoco payment module copy and review window are correct in admin settings.
 - Rotate any secret that was pasted in chat or used during local testing.
 - Re-enable `SHOPIFY_ORDER_SYNC_ENABLED` only when paid-order hosted testing is approved.

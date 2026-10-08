@@ -192,8 +192,7 @@ h3 {
 }
 
 .form-stack,
-.account-form,
-.proof-form {
+.account-form {
   display: grid;
   gap: 14px;
 }
@@ -269,7 +268,6 @@ textarea {
 .secondary,
 .button-link,
 .product button,
-.proof-form button,
 .order-actions button {
   display: inline-flex;
   align-items: center;
@@ -284,7 +282,6 @@ textarea {
 .primary,
 .button-link.primary,
 .product button,
-.proof-form button,
 .order-actions button {
   background: var(--red);
   color: #fff;
@@ -293,7 +290,6 @@ textarea {
 .primary:hover,
 .button-link.primary:hover,
 .product button:hover,
-.proof-form button:hover,
 .order-actions button:hover {
   background: var(--red-dark);
 }
@@ -780,6 +776,27 @@ nav {
 .product-pager button:disabled {
   background: #e5e5e5;
   color: #888;
+}
+
+.load-error-panel {
+  display: grid;
+  gap: 8px;
+  grid-column: 1 / -1;
+  border: 1px solid var(--line);
+  border-left: 5px solid var(--red);
+  border-radius: 8px;
+  background: var(--panel);
+  padding: 16px;
+}
+
+.load-error-panel button {
+  justify-self: start;
+  min-height: 38px;
+  border-radius: 6px;
+  background: var(--black);
+  color: #fff;
+  padding: 0 14px;
+  font-weight: 950;
 }
 
 .small {
@@ -1425,6 +1442,34 @@ nav {
   margin: 0 14px 14px;
 }
 
+.provider-settings-list {
+  display: grid;
+  gap: 10px;
+  margin: 0 14px 14px;
+}
+
+.settings-subaccordion {
+  border: 1px solid var(--soft-line);
+  border-radius: 8px;
+  background: #fbfbfb;
+  overflow: hidden;
+}
+
+.settings-subaccordion summary {
+  min-height: 46px;
+  padding: 10px 12px;
+}
+
+.settings-subaccordion summary::after {
+  width: 24px;
+  height: 24px;
+}
+
+.settings-subaccordion > section {
+  margin: 0;
+  padding: 0 12px 12px;
+}
+
 .settings-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1557,6 +1602,40 @@ nav {
 }
 
 .account-filter.is-active span {
+  color: #fff;
+}
+
+.admin-order-tools {
+  display: grid;
+  grid-template-columns: minmax(220px, 360px) 1fr;
+  gap: 10px;
+  width: min(820px, 100%);
+}
+
+.admin-order-tools input {
+  min-height: 38px;
+}
+
+.admin-order-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.admin-order-filters button {
+  min-height: 38px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--panel);
+  color: var(--ink);
+  padding: 0 12px;
+  font-size: 0.82rem;
+  font-weight: 950;
+}
+
+.admin-order-filters button.is-active {
+  border-color: var(--red);
+  background: var(--red);
   color: #fff;
 }
 
@@ -1764,6 +1843,49 @@ nav {
 .order-card a {
   color: var(--red-dark);
   font-weight: 900;
+}
+
+.order-progress {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 6px;
+  margin: 12px 0;
+}
+
+.progress-step {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 900;
+  text-align: center;
+}
+
+.progress-step i {
+  display: block;
+  height: 5px;
+  border-radius: 999px;
+  background: var(--soft-line);
+}
+
+.progress-step em {
+  overflow: hidden;
+  font-style: normal;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.progress-step.is-done i {
+  background: #15a66a;
+}
+
+.progress-step.is-active {
+  color: var(--ink);
+}
+
+.progress-step.is-active i {
+  background: var(--red);
 }
 
 .payment-box {
@@ -2100,7 +2222,8 @@ nav {
 :root[data-theme="dark"] .fulfillment-summary,
 :root[data-theme="dark"] .payment-link-panel,
 :root[data-theme="dark"] .payment-issue-panel,
-:root[data-theme="dark"] .manual-tracking-panel {
+:root[data-theme="dark"] .manual-tracking-panel,
+:root[data-theme="dark"] .settings-subaccordion {
   background: #151515;
 }
 
@@ -2123,12 +2246,6 @@ nav {
 :root[data-theme="dark"] .payment-box.is-confirmed strong,
 :root[data-theme="dark"] .payment-box.is-confirmed span {
   color: #aaa;
-}
-
-.proof-form {
-  margin-top: 12px;
-  padding-top: 12px;
-  border-top: 1px solid var(--soft-line);
 }
 
 .order-actions {
@@ -2184,6 +2301,61 @@ nav {
   overflow: auto;
 }
 
+.terms-modal {
+  border-top: 6px solid var(--red);
+}
+
+.terms-alert {
+  display: grid;
+  gap: 7px;
+  padding: 12px;
+  border: 1px solid #f1adb1;
+  border-radius: 8px;
+  background: var(--red-soft);
+}
+
+.terms-alert strong {
+  color: var(--red-dark);
+  font-size: 1.02rem;
+}
+
+.terms-scroll {
+  display: grid;
+  gap: 14px;
+  max-height: min(45vh, 390px);
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  padding: 14px;
+}
+
+.terms-scroll section {
+  display: grid;
+  gap: 7px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--soft-line);
+}
+
+.terms-scroll section:last-child {
+  padding-bottom: 0;
+  border-bottom: 0;
+}
+
+.terms-scroll p {
+  color: var(--muted);
+  line-height: 1.48;
+}
+
+.terms-confirm {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fbfbfb;
+}
+
 .confirm-modal form {
   display: grid;
   gap: 14px;
@@ -2228,7 +2400,8 @@ nav {
 :root[data-theme="dark"] .summary-panel,
 :root[data-theme="dark"] .custom-pick-panel,
 :root[data-theme="dark"] .special-status,
-:root[data-theme="dark"] .special-review {
+:root[data-theme="dark"] .special-review,
+:root[data-theme="dark"] .terms-confirm {
   background: #141414;
 }
 
@@ -2280,6 +2453,7 @@ nav {
   .account-details,
   .shop-controls,
   .settings-grid,
+  .admin-order-tools,
   .cart-actions,
   .fulfillment-allocation-row,
   .tracking-grid,

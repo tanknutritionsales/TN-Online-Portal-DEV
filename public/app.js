@@ -33,7 +33,8 @@ const state = {
   pendingOrderDraft: null,
   activePaymentOrder: null,
   cart: new Map(),
-  banking: null,
+  adminOrderSearch: "",
+  adminOrderFilter: "all",
 };
 
 const productTypes = [
@@ -43,10 +44,61 @@ const productTypes = [
   { id: "nasal", label: "Nasal", tokens: ["nasal"] },
 ];
 
+const termsVersion = "research-use-v1-2026-10-08";
+let pendingRegistrationPayload = null;
+
 const qs = (selector, root = document) => root.querySelector(selector);
 const qsa = (selector, root = document) => [...root.querySelectorAll(selector)];
 
 function defaultShopSettings() {
+  const providers = {
+    yoco: {
+      enabled: true,
+      label: "Yoco payment link",
+      customerTitle: "Secure Yoco payment",
+      adminTitle: "Yoco payment link",
+      payButtonLabel: "Pay now",
+      copyLabel: "payment link",
+      linkPlaceholder: "https://pay.yoco.com/...",
+      customerInstructions: "Use the secure Yoco link below to complete payment.",
+      adminInstructions: "Create the payment link in Yoco, then paste it here for the customer.",
+      confirmationLabel: "Yoco payment confirmed",
+      requireLink: true,
+      allowProofUpload: false,
+    },
+    eft: {
+      enabled: false,
+      label: "EFT manual payment",
+      customerTitle: "EFT payment",
+      adminTitle: "EFT payment details",
+      payButtonLabel: "View EFT details",
+      copyLabel: "EFT details",
+      linkPlaceholder: "",
+      accountName: "Tank Nutrition",
+      bankName: "",
+      accountNumber: "",
+      branchCode: "",
+      customerInstructions: "Use the banking details and order reference below. Our team will verify payment before processing.",
+      adminInstructions: "Review availability, then save the EFT details to unlock payment instructions for the customer.",
+      confirmationLabel: "EFT payment confirmed",
+      requireLink: false,
+      allowProofUpload: false,
+    },
+    manual: {
+      enabled: false,
+      label: "Manual/custom",
+      customerTitle: "Payment instructions",
+      adminTitle: "Manual payment instructions",
+      payButtonLabel: "View payment instructions",
+      copyLabel: "payment instructions",
+      linkPlaceholder: "https://",
+      customerInstructions: "Follow the payment instructions below. Our team will verify payment before processing.",
+      adminInstructions: "Enter the customer-facing payment instruction or optional payment URL.",
+      confirmationLabel: "Payment confirmed",
+      requireLink: false,
+      allowProofUpload: false,
+    },
+  };
   return {
     featured: {
       mode: "collection",
@@ -56,11 +108,10 @@ function defaultShopSettings() {
       customProductIds: [],
     },
     payment: {
-      accountName: "Tank Nutrition",
-      bankName: "",
-      accountNumber: "",
-      branchCode: "",
-      note: "Once POP has been uploaded, the order will be verified and tracking details will follow.",
+      activeProvider: "yoco",
+      reviewWindow: "12-24 hours",
+      note: "Once payment has been marked as paid, the order will be verified and tracking details will follow.",
+      providers,
     },
     references: {
       standardFormat: "OP-{YYYY}{MM}{DD}-{RAND4}",
@@ -75,6 +126,7 @@ async function api(path, options = {}) {
     ...options,
     headers: {
       "content-type": "application/json",
+      "x-op-client": "portal",
       ...(options.headers || {}),
     },
   });
@@ -89,6 +141,10 @@ function toast(message) {
   el.classList.add("is-visible");
   clearTimeout(toast.timer);
   toast.timer = setTimeout(() => el.classList.remove("is-visible"), 3200);
+}
+
+function newIdempotencyKey(prefix = "op") {
+  return `${prefix}-${crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`}`;
 }
 
 function showScreen(screen) {
@@ -190,19 +246,60 @@ async function login(event) {
 async function register(event) {
   event.preventDefault();
   const form = new FormData(event.target);
+  pendingRegistrationPayload = {
+    username: form.get("username"),
+    name: form.get("name"),
+    email: form.get("email"),
+    phoneArea: form.get("phoneArea"),
+    phoneNumber: form.get("phoneNumber"),
+    defaultAddress: addressFromForm(form),
+    password: form.get("password"),
+  };
+  openTermsModal();
+}
+
+function openTermsModal() {
+  const modal = qs("#termsModal");
+  const body = qs("#termsScrollBody");
+  const checkbox = qs("#termsAgeConfirm");
+  const button = qs("#acceptTermsButton");
+  checkbox.checked = false;
+  checkbox.disabled = true;
+  button.disabled = true;
+  body.scrollTop = 0;
+  modal.hidden = false;
+}
+
+function closeTermsModal() {
+  pendingRegistrationPayload = null;
+  qs("#termsModal").hidden = true;
+}
+
+function updateTermsGate() {
+  const body = qs("#termsScrollBody");
+  const checkbox = qs("#termsAgeConfirm");
+  const button = qs("#acceptTermsButton");
+  const hasScrolled = body.scrollTop + body.clientHeight >= body.scrollHeight - 8;
+  checkbox.disabled = !hasScrolled;
+  button.disabled = !hasScrolled || !checkbox.checked;
+}
+
+async function acceptTermsAndRegister() {
+  if (!pendingRegistrationPayload) return;
   try {
     const payload = await api("/api/auth/register", {
       method: "POST",
       body: JSON.stringify({
-        username: form.get("username"),
-        name: form.get("name"),
-        email: form.get("email"),
-        phoneArea: form.get("phoneArea"),
-        phoneNumber: form.get("phoneNumber"),
-        defaultAddress: addressFromForm(form),
-        password: form.get("password"),
+        ...pendingRegistrationPayload,
+        terms: {
+          version: termsVersion,
+          accepted: true,
+          ageConfirmed: true,
+        },
       }),
     });
+    pendingRegistrationPayload = null;
+    qs("#termsModal").hidden = true;
     toast("Account created.");
     await showApp({ user: payload.user });
   } catch (error) {
@@ -326,13 +423,18 @@ async function loadCatalog() {
     const [payload, settingsPayload] = await Promise.all([api("/api/catalog"), loadShopSettings()]);
     state.products = payload.products || [];
     state.filters = payload.filters || deriveFilters(state.products);
-    state.shopSettings = settingsPayload.settings || defaultShopSettings();
+    state.shopSettings = mergeShopSettings(settingsPayload.settings || defaultShopSettings());
     state.brandCollections = buildBrandCollections(state.products);
     renderCatalogControls();
     renderFeaturedSlider();
     renderProducts();
   } catch (error) {
-    qs("#products").innerHTML = `<p class="muted">${escapeHtml(error.message)}</p>`;
+    qs("#products").innerHTML = renderLoadError(
+      "Products could not load.",
+      "Refresh the catalog. If it keeps failing, our team needs to check the Shopify connection.",
+      "Retry",
+      "retry-catalog",
+    );
   }
 }
 
@@ -342,6 +444,48 @@ async function loadShopSettings() {
   } catch {
     return { settings: defaultShopSettings() };
   }
+}
+
+function currentShopSettings() {
+  return mergeShopSettings(state.shopSettings || defaultShopSettings());
+}
+
+function mergeShopSettings(settings = {}) {
+  const defaults = defaultShopSettings();
+  const payment = settings.payment || {};
+  const providers = {
+    ...defaults.payment.providers,
+    ...(payment.providers || {}),
+  };
+  return {
+    ...defaults,
+    ...settings,
+    featured: { ...defaults.featured, ...(settings.featured || {}) },
+    payment: {
+      ...defaults.payment,
+      ...payment,
+      providers,
+    },
+    references: { ...defaults.references, ...(settings.references || {}) },
+  };
+}
+
+function paymentSettings() {
+  return currentShopSettings().payment;
+}
+
+function paymentProviderOptions() {
+  return Object.entries(paymentSettings().providers || defaultShopSettings().payment.providers);
+}
+
+function paymentProviderConfig(providerId) {
+  const settings = paymentSettings();
+  const id = providerId || settings.activeProvider || "yoco";
+  return settings.providers?.[id] || settings.providers?.yoco || defaultShopSettings().payment.providers.yoco;
+}
+
+function orderProviderConfig(order) {
+  return paymentProviderConfig(order?.paymentLink?.provider || order?.paymentProvider || paymentSettings().activeProvider);
 }
 
 function renderCatalogControls() {
@@ -393,6 +537,16 @@ function renderProducts() {
   renderProductPager("productsTopPager", products.length);
   renderProductPager("productsBottomPager", products.length);
   container.innerHTML = pageProducts.map((product) => renderProductCard(product)).join("");
+}
+
+function renderLoadError(title, message, actionLabel, actionName) {
+  return `
+    <div class="load-error-panel">
+      <strong>${escapeHtml(title)}</strong>
+      <p class="muted">${escapeHtml(message)}</p>
+      ${actionName ? `<button type="button" data-${escapeHtml(actionName)}>${escapeHtml(actionLabel || "Retry")}</button>` : ""}
+    </div>
+  `;
 }
 
 function renderProductCard(product, extraClass = "") {
@@ -598,6 +752,7 @@ async function submitOrder(event) {
   if (!selectedAddress) return toast("Add a delivery address first.");
   const form = new FormData(event.target);
   state.pendingOrderDraft = {
+    idempotencyKey: newIdempotencyKey("standard"),
     kind: "standard",
     delivery: {
       addressId: form.get("addressId") || selectedAddress.id,
@@ -622,15 +777,14 @@ async function confirmPendingOrder() {
         items: draft.items,
         specialOrder: Boolean(draft.specialOrder),
         specialOrderNote: draft.specialOrderNote || "",
+        idempotencyKey: draft.idempotencyKey,
       }),
     });
     if (!draft.specialOrder) state.cart.clear();
     state.pendingOrderDraft = null;
-    state.banking = payload.banking || state.banking;
     renderCart();
     await loadCustomerOrders();
-    if (payload.order.canUploadProof) showPaymentModal(payload.order);
-    else showOrderSubmittedModal(payload.order);
+    showOrderSubmittedModal(payload.order);
   } catch (error) {
     toast(error.message);
   }
@@ -875,6 +1029,7 @@ async function submitSpecialOrder(event) {
   const items = state.specialOrderItems.length ? state.specialOrderItems.map((item) => ({ ...item })) : [specialOrderItemFromForm(form)].filter(Boolean);
   if (!items.length) return;
   state.pendingOrderDraft = {
+    idempotencyKey: newIdempotencyKey("special"),
     kind: "special",
     delivery: {
       addressId: address.id,
@@ -1048,7 +1203,6 @@ async function loadCustomerOrders() {
   container.innerHTML = `<p class="muted">Loading orders...</p>`;
   try {
     const payload = await api("/api/orders");
-    state.banking = payload.banking || state.banking;
     state.customerOrders = payload.orders || [];
     container.innerHTML = state.customerOrders.length ? state.customerOrders.map(renderCustomerOrder).join("") : `<p class="muted">No orders yet.</p>`;
   } catch (error) {
@@ -1064,7 +1218,8 @@ function renderCustomerOrder(order) {
   const trackButton = shipments.length
     ? `<button type="button" data-view-order-tracking="${escapeHtml(order.id)}">Track Order</button>`
     : "";
-  const paymentActionLabel = order.paymentIssue?.type === "paid_pending" ? "Payment details" : order.canPay ? "Pay now" : order.paymentLink ? "Payment details" : "View order";
+  const provider = orderProviderConfig(order);
+  const paymentActionLabel = order.paymentIssue?.type === "paid_pending" ? "Payment details" : order.canPay ? provider.payButtonLabel || "Payment details" : order.paymentLink ? "Payment details" : "View order";
   const special = order.specialOrder ? renderSpecialOrderStatus(order.specialOrder) : "";
   const reviewNote = !order.paymentLink && order.paymentStatus !== "confirmed" && order.specialOrder?.status !== "declined"
     ? `<p class="muted">${escapeHtml(paymentReviewNote(order))}</p>`
@@ -1080,6 +1235,7 @@ function renderCustomerOrder(order) {
       </header>
       <ul>${order.items.map((item) => `<li>${item.quantity} x ${escapeHtml(item.productTitle)}</li>`).join("")}</ul>
       <p><strong>Total:</strong> ${money.format(order.total)}</p>
+      ${renderOrderProgress(order)}
       ${special}
       ${reviewNote}
       ${tracking}
@@ -1091,11 +1247,46 @@ function renderCustomerOrder(order) {
   `;
 }
 
+function renderOrderProgress(order) {
+  const steps = orderProgressSteps(order);
+  return `
+    <div class="order-progress" aria-label="Order progress">
+      ${steps
+        .map(
+          (step) => `
+            <span class="progress-step ${step.done ? "is-done" : ""} ${step.active ? "is-active" : ""}">
+              <i aria-hidden="true"></i>
+              <em>${escapeHtml(step.label)}</em>
+            </span>
+          `,
+        )
+        .join("")}
+    </div>
+  `;
+}
+
+function orderProgressSteps(order) {
+  const hasPaymentInstructions = Boolean(order.paymentLink);
+  const markedPaid = order.paymentIssue?.type === "paid_pending" || order.paymentStatus === "confirmed";
+  const confirmed = order.paymentStatus === "confirmed";
+  const shipped = order.fulfillmentStatus === "shipped";
+  return [
+    { label: "Submitted", done: true, active: !hasPaymentInstructions && !markedPaid && !shipped },
+    { label: "Payment link sent", done: hasPaymentInstructions || markedPaid || confirmed || shipped, active: hasPaymentInstructions && !markedPaid && !confirmed },
+    { label: "Marked as paid", done: markedPaid || confirmed || shipped, active: markedPaid && !confirmed },
+    { label: "Processing", done: confirmed || shipped, active: confirmed && !shipped },
+    { label: "Shipped", done: shipped, active: shipped },
+  ];
+}
+
 function paymentReviewNote(order) {
+  const reviewWindow = paymentSettings().reviewWindow || "12-24 hours";
+  const provider = orderProviderConfig(order);
+  const paymentLabel = provider.requireLink ? "payment link" : "payment details";
   if (order.specialOrder) {
-    return "Your special order request has been submitted. Our team will review availability and confirm what we can supply, typically within 12-24 hours. If approved, your secure payment link will appear here.";
+    return `Your special order request has been submitted. Our team will review availability and confirm what we can supply, typically within ${reviewWindow}. If approved, your ${paymentLabel} will appear here.`;
   }
-  return "Your order has been submitted. Our team will review availability and send your secure payment link, typically within 12-24 hours.";
+  return `Your order has been submitted. Our team will review availability and send your ${paymentLabel}, typically within ${reviewWindow}.`;
 }
 
 function paymentIssueLabel(type) {
@@ -1136,31 +1327,47 @@ function renderSpecialOrderStatus(specialOrder) {
 function paymentInstructions(order) {
   const confirmed = order.paymentStatus === "confirmed";
   const paymentLink = order.paymentLink || {};
+  const hasPaymentLink = Boolean(order.paymentLink);
+  const provider = orderProviderConfig(order);
   const markedPaid = order.paymentIssue?.type === "paid_pending";
-  const paymentLines = [`Order reference: ${order.reference}`, `Amount: ${money.format(order.total)}`, paymentLink.url && `Payment link: ${paymentLink.url}`].filter(Boolean);
-  const paymentActions = paymentLink.url && !confirmed
+  const eftLines = [
+    provider.accountName && `Account: ${provider.accountName}`,
+    provider.bankName && `Bank: ${provider.bankName}`,
+    provider.accountNumber && `Account number: ${provider.accountNumber}`,
+    provider.branchCode && `Branch code: ${provider.branchCode}`,
+  ].filter(Boolean);
+  const paymentLines = [
+    `Order reference: ${order.reference}`,
+    `Amount: ${money.format(order.total)}`,
+    paymentLink.reference && `Payment reference: ${paymentLink.reference}`,
+    paymentLink.url && `Payment link: ${paymentLink.url}`,
+    ...eftLines,
+    paymentLink.note || provider.customerInstructions,
+  ].filter(Boolean);
+  const paymentActions = !confirmed && hasPaymentLink
     ? `
       <div class="payment-support-actions">
         ${markedPaid ? "" : `<button type="button" data-paid-notice="${escapeHtml(order.id)}">I have paid</button>`}
-        <button type="button" data-report-payment-issue="${escapeHtml(order.id)}">Payment link not working</button>
+        <button type="button" data-report-payment-issue="${escapeHtml(order.id)}">${provider.requireLink ? "Payment link not working" : "Payment help"}</button>
       </div>
     `
     : "";
   return `
     <div class="payment-box${confirmed ? " is-confirmed" : ""}">
       <div class="payment-line important">
-        <strong>${confirmed ? "Payment confirmed" : "Secure Yoco payment"}</strong>
+        <strong>${confirmed ? "Payment confirmed" : escapeHtml(provider.customerTitle || provider.label || "Payment details")}</strong>
         <button type="button" data-copy-value="${escapeHtml(order.reference)}" data-copy-label="order reference">Copy reference</button>
       </div>
       <span>Amount: ${money.format(order.total)}</span>
       ${paymentLink.reference ? `<span>Payment reference: ${escapeHtml(paymentLink.reference)}</span>` : ""}
-      ${paymentLink.note ? `<span>${escapeHtml(paymentLink.note)}</span>` : ""}
-      ${paymentLink.url && !confirmed ? `<a class="primary button-link payment-link-button" href="${escapeHtml(paymentLink.url)}" target="_blank" rel="noopener">Pay now</a>` : ""}
+      ${eftLines.map((line) => `<span>${escapeHtml(line)}</span>`).join("")}
+      ${paymentLink.note ? `<span>${escapeHtml(paymentLink.note)}</span>` : provider.customerInstructions ? `<span>${escapeHtml(provider.customerInstructions)}</span>` : ""}
+      ${paymentLink.url && !confirmed ? `<a class="primary button-link payment-link-button" href="${escapeHtml(paymentLink.url)}" target="_blank" rel="noopener">${escapeHtml(provider.payButtonLabel || "Pay now")}</a>` : ""}
       ${order.paymentIssue ? `<span class="payment-issue-note">${escapeHtml(customerPaymentNotice(order))}</span>` : ""}
-      ${!paymentLink.url && !confirmed ? `<span>Your secure payment link will appear here once the order has been reviewed.</span>` : ""}
+      ${!hasPaymentLink && !confirmed ? `<span>${escapeHtml(paymentReviewNote(order))}</span>` : ""}
       ${paymentActions}
       <div class="payment-copy-actions">
-        ${paymentLink.url ? `<button type="button" data-copy-value="${escapeHtml(paymentLink.url)}" data-copy-label="payment link">Copy payment link</button>` : ""}
+        ${paymentLink.url ? `<button type="button" data-copy-value="${escapeHtml(paymentLink.url)}" data-copy-label="${escapeHtml(provider.copyLabel || "payment link")}">Copy ${escapeHtml(provider.copyLabel || "payment link")}</button>` : ""}
         <button type="button" data-copy-value="${escapeHtml(paymentLines.join("\n"))}" data-copy-label="payment details">Copy payment details</button>
       </div>
     </div>
@@ -1177,14 +1384,13 @@ function showPaymentIssueModal(order) {
           <option value="link_not_opening">Link will not open</option>
           <option value="amount_wrong">Amount looks wrong</option>
           <option value="payment_failed">Payment failed</option>
-          <option value="paid_pending">Marked as paid</option>
           <option value="other">Other</option>
         </select>
       </label>
       <label>Message
         <textarea name="message" rows="4" placeholder="Tell us what happened"></textarea>
       </label>
-      <p class="muted">This will alert our team to check the Yoco link and your order.</p>
+      <p class="muted">This will alert our team to check your payment details and order.</p>
     </form>
   `;
   qs("#orderFlowActions").innerHTML = `
@@ -1232,50 +1438,12 @@ async function reportPaidNotice(orderId) {
   }
 }
 
-function proofForm(orderId) {
-  return `
-    <form class="proof-form" data-proof-order="${orderId}">
-      <label>Proof of payment<input name="proof" type="file" accept="image/*,.pdf"></label>
-      <label>Payment note<input name="note" placeholder="Bank reference or payment note"></label>
-      <button type="submit">Upload POP</button>
-    </form>
-  `;
-}
-
-async function uploadProof(event) {
-  event.preventDefault();
-  const form = event.target;
-  const file = form.proof.files[0];
-  if (!file) return toast("Choose a POP file.");
-  const dataUrl = await fileToDataUrl(file);
-  try {
-    await api(`/api/orders/${encodeURIComponent(form.dataset.proofOrder)}/proof`, {
-      method: "POST",
-      body: JSON.stringify({ filename: file.name, dataUrl, note: form.note.value }),
-    });
-    toast("POP uploaded.");
-    await loadCustomerOrders();
-    const updated = state.customerOrders.find((order) => order.id === form.dataset.proofOrder);
-    if (updated) showPaymentModal(updated);
-  } catch (error) {
-    toast(error.message);
-  }
-}
-
-function fileToDataUrl(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result);
-    reader.onerror = () => reject(new Error("Could not read file."));
-    reader.readAsDataURL(file);
-  });
-}
-
 async function loadAdminOrders() {
   const container = qs("#adminOrders");
   container.innerHTML = `<p class="muted">Loading orders...</p>`;
   try {
-    const payload = await api("/api/admin/orders");
+    const [payload, settingsPayload] = await Promise.all([api("/api/admin/orders"), loadShopSettings()]);
+    state.shopSettings = mergeShopSettings(settingsPayload.settings || defaultShopSettings());
     state.adminOrders = payload.orders || [];
     renderAdminOrders();
   } catch (error) {
@@ -1297,14 +1465,68 @@ function renderAdminOrders() {
     renderSystemStatus();
     return;
   }
-  const orders = state.adminOrders.filter((order) => adminOrderView(order) === state.adminView);
+  const viewOrders = state.adminOrders.filter((order) => adminOrderView(order) === state.adminView);
+  const orders = viewOrders.filter(adminOrderMatchesFilters);
   const labels = {
     pending: "Awaiting confirmation",
     ready: "Ready to pack",
     completed: "Completed",
   };
-  qs("#adminOrdersSummary").innerHTML = `<span>${labels[state.adminView]} - ${orders.length} order${orders.length === 1 ? "" : "s"}</span>`;
-  qs("#adminOrders").innerHTML = orders.length ? orders.map(renderAdminOrder).join("") : `<p class="muted">${emptyAdminMessage(state.adminView)}</p>`;
+  qs("#adminOrdersSummary").innerHTML = `
+    <span>${labels[state.adminView]} - ${orders.length}${orders.length === viewOrders.length ? "" : ` of ${viewOrders.length}`} order${orders.length === 1 ? "" : "s"}</span>
+    <div class="admin-order-tools">
+      <input id="adminOrderSearch" type="search" value="${escapeHtml(state.adminOrderSearch)}" placeholder="Search reference, customer, email or product">
+      <div class="admin-order-filters" aria-label="Order filters">
+        ${adminOrderFilterOptions()
+          .map(
+            (filter) => `
+              <button type="button" class="${state.adminOrderFilter === filter.id ? "is-active" : ""}" data-admin-order-filter="${filter.id}">
+                ${escapeHtml(filter.label)}
+              </button>
+            `,
+          )
+          .join("")}
+      </div>
+    </div>
+  `;
+  const hasActiveOrderFilter = state.adminOrderFilter !== "all" || Boolean(state.adminOrderSearch);
+  qs("#adminOrders").innerHTML = orders.length
+    ? orders.map(renderAdminOrder).join("")
+    : `<p class="muted">${hasActiveOrderFilter ? "No orders match this search or filter." : emptyAdminMessage(state.adminView)}</p>`;
+}
+
+function adminOrderFilterOptions() {
+  return [
+    { id: "all", label: "All" },
+    { id: "needs_payment_details", label: "Needs payment details" },
+    { id: "payment_to_verify", label: "Payment to verify" },
+    { id: "special_review", label: "Special review" },
+    { id: "support", label: "Payment support" },
+  ];
+}
+
+function adminOrderMatchesFilters(order) {
+  const query = normalizeSearch(state.adminOrderSearch);
+  if (query && !adminOrderSearchText(order).includes(query)) return false;
+  if (state.adminOrderFilter === "needs_payment_details") return !order.paymentLink && (!order.specialOrder || ["accepted", "countered"].includes(order.specialOrder.status));
+  if (state.adminOrderFilter === "payment_to_verify") return order.paymentIssue?.type === "paid_pending";
+  if (state.adminOrderFilter === "special_review") return order.specialOrder?.status === "pending";
+  if (state.adminOrderFilter === "support") return order.paymentIssue && order.paymentIssue.status !== "resolved" && order.paymentIssue.type !== "paid_pending";
+  return true;
+}
+
+function adminOrderSearchText(order) {
+  return normalizeSearch(
+    [
+      order.reference,
+      order.customer?.name,
+      order.customer?.email,
+      order.customer?.phone,
+      order.items?.map((item) => `${item.productTitle} ${item.sku || ""}`).join(" "),
+      order.paymentLink?.reference,
+      order.proof?.note,
+    ].join(" "),
+  );
 }
 
 function adminOrderView(order) {
@@ -1325,7 +1547,7 @@ async function loadAdminShopSettings() {
   qs("#adminOrders").innerHTML = `<p class="muted">Loading shop settings...</p>`;
   try {
     const [settingsPayload, catalogPayload] = await Promise.all([loadShopSettings(), api("/api/catalog")]);
-    state.shopSettings = settingsPayload.settings || defaultShopSettings();
+    state.shopSettings = mergeShopSettings(settingsPayload.settings || defaultShopSettings());
     state.products = catalogPayload.products || state.products;
     renderAdminShopSettings();
   } catch (error) {
@@ -1551,9 +1773,124 @@ function statusLabel(status) {
   return "Offline";
 }
 
+function renderPaymentProviderSettings(payment) {
+  const activeProvider = payment.activeProvider || "yoco";
+  const providers = payment.providers || defaultShopSettings().payment.providers;
+  const providerFields = Object.entries(providers)
+    .map(([id, provider]) => {
+      const isEft = id === "eft";
+      return `
+        <details class="settings-subaccordion" ${id === activeProvider ? "open" : ""}>
+          <summary>
+            <span>${escapeHtml(provider.label || titleFromId(id))}</span>
+            <small>${id === activeProvider ? "Active provider" : "Optional provider"}</small>
+          </summary>
+          <section class="settings-grid">
+            <label>Admin title
+              <input name="${escapeHtml(id)}AdminTitle" maxlength="120" value="${escapeHtml(provider.adminTitle || "")}">
+            </label>
+            <label>Customer title
+              <input name="${escapeHtml(id)}CustomerTitle" maxlength="120" value="${escapeHtml(provider.customerTitle || "")}">
+            </label>
+            <label>Button label
+              <input name="${escapeHtml(id)}PayButtonLabel" maxlength="80" value="${escapeHtml(provider.payButtonLabel || "")}">
+            </label>
+            <label>Copy label
+              <input name="${escapeHtml(id)}CopyLabel" maxlength="80" value="${escapeHtml(provider.copyLabel || "")}">
+            </label>
+            <label class="wide">Admin confirmation label
+              <input name="${escapeHtml(id)}ConfirmationLabel" maxlength="120" value="${escapeHtml(provider.confirmationLabel || "")}">
+            </label>
+            <label class="wide">Admin instructions
+              <textarea name="${escapeHtml(id)}AdminInstructions" rows="2" maxlength="500">${escapeHtml(provider.adminInstructions || "")}</textarea>
+            </label>
+            <label class="wide">Customer instructions
+              <textarea name="${escapeHtml(id)}CustomerInstructions" rows="2" maxlength="700">${escapeHtml(provider.customerInstructions || "")}</textarea>
+            </label>
+            ${
+              isEft
+                ? `
+                  <label>Account name
+                    <input name="${escapeHtml(id)}AccountName" maxlength="120" value="${escapeHtml(provider.accountName || "")}">
+                  </label>
+                  <label>Bank name
+                    <input name="${escapeHtml(id)}BankName" maxlength="120" value="${escapeHtml(provider.bankName || "")}">
+                  </label>
+                  <label>Account number
+                    <input name="${escapeHtml(id)}AccountNumber" maxlength="80" value="${escapeHtml(provider.accountNumber || "")}">
+                  </label>
+                  <label>Branch code
+                    <input name="${escapeHtml(id)}BranchCode" maxlength="80" value="${escapeHtml(provider.branchCode || "")}">
+                  </label>
+                `
+                : `
+                  <label class="wide">Payment URL placeholder
+                    <input name="${escapeHtml(id)}LinkPlaceholder" maxlength="180" value="${escapeHtml(provider.linkPlaceholder || "")}">
+                  </label>
+                `
+            }
+          </section>
+        </details>
+      `;
+    })
+    .join("");
+  return `
+    <section class="settings-grid">
+      <label>Active payment provider
+        <select name="activeProvider">
+          ${Object.entries(providers)
+            .map(([id, provider]) => `<option value="${escapeHtml(id)}" ${id === activeProvider ? "selected" : ""}>${escapeHtml(provider.label || titleFromId(id))}</option>`)
+            .join("")}
+        </select>
+      </label>
+      <label>Review window
+        <input name="paymentReviewWindow" maxlength="80" value="${escapeHtml(payment.reviewWindow || "12-24 hours")}">
+      </label>
+      <label class="wide">Default customer note
+        <textarea name="paymentNote" rows="3" maxlength="500">${escapeHtml(payment.note || "")}</textarea>
+      </label>
+    </section>
+    <div class="provider-settings-list">
+      ${providerFields}
+    </div>
+  `;
+}
+
+function collectPaymentSettings(formData) {
+  const defaults = paymentSettings();
+  const providers = {};
+  const field = (name, fallback = "") => (formData.has(name) ? String(formData.get(name) || "") : fallback);
+  for (const [id, provider] of Object.entries(defaults.providers || defaultShopSettings().payment.providers)) {
+    providers[id] = {
+      ...provider,
+      label: provider.label || titleFromId(id),
+      enabled: id === formData.get("activeProvider") || Boolean(provider.enabled),
+      adminTitle: field(`${id}AdminTitle`, provider.adminTitle || ""),
+      customerTitle: field(`${id}CustomerTitle`, provider.customerTitle || ""),
+      payButtonLabel: field(`${id}PayButtonLabel`, provider.payButtonLabel || ""),
+      copyLabel: field(`${id}CopyLabel`, provider.copyLabel || ""),
+      confirmationLabel: field(`${id}ConfirmationLabel`, provider.confirmationLabel || ""),
+      adminInstructions: field(`${id}AdminInstructions`, provider.adminInstructions || ""),
+      customerInstructions: field(`${id}CustomerInstructions`, provider.customerInstructions || ""),
+      linkPlaceholder: field(`${id}LinkPlaceholder`, provider.linkPlaceholder || ""),
+      accountName: field(`${id}AccountName`, provider.accountName || ""),
+      bankName: field(`${id}BankName`, provider.bankName || ""),
+      accountNumber: field(`${id}AccountNumber`, provider.accountNumber || ""),
+      branchCode: field(`${id}BranchCode`, provider.branchCode || ""),
+    };
+  }
+  return {
+    ...defaults,
+    activeProvider: formData.get("activeProvider") || defaults.activeProvider || "yoco",
+    reviewWindow: formData.get("paymentReviewWindow") || defaults.reviewWindow || "12-24 hours",
+    note: formData.get("paymentNote") || defaults.note || "",
+    providers,
+  };
+}
+
 function renderAdminShopSettings() {
   qsa("[data-admin-view]").forEach((button) => button.classList.toggle("is-active", button.dataset.adminView === state.adminView));
-  const allSettings = state.shopSettings || defaultShopSettings();
+  const allSettings = currentShopSettings();
   const settings = allSettings.featured;
   const payment = allSettings.payment || defaultShopSettings().payment;
   const references = allSettings.references || defaultShopSettings().references;
@@ -1613,24 +1950,8 @@ function renderAdminShopSettings() {
         </section>
       </details>
       <details class="settings-accordion">
-        <summary><span>Payments</span><small>EFT details and customer note</small></summary>
-        <section class="settings-grid">
-          <label>Account name
-            <input name="paymentAccountName" maxlength="120" value="${escapeHtml(payment.accountName || "")}">
-          </label>
-          <label>Bank name
-            <input name="paymentBankName" maxlength="120" value="${escapeHtml(payment.bankName || "")}">
-          </label>
-          <label>Account number
-            <input name="paymentAccountNumber" maxlength="80" value="${escapeHtml(payment.accountNumber || "")}">
-          </label>
-          <label>Branch code
-            <input name="paymentBranchCode" maxlength="80" value="${escapeHtml(payment.branchCode || "")}">
-          </label>
-          <label class="wide">Payment note
-            <textarea name="paymentNote" rows="3" maxlength="500">${escapeHtml(payment.note || "")}</textarea>
-          </label>
-        </section>
+        <summary><span>Payments</span><small>Provider module, customer instructions and future webhook readiness</small></summary>
+        ${renderPaymentProviderSettings(payment)}
       </details>
       <details class="settings-accordion">
         <summary><span>References</span><small>Standard and special order formats</small></summary>
@@ -1678,20 +1999,14 @@ async function submitShopSettings(event) {
           collectionQuery: formData.get("collectionQuery"),
           customProductIds: state.shopSettings?.featured?.customProductIds || formData.getAll("customProductIds"),
         },
-        payment: {
-          accountName: formData.get("paymentAccountName"),
-          bankName: formData.get("paymentBankName"),
-          accountNumber: formData.get("paymentAccountNumber"),
-          branchCode: formData.get("paymentBranchCode"),
-          note: formData.get("paymentNote"),
-        },
+        payment: collectPaymentSettings(formData),
         references: {
           standardFormat: formData.get("standardFormat"),
           specialFormat: formData.get("specialFormat"),
         },
       }),
     });
-    state.shopSettings = payload.settings;
+    state.shopSettings = mergeShopSettings(payload.settings);
     toast("Shop settings saved.");
     renderAdminShopSettings();
   } catch (error) {
@@ -1710,13 +2025,13 @@ function adminOrderStatusLabel(order) {
   if (order.paymentIssue && order.paymentIssue.status !== "resolved") return "Payment support";
   if (order.specialOrder?.status === "pending") return "Review required";
   if (order.specialOrder?.status === "countered") return "Counter sent";
-  if (order.paymentLink?.url) return "Payment required";
+  if (order.paymentLink) return "Payment required";
   return "Awaiting confirmation";
 }
 
 function renderAdminOrder(order) {
   const readyForPayment = !order.specialOrder || ["accepted", "countered"].includes(order.specialOrder.status);
-  const hasPaymentEvidence = Boolean(order.paymentLink?.url || order.proof);
+  const hasPaymentEvidence = Boolean(order.paymentLink || order.proof);
   const canConfirm = order.paymentStatus !== "confirmed" && readyForPayment && hasPaymentEvidence;
   const hasShopifyRelevantItems = !order.specialOrder || (order.officeItems || []).length > 0;
   const canSyncShopify = hasShopifyRelevantItems && order.paymentStatus === "confirmed" && !order.shopifyOrder?.id;
@@ -1754,7 +2069,7 @@ function renderAdminOrder(order) {
         ${manualTracking}
         ${
           order.proof
-            ? `<p class="muted">Legacy POP: <a href="/api/admin/orders/${encodeURIComponent(order.id)}/proof" target="_blank" rel="noopener">${escapeHtml(order.proof.filename)}</a></p>`
+            ? `<p class="muted">Legacy proof file: <a href="/api/admin/orders/${encodeURIComponent(order.id)}/proof" target="_blank" rel="noopener">${escapeHtml(order.proof.filename)}</a></p>`
             : ""
         }
         ${paymentNote}
@@ -1762,7 +2077,7 @@ function renderAdminOrder(order) {
         ${
           canConfirm || canSyncShopify
             ? `<div class="order-actions">
-                ${canConfirm ? `<button type="button" data-confirm="${order.id}">Confirm Yoco payment</button>` : ""}
+                ${canConfirm ? `<button type="button" data-confirm="${order.id}">Confirm payment</button>` : ""}
                 ${canSyncShopify ? `<button type="button" data-sync-shopify="${order.id}">Sync to Shopify</button>` : ""}
               </div>`
             : ""
@@ -1788,25 +2103,37 @@ function renderAdminPaymentIssue(order) {
 }
 
 function renderAdminPaymentLinkForm(order, readyForPayment) {
+  const providerId = order.paymentLink?.provider || order.paymentProvider || paymentSettings().activeProvider || "yoco";
+  const provider = paymentProviderConfig(providerId);
   if (order.paymentStatus === "confirmed") {
-    return order.paymentLink?.url
-      ? `<div class="payment-link-panel"><strong>Yoco payment</strong><a href="${escapeHtml(order.paymentLink.url)}" target="_blank" rel="noopener">${escapeHtml(order.paymentLink.reference || order.reference)}</a><span>Confirmed</span></div>`
+    return order.paymentLink
+      ? `<div class="payment-link-panel"><strong>${escapeHtml(provider.label || "Payment")}</strong>${order.paymentLink.url ? `<a href="${escapeHtml(order.paymentLink.url)}" target="_blank" rel="noopener">${escapeHtml(order.paymentLink.reference || order.reference)}</a>` : `<span>${escapeHtml(order.paymentLink.reference || order.reference)}</span>`}<span>Confirmed</span></div>`
       : "";
   }
   if (!readyForPayment) {
-    return `<div class="payment-link-panel"><strong>Yoco payment link</strong><span>Review this order before attaching payment.</span></div>`;
+    return `<div class="payment-link-panel"><strong>${escapeHtml(provider.adminTitle || "Payment details")}</strong><span>Review this order before attaching payment details.</span></div>`;
   }
   const link = order.paymentLink || {};
+  const providerChoices = paymentProviderOptions()
+    .map(([id, option]) => `<option value="${escapeHtml(id)}" ${id === providerId ? "selected" : ""}>${escapeHtml(option.label || titleFromId(id))}</option>`)
+    .join("");
   return `
     <form class="payment-link-panel" data-payment-link="${escapeHtml(order.id)}">
       <div>
-        <strong>Yoco payment link</strong>
-        <span>${link.url ? "Payment link attached. Update it only if the Yoco link was recreated." : "Create the payment link in Yoco, then paste it here for the customer."}</span>
+        <strong>${escapeHtml(provider.adminTitle || "Payment details")}</strong>
+        <span>${escapeHtml(link.url || link.reference ? "Payment details are attached. Update them only if they change." : provider.adminInstructions || "Attach the payment details for the customer.")}</span>
       </div>
-      <label class="wide">Payment link <input name="url" type="url" value="${escapeHtml(link.url || "")}" placeholder="https://pay.yoco.com/..." required></label>
+      <label>Provider
+        <select name="provider">
+          ${providerChoices}
+        </select>
+      </label>
+      <label class="wide">Payment link
+        <input name="url" type="url" value="${escapeHtml(link.url || "")}" placeholder="${escapeHtml(provider.linkPlaceholder || "https://")}">
+      </label>
       <label>Reference <input name="reference" value="${escapeHtml(link.reference || order.reference)}" placeholder="${escapeHtml(order.reference)}"></label>
-      <label>Note <input name="note" value="${escapeHtml(link.note || "")}" placeholder="Optional customer note"></label>
-      <button type="submit">${link.url ? "Update payment link" : "Attach payment link"}</button>
+      <label>Note <input name="note" value="${escapeHtml(link.note || provider.customerInstructions || "")}" placeholder="Customer-facing payment note"></label>
+      <button type="submit">${link.url || link.reference ? "Update payment details" : "Attach payment details"}</button>
     </form>
   `;
 }
@@ -2043,7 +2370,7 @@ async function confirmPayment(orderId) {
       body: JSON.stringify({ confirmedBy: "admin" }),
     });
     const sync = payload.order?.shopifySync;
-    toast(sync?.status === "error" ? `Yoco payment confirmed. Shopify sync failed: ${sync.message}` : "Yoco payment confirmed.");
+    toast(sync?.status === "error" ? `Payment confirmed. Shopify sync failed: ${sync.message}` : "Payment confirmed.");
     await loadAdminOrders();
   } catch (error) {
     toast(error.message);
@@ -2059,12 +2386,13 @@ async function submitPaymentLink(event) {
     await api(`/api/admin/orders/${encodeURIComponent(orderId)}/payment-link`, {
       method: "POST",
       body: JSON.stringify({
+        provider: formData.get("provider"),
         url: formData.get("url"),
         reference: formData.get("reference"),
         note: formData.get("note"),
       }),
     });
-    toast("Yoco payment link saved.");
+    toast("Payment details saved.");
     await loadAdminOrders();
   } catch (error) {
     toast(error.message);
@@ -2254,6 +2582,8 @@ document.addEventListener("click", (event) => {
 
   if (event.target.closest("#showCreateAccount")) showScreen("create");
   if (event.target.closest("#backToLogin")) showAuth();
+  if (event.target.closest("[data-cancel-terms]")) closeTermsModal();
+  if (event.target.closest("#acceptTermsButton")) acceptTermsAndRegister();
 
   const add = event.target.closest("[data-add-product]");
   if (add) addToCart(add.dataset.addProduct, add.closest(".product"));
@@ -2319,10 +2649,18 @@ document.addEventListener("click", (event) => {
   const adminTab = event.target.closest("[data-admin-view]");
   if (adminTab) {
     state.adminView = adminTab.dataset.adminView;
+    state.adminOrderFilter = "all";
+    state.adminOrderSearch = "";
     if (state.adminView === "shop-settings") loadAdminShopSettings();
     else if (state.adminView === "accounts") loadAdminAccounts();
     else if (state.adminView === "system-status") loadSystemStatus();
     else renderAdminOrders();
+  }
+
+  const adminOrderFilter = event.target.closest("[data-admin-order-filter]");
+  if (adminOrderFilter) {
+    state.adminOrderFilter = adminOrderFilter.dataset.adminOrderFilter || "all";
+    renderAdminOrders();
   }
 
   const accountFilter = event.target.closest("[data-account-filter]");
@@ -2359,6 +2697,7 @@ document.addEventListener("click", (event) => {
   }
   const copy = event.target.closest("[data-copy-value]");
   if (copy) copyText(copy.dataset.copyValue, copy.dataset.copyLabel || "text");
+  if (event.target.closest("[data-retry-catalog]")) loadCatalog();
   if (event.target.closest("[data-cancel-special-order]")) closeSpecialOrderModal();
   if (event.target.closest("[data-close-order-flow]")) closeOrderFlowModal();
   if (event.target.closest("[data-confirm-order]")) confirmPendingOrder();
@@ -2388,6 +2727,10 @@ document.addEventListener("click", (event) => {
 });
 
 document.addEventListener("change", async (event) => {
+  if (event.target.matches("#termsAgeConfirm")) {
+    updateTermsGate();
+  }
+
   const type = event.target.closest("[data-type-filter]");
   if (type) {
     if (type.checked) state.selectedTypes.add(type.dataset.typeFilter);
@@ -2445,13 +2788,22 @@ document.addEventListener("input", (event) => {
       input.setSelectionRange(input.value.length, input.value.length);
     }
   }
+
+  if (event.target.matches("#adminOrderSearch")) {
+    state.adminOrderSearch = event.target.value.trim();
+    renderAdminOrders();
+    const input = qs("#adminOrderSearch");
+    if (input) {
+      input.focus();
+      input.setSelectionRange(input.value.length, input.value.length);
+    }
+  }
 });
 
 document.addEventListener("submit", (event) => {
   if (event.target.matches("#loginForm")) login(event);
   if (event.target.matches("#registerForm")) register(event);
   if (event.target.matches("#orderForm")) submitOrder(event);
-  if (event.target.matches(".proof-form")) uploadProof(event);
   if (event.target.matches(".payment-issue-form")) submitPaymentIssueForm(event);
   if (event.target.matches("[data-payment-link]")) submitPaymentLink(event);
   if (event.target.matches("[data-special-review]")) submitSpecialReviewForm(event);
@@ -2468,6 +2820,7 @@ qs("#logoutButton").addEventListener("click", logout);
 qs("#themeToggle").addEventListener("click", toggleTheme);
 qs("#refreshCatalog").addEventListener("click", loadCatalog);
 qs("#refreshOrders").addEventListener("click", loadCustomerOrders);
+qs("#termsScrollBody").addEventListener("scroll", updateTermsGate);
 qs("#refreshAdminPanel").addEventListener("click", () => {
   if (state.adminView === "shop-settings") loadAdminShopSettings();
   else if (state.adminView === "accounts") loadAdminAccounts();

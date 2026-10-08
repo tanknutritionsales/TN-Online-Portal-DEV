@@ -2,7 +2,7 @@
   "name": "online-portal",
   "version": "0.1.0",
   "private": true,
-  "description": "Customer order portal proof of concept for Tank Nutrition.",
+  "description": "Customer order portal for Tank Nutrition.",
   "type": "module",
   "scripts": {
     "start": "node server.js",

@@ -1,6 +1,6 @@
 # Local Testing Checklist
 
-Use this before deciding the portal is ready for hosted setup.
+Use this before cutting a release or enabling Shopify order sync.
 
 ## Reset
 
@@ -12,6 +12,8 @@ npm start
 ## Customer
 
 - Login with `user` / `user`.
+- Open Create account, fill the form, and confirm account creation is blocked by the terms/disclaimer modal.
+- Confirm the `I am 18 years or older - Enter` button stays disabled until the terms are scrolled to the bottom and the age checkbox is ticked.
 - Confirm the first screen after login is the Shop page.
 - Confirm the featured slider appears when matching products exist.
 - Confirm brand collection tiles appear above the product grid.
@@ -31,12 +33,13 @@ npm start
 - Open My account and confirm customer contact and default delivery details are shown.
 - Try an unusually large normal quantity and confirm it is blocked.
 - Enable Special order request, add a larger quantity or out-of-stock product, and submit the request.
-- Submit an order with the prefilled delivery address.
+- Submit an order with the selected delivery address.
 - Open `My orders`.
 - Confirm the order shows `Payment pending`.
-- Confirm EFT reference and total are visible.
-- Upload a proof-of-payment file.
-- Confirm the order shows the POP filename.
+- Confirm the customer sees the review note saying payment details will be provided after staff review.
+- After admin attaches payment details, confirm the payment panel is readable in light and dark mode.
+- Confirm the copy reference/details buttons work.
+- Click `I have paid` and confirm the customer status becomes `Marked as paid, processing`.
 
 ## Admin
 
@@ -45,9 +48,11 @@ npm start
 - Confirm only the admin queue is visible.
 - Confirm the admin area has Awaiting confirmation, Ready to pack, and Completed tabs.
 - Open Shop settings and confirm the featured slider can be saved as a collection/tag query or custom product selection.
+- Confirm the Payments section is collapsed by default and can save the active provider/module copy.
 - Confirm the submitted order appears under Awaiting confirmation.
 - For a special order, approve, decline, or counter the request.
-- Open the POP link if a proof was uploaded.
+- Attach a Yoco payment link to an approved order.
+- Confirm the order filters can isolate orders needing payment details and payments to verify.
 - Confirm payment.
 - Confirm the order moves to Ready to pack.
 

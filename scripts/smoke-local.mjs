@@ -6,6 +6,7 @@ class Session {
   async request(path, options = {}) {
     const headers = {
       "content-type": "application/json",
+      "x-op-client": "portal",
       ...(this.cookie ? { cookie: this.cookie } : {}),
       ...(options.headers || {}),
     };
@@ -50,6 +51,7 @@ const order = await customer.request("/api/orders", {
         country: "South Africa",
       },
     },
+    idempotencyKey: `smoke-${Date.now()}`,
     items: [
       {
         variantId: product.variant.id,
@@ -72,6 +74,7 @@ await admin.request(`/api/admin/orders/${encodeURIComponent(order.order.id)}/pay
   method: "POST",
   body: JSON.stringify({
     url: "https://pay.yoco.com/smoke-test",
+    provider: "yoco",
     reference: order.order.reference,
     note: "Smoke test Yoco link",
   }),

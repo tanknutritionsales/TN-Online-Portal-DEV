@@ -132,7 +132,7 @@
                 <div>
                   <p class="eyebrow">Shop</p>
                   <h2>Browse products</h2>
-                  <p class="muted">Select your products and submit a secure EFT order request.</p>
+                  <p class="muted">Select your products and submit a secure order request.</p>
                 </div>
                 <button id="refreshCatalog" class="secondary" type="button">Refresh</button>
               </div>
@@ -197,7 +197,7 @@
             <section class="panel checkout">
               <div class="section-heading">
                 <div>
-                  <p class="eyebrow">EFT order</p>
+                  <p class="eyebrow">Order request</p>
                   <h2>Cart</h2>
                 </div>
                 <span id="cartCount" class="pill">0 items</span>
@@ -274,6 +274,53 @@
     </main>
 
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <div id="termsModal" class="modal-backdrop" hidden>
+      <div class="confirm-modal wide-modal terms-modal" role="dialog" aria-modal="true" aria-labelledby="termsTitle">
+        <div class="modal-shell">
+          <div class="terms-alert">
+            <p class="eyebrow">Required disclaimer</p>
+            <h2 id="termsTitle">Terms and conditions</h2>
+            <strong>All products listed in this portal are supplied for research use only.</strong>
+          </div>
+          <div id="termsScrollBody" class="terms-scroll" tabindex="0">
+            <section>
+              <h3>Research use only</h3>
+              <p>Products available through this portal are intended strictly for research, laboratory, analytical, or non-human-use purposes. They are not sold as medicines, supplements, foods, cosmetics, or consumer health products.</p>
+              <p>Products are not intended to diagnose, treat, cure, or prevent any disease or medical condition. They are not intended for human consumption, personal use, injection, ingestion, or administration to any person or animal.</p>
+            </section>
+            <section>
+              <h3>Customer responsibility</h3>
+              <p>By creating an account, you confirm that you understand the nature of the products, that you are responsible for complying with all laws and regulations that apply to you, and that you will not misuse any product purchased through this portal.</p>
+              <p>You agree to review product information carefully before placing any order and to contact our team before ordering if anything is unclear.</p>
+            </section>
+            <section>
+              <h3>Age confirmation</h3>
+              <p>You must be 18 years or older to create an account or place an order through this portal. If you are not at least 18 years old, do not continue.</p>
+            </section>
+            <section>
+              <h3>Order review and payment</h3>
+              <p>Submitting an order request does not guarantee supply. Orders may be reviewed, declined, adjusted, or delayed based on availability, compliance, payment verification, or operational requirements.</p>
+              <p>Payment details are provided only after our team has reviewed the order. Orders are processed further only after payment has been verified.</p>
+            </section>
+            <section>
+              <h3>Agreement</h3>
+              <p>By continuing, you acknowledge that you have read and understood this disclaimer and the portal terms, that all information you provided is accurate, and that you accept responsibility for your account and order activity.</p>
+            </section>
+          </div>
+          <div class="terms-confirm">
+            <label class="check-option">
+              <input id="termsAgeConfirm" type="checkbox" disabled>
+              I confirm that I have read the terms and I am 18 years or older.
+            </label>
+            <p class="muted small">Scroll to the bottom of the terms to enable confirmation.</p>
+          </div>
+          <div class="modal-actions">
+            <button class="secondary" type="button" data-cancel-terms>Cancel</button>
+            <button id="acceptTermsButton" class="primary" type="button" disabled>I am 18 years or older - Enter</button>
+          </div>
+        </div>
+      </div>
+    </div>
     <div id="confirmAccountRemove" class="modal-backdrop" hidden>
       <div class="confirm-modal" role="dialog" aria-modal="true" aria-labelledby="removeAccountTitle">
         <form id="removeAccountForm">
