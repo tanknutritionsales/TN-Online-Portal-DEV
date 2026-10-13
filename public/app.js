@@ -2018,6 +2018,7 @@ function adminOrderStatusLabel(order) {
   if (order.fulfillmentStatus === "shipped") return "Completed";
   if (order.specialOrder?.status === "declined") return "Declined";
   if (order.paymentStatus === "confirmed") {
+    if (order.shopifySync?.status === "storage_pending") return "Storage transfer required";
     if (order.fulfillmentStatus === "back_order") return "Back order";
     return "Ready to pack";
   }
@@ -2034,7 +2035,8 @@ function renderAdminOrder(order) {
   const hasPaymentEvidence = Boolean(order.paymentLink || order.proof);
   const canConfirm = order.paymentStatus !== "confirmed" && readyForPayment && hasPaymentEvidence;
   const hasShopifyRelevantItems = !order.specialOrder || (order.officeItems || []).length > 0;
-  const canSyncShopify = hasShopifyRelevantItems && order.paymentStatus === "confirmed" && !order.shopifyOrder?.id;
+  const canCheckStockTransfer =
+    hasShopifyRelevantItems && order.paymentStatus === "confirmed" && !order.shopifyOrder?.id && order.shopifySync?.status === "storage_pending";
   const view = adminOrderView(order);
   const hasManualItems = Boolean((order.externalItems || []).length);
   const workflowNote =
@@ -2049,6 +2051,9 @@ function renderAdminOrder(order) {
   const specialReview = order.specialOrder ? renderAdminSpecialOrder(order) : "";
   const manualTracking = renderManualTrackingForm(order);
   const shopifySync = renderShopifySync(order);
+  const storageTransferNote = (order.items || []).some((item) => Number(item.storageBackedQuantity || 0) > 0)
+    ? `<p class="muted"><strong>Stock transfer:</strong> This order is paused until the required units have been moved to Office. Use the check button after the transfer has been completed.</p>`
+    : "";
   const statusLabel = adminOrderStatusLabel(order);
   return `
     <details class="order-card admin-order-card" data-admin-order-id="${escapeHtml(order.id)}">
@@ -2063,6 +2068,7 @@ function renderAdminOrder(order) {
         <ul>${order.items.map((item) => `<li>${item.quantity} x ${escapeHtml(item.productTitle)}</li>`).join("")}</ul>
         <p><strong>Total:</strong> ${money.format(order.total)}</p>
         ${workflowNote}
+        ${storageTransferNote}
         ${specialReview}
         ${paymentIssue}
         ${paymentLinkForm}
@@ -2075,10 +2081,10 @@ function renderAdminOrder(order) {
         ${paymentNote}
         ${shopifySync}
         ${
-          canConfirm || canSyncShopify
+          canConfirm || canCheckStockTransfer
             ? `<div class="order-actions">
                 ${canConfirm ? `<button type="button" data-confirm="${order.id}">Confirm payment</button>` : ""}
-                ${canSyncShopify ? `<button type="button" data-sync-shopify="${order.id}">Sync to Shopify</button>` : ""}
+                ${canCheckStockTransfer ? `<button type="button" data-check-stock-transfer="${order.id}">Check stock transfer</button>` : ""}
               </div>`
             : ""
         }
@@ -2155,17 +2161,18 @@ function renderShopifySync(order) {
     const linked = order.shopifyOrder.adminUrl
       ? `<a href="${escapeHtml(order.shopifyOrder.adminUrl)}" target="_blank" rel="noopener">${escapeHtml(label)}</a>`
       : escapeHtml(label);
-    return `<p class="muted">Shopify: ${linked} (${escapeHtml(order.shopifyOrder.financialStatus || "paid")})</p>`;
+    return `<p class="muted">Processing: ${linked} (${escapeHtml(order.shopifyOrder.financialStatus || "paid")})</p>`;
   }
-  if (!sync.status || sync.status === "not_started") return `<p class="muted">Shopify: Not synced yet.</p>`;
+  if (!sync.status || sync.status === "not_started") return `<p class="muted">Processing: Not started yet.</p>`;
   const labels = {
     disabled: "Sync disabled",
     external: "Not required",
+    storage_pending: "Storage transfer required",
     syncing: "Syncing",
     error: "Sync error",
     synced: "Synced",
   };
-  return `<p class="muted">Shopify: ${escapeHtml(labels[sync.status] || sync.status)}${sync.message ? ` - ${escapeHtml(sync.message)}` : ""}</p>`;
+  return `<p class="muted">Processing: ${escapeHtml(labels[sync.status] || sync.status)}${sync.message ? ` - ${escapeHtml(sync.message)}` : ""}</p>`;
 }
 
 function renderAdminSpecialOrder(order) {
@@ -2370,7 +2377,8 @@ async function confirmPayment(orderId) {
       body: JSON.stringify({ confirmedBy: "admin" }),
     });
     const sync = payload.order?.shopifySync;
-    toast(sync?.status === "error" ? `Payment confirmed. Shopify sync failed: ${sync.message}` : "Payment confirmed.");
+    if (sync?.status === "storage_pending") toast("Payment confirmed. Stock transfer required before processing can continue.");
+    else toast(sync?.status === "error" ? `Payment confirmed. Shopify processing failed: ${sync.message}` : "Payment confirmed.");
     await loadAdminOrders();
   } catch (error) {
     toast(error.message);
@@ -2412,10 +2420,14 @@ async function resolvePaymentIssue(orderId) {
   }
 }
 
-async function syncShopifyOrder(orderId) {
+async function checkStockTransfer(orderId) {
   try {
-    const payload = await api(`/api/admin/orders/${encodeURIComponent(orderId)}/sync-shopify`, { method: "POST" });
-    toast(payload.order?.shopifyOrder?.name ? `Synced ${payload.order.shopifyOrder.name} to Shopify.` : "Shopify sync complete.");
+    const payload = await api(`/api/admin/orders/${encodeURIComponent(orderId)}/check-stock-transfer`, { method: "POST" });
+    if (payload.order?.shopifyOrder?.name) {
+      toast(`Stock transfer confirmed. Order ${payload.order.shopifyOrder.name} is ready for Retail Shark.`);
+    } else {
+      toast(payload.order?.shopifySync?.message || "Stock transfer is still required.");
+    }
     await loadAdminOrders();
   } catch (error) {
     toast(error.message);
@@ -2609,8 +2621,8 @@ document.addEventListener("click", (event) => {
   const resolveIssue = event.target.closest("[data-resolve-payment-issue]");
   if (resolveIssue) resolvePaymentIssue(resolveIssue.dataset.resolvePaymentIssue);
 
-  const syncShopify = event.target.closest("[data-sync-shopify]");
-  if (syncShopify) syncShopifyOrder(syncShopify.dataset.syncShopify);
+  const stockTransfer = event.target.closest("[data-check-stock-transfer]");
+  if (stockTransfer) checkStockTransfer(stockTransfer.dataset.checkStockTransfer);
 
   const specialAction = event.target.closest("[data-special-action]");
   if (specialAction) submitSpecialOrderReview(specialAction.dataset.orderId, specialAction.dataset.specialAction);

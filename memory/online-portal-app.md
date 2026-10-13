@@ -22,7 +22,7 @@ Retail Shark remains the internal staff operations app. Online Portal owns custo
 - Do not route customers through Shopify checkout.
 - Do not create Shopify orders unless `SHOPIFY_ORDER_SYNC_ENABLED=true` and payment has been verified by admin or a future trusted webhook.
 - Do not show exact Shopify SOH to customers. Customers see only `In stock` or `Out of stock`.
-- Normal carts cannot exceed Shopify availability.
+- Normal carts cannot exceed server-side availability. Availability can combine Shopify Office SOH with Retail Shark secondary storage availability when the Retail Shark internal API is configured.
 - Special orders can request more than availability or out-of-stock products, but admin must approve/decline/counter before payment details unlock.
 - Keep secrets in `.env` or hosted environment variables only.
 - Never commit tokens, admin passwords, customer/order data, database dumps, payment links, legacy proof files, or cached private assets.
@@ -43,8 +43,9 @@ Retail Shark remains the internal staff operations app. Online Portal owns custo
 11. Customer pays, can copy payment reference/details, and can click `I have paid`.
 12. Customer status becomes `Marked as paid, processing` until admin verifies payment.
 13. After admin confirmation, the order can sync to Shopify if mutations are enabled and then becomes visible to Retail Shark.
-14. Retail Shark supplies tracking/back-order/shipped updates.
-15. Customer can open My orders, view progress, and track shipped orders.
+14. If a normal order depends on Retail Shark storage stock, OP pauses it as `Storage transfer required` after payment confirmation. Staff must complete the Office stock transfer and click `Check stock transfer`; only then can OP create the Shopify order and release it to Retail Shark.
+15. Retail Shark supplies tracking/back-order/shipped updates.
+16. Customer can open My orders, view progress, and track shipped orders.
 
 ## Current Admin Flow
 
@@ -56,6 +57,7 @@ Retail Shark remains the internal staff operations app. Online Portal owns custo
 - Admin attaches payment details after review. For Yoco, this is the Yoco payment link plus reference/customer note.
 - Admin confirms payment only after payment has truly cleared.
 - Admin can retry Shopify sync for confirmed orders if sync is enabled and previous sync failed or was disabled.
+- For storage-backed orders, admin sees `Storage transfer required` and uses `Check stock transfer` after moving stock to Office. Customers do not see storage/transfer details.
 - Admin can manage accounts, shop settings, system status, and payment provider settings.
 
 ## Payment Module
@@ -133,6 +135,7 @@ Guarded sync:
 - Default inventory behavior is `DECREMENT_OBEYING_POLICY`.
 - Online Portal stores Shopify order ID/name/admin URL so retries cannot duplicate orders.
 - Retail Shark receives confirmed orders only after Shopify sync succeeds when sync is enabled.
+- Storage-backed normal orders do not auto-create Shopify orders after payment confirmation. OP tags the internal line quantity that exceeded Office SOH, blocks shipping/processing, and clears the pause only after Office SOH is sufficient.
 
 ## Retail Shark Internal API
 
@@ -151,9 +154,19 @@ POST /api/internal/orders/:id/back-order
 POST /api/internal/orders/:id/ship
 ```
 
+Online Portal also reads Retail Shark storage availability through Retail Shark's protected internal API:
+
+```text
+GET <RETAIL_SHARK_INTERNAL_URL>/api/internal/storage-availability
+X-Internal-Token: <RETAIL_SHARK_INTERNAL_TOKEN>
+```
+
+The storage availability response is used only server-side for customer availability and normal cart limits. Public catalog/order payloads must not expose exact SOH or storage quantities.
+
 Office flow:
 
 - Confirmed paid, Shopify-ready orders appear in Retail Shark.
+- Storage-backed paid orders stay paused in OP until stock has been transferred to Office and OP's `Check stock transfer` succeeds.
 - Staff adds courier/tracking or marks back order.
 - Staff marks shipped when parcel is packed and leaving same day.
 - Online Portal shows customer tracking and shipped status.

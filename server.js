@@ -1296,7 +1296,7 @@ function publicOrder(order) {
     id: order.id,
     reference: order.reference,
     customer: order.customer,
-    items: order.items,
+    items: publicOrderItems(order.items),
     subtotal: order.subtotal,
     deliveryFee: order.deliveryFee,
     total: order.total,
@@ -1315,6 +1315,17 @@ function publicOrder(order) {
     createdAt: order.createdAt,
     updatedAt: order.updatedAt,
   };
+}
+
+function publicOrderItems(items = []) {
+  return (items || []).map((item) => ({
+    variantId: item.variantId,
+    productTitle: item.productTitle,
+    variantTitle: item.variantTitle,
+    sku: item.sku,
+    quantity: item.quantity,
+    price: item.price,
+  }));
 }
 
 function publicPaymentLink(paymentLink) {
@@ -1385,6 +1396,7 @@ function specialOrderReadyForPayment(order) {
 function staffOrder(order) {
   return {
     ...publicOrder(order),
+    items: order.items || [],
     specialOrder: order.specialOrder || null,
     paymentLink: order.paymentLink || null,
     paymentIssue: order.paymentIssue || null,
@@ -1508,6 +1520,11 @@ function validateCartItems(inputItems, catalogProducts, options = {}) {
       if (!product || !product.variant) return null;
       if (quantity <= 0) return null;
       if (!allowSpecial) assertQuantityAvailable(product, quantity);
+      const officeAvailableQuantity = Number.isFinite(product.variant.officeAvailableQuantity)
+        ? product.variant.officeAvailableQuantity
+        : product.variant.availableQuantity;
+      const storageBackedQuantity =
+        !allowSpecial && Number.isFinite(officeAvailableQuantity) ? Math.max(0, quantity - Math.max(0, officeAvailableQuantity)) : 0;
       return {
         variantId,
         productTitle: product.title,
@@ -1515,6 +1532,7 @@ function validateCartItems(inputItems, catalogProducts, options = {}) {
         sku: product.variant.sku,
         quantity,
         price: money(product.variant.price),
+        ...(storageBackedQuantity > 0 ? { storageBackedQuantity } : {}),
       };
     })
     .filter(Boolean);
@@ -1528,6 +1546,10 @@ function assertQuantityAvailable(product, quantity) {
   if (Number.isFinite(variant.availableQuantity) && quantity > variant.availableQuantity) {
     throw Object.assign(new Error(`${product.title} exceeds current availability. Use a special order request for larger quantities.`), { status: 409 });
   }
+}
+
+function orderHasStorageBackedItems(order) {
+  return (order.items || []).some((item) => Number(item.storageBackedQuantity || 0) > 0);
 }
 
 async function createOrder(input, user) {
@@ -1667,7 +1689,14 @@ async function confirmPayment(orderId, input, admin) {
     }
     order.statusEvents.push({ at: now, actor: "admin", type: "payment_confirmed", label: provider.confirmationLabel || "Payment confirmed" });
   }
-  if (shopifyOrderSyncEnabled && !order.shopifyOrder?.id) {
+  if (shopifyOrderSyncEnabled && !order.shopifyOrder?.id && orderHasStorageBackedItems(order)) {
+    order.shopifySync = {
+      status: "storage_pending",
+      message: "This order is paused until the required storage stock has been transferred to Office.",
+      attemptedAt: null,
+      syncedAt: null,
+    };
+  } else if (shopifyOrderSyncEnabled && !order.shopifyOrder?.id) {
     await syncOrderToShopify(order, admin, { throwOnError: false });
   } else if (!shopifyOrderSyncEnabled && !order.shopifyOrder?.id) {
     order.shopifySync = {
@@ -1722,6 +1751,52 @@ async function syncConfirmedOrder(orderId, admin) {
   order.updatedAt = new Date().toISOString();
   await writeOrdersData(data);
   return order;
+}
+
+async function checkStorageTransfer(orderId, admin) {
+  const data = await readOrdersData();
+  const order = data.orders.find((entry) => entry.id === orderId);
+  if (!order) throw Object.assign(new Error("Order not found."), { status: 404 });
+  if (order.paymentStatus !== "confirmed") throw Object.assign(new Error("Payment must be confirmed first."), { status: 409 });
+  if (!orderHasStorageBackedItems(order)) throw Object.assign(new Error("This order is not waiting for a storage transfer."), { status: 409 });
+  const missingItems = await storageTransferShortfalls(order);
+  if (missingItems.length) {
+    order.shopifySync = {
+      status: "storage_pending",
+      message: `Still waiting for Office stock: ${missingItems.map((item) => `${item.productTitle} needs ${item.required}, Office has ${item.officeAvailable}`).join("; ")}.`,
+      attemptedAt: new Date().toISOString(),
+      attemptedBy: cleanText(admin?.username || "admin", 120),
+      syncedAt: null,
+    };
+    order.updatedAt = new Date().toISOString();
+    await writeOrdersData(data);
+    return order;
+  }
+  order.items = (order.items || []).map((item) => {
+    const { storageBackedQuantity, ...rest } = item;
+    return rest;
+  });
+  await syncOrderToShopify(order, admin, { throwOnError: true });
+  order.updatedAt = new Date().toISOString();
+  await writeOrdersData(data);
+  return order;
+}
+
+async function storageTransferShortfalls(order) {
+  const catalog = await catalogProducts();
+  const productsByVariant = new Map(catalog.products.map((product) => [product.variant?.id, product]).filter(([variantId]) => variantId));
+  return (order.items || [])
+    .filter((item) => Number(item.storageBackedQuantity || 0) > 0)
+    .map((item) => {
+      const product = productsByVariant.get(item.variantId);
+      const officeAvailable = Number.isFinite(product?.variant?.officeAvailableQuantity) ? Math.max(0, product.variant.officeAvailableQuantity) : 0;
+      return {
+        productTitle: item.productTitle,
+        required: Math.max(0, Number(item.quantity || 0)),
+        officeAvailable,
+      };
+    })
+    .filter((item) => item.officeAvailable < item.required);
 }
 
 async function reviewSpecialOrder(orderId, input, admin) {
@@ -1895,6 +1970,9 @@ async function markShipped(orderId) {
   const order = data.orders.find((entry) => entry.id === orderId);
   if (!order) throw Object.assign(new Error("Order not found."), { status: 404 });
   if (order.paymentStatus !== "confirmed") throw Object.assign(new Error("Payment must be confirmed first."), { status: 409 });
+  if (shopifyFulfillmentItems(order).length && shopifyOrderSyncEnabled && !order.shopifyOrder?.id) {
+    throw Object.assign(new Error("This order must complete stock transfer and Shopify processing before it can be marked as shipped."), { status: 409 });
+  }
   const now = new Date().toISOString();
   order.fulfillmentStatus = "shipped";
   order.shippedAt = now;
@@ -1914,6 +1992,9 @@ async function syncOrderToShopify(order, admin, options = {}) {
   }
   if (order.specialOrder?.status === "pending" || order.specialOrder?.status === "declined") {
     throw Object.assign(new Error("This special order is not ready for Shopify sync."), { status: 409 });
+  }
+  if (orderHasStorageBackedItems(order)) {
+    throw Object.assign(new Error("Complete the stock transfer check before processing this order."), { status: 409 });
   }
   if (!shopifyFulfillmentItems(order).length) {
     order.shopifySync = {
@@ -2242,8 +2323,48 @@ async function catalogProducts() {
   ]);
   const collectionImages = buildCollectionImageLookup(collectionNodes);
   const products = productNodes.map((product) => normalizeCatalogProduct(product, collectionImages)).filter((product) => product.variant);
-  const cachedProducts = await cacheCatalogImages(products);
+  const storageAvailability = await retailSharkStorageAvailability();
+  const mergedProducts = mergeStorageAvailability(products, storageAvailability);
+  const cachedProducts = await cacheCatalogImages(mergedProducts);
   return { source: "shopify", products: cachedProducts, filters: buildCatalogFilters(cachedProducts) };
+}
+
+async function retailSharkStorageAvailability() {
+  if (!retailSharkInternalUrl || !retailSharkInternalToken) return new Map();
+  try {
+    const storageUrl = new URL("/api/internal/storage-availability", retailSharkInternalUrl).toString();
+    const { response, payload } = await fetchJsonWithTimeout(storageUrl, {
+      headers: { "x-internal-token": retailSharkInternalToken },
+    }, 2500);
+    if (!response.ok || payload.ok === false) return new Map();
+    return new Map(
+      (Array.isArray(payload.rows) ? payload.rows : [])
+        .map((row) => [cleanText(row.variantId, 180), Math.max(0, Number(row.storageQuantity || 0))])
+        .filter(([variantId, quantity]) => variantId && quantity > 0),
+    );
+  } catch {
+    return new Map();
+  }
+}
+
+function mergeStorageAvailability(products, storageAvailability) {
+  if (!storageAvailability?.size) return products;
+  return products.map((product) => {
+    if (!product.variant?.id) return product;
+    const storageQuantity = storageAvailability.get(product.variant.id) || 0;
+    if (storageQuantity <= 0) return product;
+    const officeQuantity = Number.isFinite(product.variant.availableQuantity) ? product.variant.availableQuantity : 0;
+    return {
+      ...product,
+      variant: {
+        ...product.variant,
+        storageQuantity,
+        availableQuantity: Number.isFinite(product.variant.availableQuantity) ? officeQuantity + storageQuantity : storageQuantity,
+        inStock: product.variant.inStock || storageQuantity > 0,
+        storageBacked: storageQuantity > 0,
+      },
+    };
+  });
 }
 
 async function fetchShopifyConnection(endpoint, accessToken, query, connectionName, variables = {}, pageLimit = 5) {
@@ -2387,6 +2508,7 @@ function normalizeCatalogProduct(product, collectionImages = new Map()) {
           title: variant.title || "Default Title",
           sku: variant.sku || "",
           price: money(variant.price),
+          officeAvailableQuantity: hasQuantity ? Math.max(0, inventoryQuantity) : null,
           availableQuantity: hasQuantity ? Math.max(0, inventoryQuantity) : null,
           inStock: Boolean(variant.availableForSale && (!hasQuantity || inventoryQuantity > 0)),
         }
@@ -2788,6 +2910,12 @@ async function handleApi(req, res, url) {
   if (req.method === "POST" && adminPaymentIssueResolveMatch) {
     const admin = requireAdmin(req);
     const order = await resolvePaymentIssue(decodeURIComponent(adminPaymentIssueResolveMatch[1]), admin);
+    return json(res, 200, { ok: true, order: staffOrder(order) });
+  }
+  const adminStockTransferCheckMatch = url.pathname.match(/^\/api\/admin\/orders\/([^/]+)\/check-stock-transfer$/);
+  if (req.method === "POST" && adminStockTransferCheckMatch) {
+    const admin = requireAdmin(req);
+    const order = await checkStorageTransfer(decodeURIComponent(adminStockTransferCheckMatch[1]), admin);
     return json(res, 200, { ok: true, order: staffOrder(order) });
   }
   const adminShopifySyncMatch = url.pathname.match(/^\/api\/admin\/orders\/([^/]+)\/sync-shopify$/);
