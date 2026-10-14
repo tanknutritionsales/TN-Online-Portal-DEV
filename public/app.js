@@ -113,6 +113,19 @@ function defaultShopSettings() {
       note: "Once payment has been marked as paid, the order will be verified and tracking details will follow.",
       providers,
     },
+    courier: {
+      enabled: true,
+      amount: 150,
+      productQuery: "pudo-courier",
+      title: "Courier",
+    },
+    fulfillment: {
+      specialOrders: {
+        enabled: true,
+        unavailableMessage: "Special orders are temporarily unavailable.",
+      },
+      rules: [],
+    },
     references: {
       standardFormat: "OP-{YYYY}{MM}{DD}-{RAND4}",
       specialFormat: "SO-{YYYY}{MM}{DD}-{RAND4}",
@@ -466,8 +479,33 @@ function mergeShopSettings(settings = {}) {
       ...payment,
       providers,
     },
+    courier: { ...defaults.courier, ...(settings.courier || {}) },
+    fulfillment: mergeFulfillmentSettings(settings.fulfillment || {}, defaults.fulfillment),
     references: { ...defaults.references, ...(settings.references || {}) },
   };
+}
+
+function mergeFulfillmentSettings(fulfillment = {}, defaults = defaultShopSettings().fulfillment) {
+  return {
+    ...defaults,
+    ...fulfillment,
+    specialOrders: { ...defaults.specialOrders, ...(fulfillment.specialOrders || {}) },
+    rules: Array.isArray(fulfillment.rules) ? fulfillment.rules : [],
+  };
+}
+
+function courierSettings() {
+  return currentShopSettings().courier || defaultShopSettings().courier;
+}
+
+function fulfillmentSettings() {
+  return currentShopSettings().fulfillment || defaultShopSettings().fulfillment;
+}
+
+function courierAmountForDraft(draft = {}) {
+  const settings = courierSettings();
+  if (settings.enabled === false) return 0;
+  return draft.items?.length ? Number(settings.amount || 0) : 0;
 }
 
 function paymentSettings() {
@@ -714,7 +752,15 @@ function renderCart() {
   renderCheckoutAddresses();
   const items = [...state.cart.values()];
   const totalQuantity = items.reduce((sum, item) => sum + item.quantity, 0);
-  const total = items.reduce((sum, item) => sum + item.price * item.quantity, 0);
+  const subtotal = items.reduce((sum, item) => sum + item.price * item.quantity, 0);
+  const courierFee = totalQuantity ? Number(courierSettings().amount || 0) : 0;
+  const total = subtotal + courierFee;
+  const specialOrders = fulfillmentSettings().specialOrders || defaultShopSettings().fulfillment.specialOrders;
+  const specialButton = qs("#openSpecialOrder");
+  if (specialButton) {
+    const note = qs("small", specialButton);
+    if (note) note.textContent = specialOrders.enabled === false ? specialOrders.unavailableMessage || "Special orders are temporarily unavailable." : "Request larger quantities or out-of-stock products";
+  }
   qs("#cartCount").textContent = `${totalQuantity} item${totalQuantity === 1 ? "" : "s"}`;
   qs("#cartTotal").textContent = money.format(total);
   const bubble = qs("#cartBubble");
@@ -729,7 +775,8 @@ function renderCart() {
     return;
   }
   container.className = "cart-items";
-  container.innerHTML = items
+  container.innerHTML =
+    items
     .map(
       (item) => `
         <div class="cart-line">
@@ -741,7 +788,18 @@ function renderCart() {
         </div>
       `,
     )
-    .join("");
+      .join("") +
+    (courierFee
+      ? `
+        <div class="cart-line system-line">
+          <div>
+            <strong>${escapeHtml(courierSettings().title || "Courier")}</strong>
+            <span>Required per order - ${money.format(courierFee)}</span>
+          </div>
+          <span class="locked-line">Fixed</span>
+        </div>
+      `
+      : "");
 }
 
 async function submitOrder(event) {
@@ -799,6 +857,7 @@ function openOrderSummaryModal(draft) {
       <section class="summary-panel">
         <p class="eyebrow">Products</p>
         <ul class="summary-lines">${draft.items.map((item) => `<li><span>${escapeHtml(item.productTitle)}</span><strong>${item.quantity} x ${money.format(item.price)}</strong></li>`).join("")}</ul>
+        ${courierAmountForDraft(draft) ? `<ul class="summary-lines system-summary-lines"><li><span>${escapeHtml(courierSettings().title || "Courier")}</span><strong>${money.format(courierAmountForDraft(draft))}</strong></li></ul>` : ""}
       </section>
       <section class="summary-panel">
         <p class="eyebrow">Delivery address</p>
@@ -824,6 +883,7 @@ function showPaymentModal(order) {
       <section class="summary-panel">
         <p class="eyebrow">Order</p>
         <ul class="summary-lines">${order.items.map((item) => `<li><span>${escapeHtml(item.productTitle)}</span><strong>${item.quantity}</strong></li>`).join("")}</ul>
+        ${orderCourierLineHtml(order)}
         <div class="summary-total compact"><span>Total</span><strong>${money.format(order.total)}</strong></div>
       </section>
       ${
@@ -877,6 +937,7 @@ function showOrderSubmittedModal(order) {
         <p class="eyebrow">Reference</p>
         <h3>${escapeHtml(order.reference)}</h3>
         <p class="muted">${escapeHtml(order.customerStatus)}</p>
+        ${order.deliveryFee ? `<p><strong>${escapeHtml(courierSettings().title || "Courier")}:</strong> ${money.format(order.deliveryFee)}</p>` : ""}
       </section>
       <p class="muted">${escapeHtml(paymentReviewNote(order))}</p>
     </div>
@@ -892,7 +953,12 @@ function closeOrderFlowModal() {
 }
 
 function orderDraftTotal(draft) {
-  return draft.items.reduce((sum, item) => sum + Number(item.price || 0) * Number(item.quantity || 0), 0);
+  return draft.items.reduce((sum, item) => sum + Number(item.price || 0) * Number(item.quantity || 0), 0) + courierAmountForDraft(draft);
+}
+
+function orderCourierLineHtml(order) {
+  if (!Number(order.deliveryFee || 0)) return "";
+  return `<ul class="summary-lines system-summary-lines"><li><span>${escapeHtml(courierSettings().title || "Courier")}</span><strong>${money.format(order.deliveryFee)}</strong></li></ul>`;
 }
 
 function renderAddressBlock(address) {
@@ -900,6 +966,11 @@ function renderAddressBlock(address) {
 }
 
 function openSpecialOrderModal() {
+  const specialOrders = fulfillmentSettings().specialOrders || defaultShopSettings().fulfillment.specialOrders;
+  if (specialOrders.enabled === false) {
+    toast(specialOrders.unavailableMessage || "Special orders are temporarily unavailable.");
+    return;
+  }
   const form = qs("#specialOrderForm");
   form.reset();
   state.specialOrderItems = [];
@@ -1234,6 +1305,7 @@ function renderCustomerOrder(order) {
         <span class="status-badge">${escapeHtml(order.customerStatus)}</span>
       </header>
       <ul>${order.items.map((item) => `<li>${item.quantity} x ${escapeHtml(item.productTitle)}</li>`).join("")}</ul>
+      ${Number(order.deliveryFee || 0) ? `<p><strong>${escapeHtml(courierSettings().title || "Courier")}:</strong> ${money.format(order.deliveryFee)}</p>` : ""}
       <p><strong>Total:</strong> ${money.format(order.total)}</p>
       ${renderOrderProgress(order)}
       ${special}
@@ -1465,10 +1537,11 @@ function renderAdminOrders() {
     renderSystemStatus();
     return;
   }
-  const viewOrders = state.adminOrders.filter((order) => adminOrderView(order) === state.adminView);
+  const viewOrders = adminOrdersForView(state.adminView);
   const orders = viewOrders.filter(adminOrderMatchesFilters);
   const labels = {
     pending: "Awaiting confirmation",
+    external: "External fulfillment",
     ready: "Ready to pack",
     completed: "Completed",
   };
@@ -1500,6 +1573,7 @@ function adminOrderFilterOptions() {
     { id: "all", label: "All" },
     { id: "needs_payment_details", label: "Needs payment details" },
     { id: "payment_to_verify", label: "Payment to verify" },
+    { id: "fulfillment_review", label: "Fulfillment review" },
     { id: "special_review", label: "Special review" },
     { id: "support", label: "Payment support" },
   ];
@@ -1508,9 +1582,10 @@ function adminOrderFilterOptions() {
 function adminOrderMatchesFilters(order) {
   const query = normalizeSearch(state.adminOrderSearch);
   if (query && !adminOrderSearchText(order).includes(query)) return false;
-  if (state.adminOrderFilter === "needs_payment_details") return !order.paymentLink && (!order.specialOrder || ["accepted", "countered"].includes(order.specialOrder.status));
+  if (state.adminOrderFilter === "needs_payment_details") return !order.paymentLink && fulfillmentReadyForPayment(order);
   if (state.adminOrderFilter === "payment_to_verify") return order.paymentIssue?.type === "paid_pending";
   if (state.adminOrderFilter === "special_review") return order.specialOrder?.status === "pending";
+  if (state.adminOrderFilter === "fulfillment_review") return !fulfillmentReadyForPayment(order) && order.specialOrder?.status !== "pending";
   if (state.adminOrderFilter === "support") return order.paymentIssue && order.paymentIssue.status !== "resolved" && order.paymentIssue.type !== "paid_pending";
   return true;
 }
@@ -1536,8 +1611,31 @@ function adminOrderView(order) {
   return "pending";
 }
 
+function adminOrdersForView(view) {
+  if (view === "external") {
+    return state.adminOrders.filter(
+      (order) => hasExternalFulfillment(order) && order.paymentStatus === "confirmed" && order.fulfillmentStatus !== "shipped" && !order.externalTracking?.number,
+    );
+  }
+  if (view === "ready") {
+    return state.adminOrders.filter((order) => adminOrderView(order) === view && (order.officeItems || []).length > 0 && !order.officeShippedAt);
+  }
+  return state.adminOrders.filter((order) => adminOrderView(order) === view);
+}
+
+function hasExternalFulfillment(order) {
+  return Boolean((order.externalItems || []).length);
+}
+
+function fulfillmentReadyForPayment(order) {
+  if (order.specialOrder?.status === "pending" || order.specialOrder?.status === "declined") return false;
+  if (order.fulfillmentReview?.status === "pending") return false;
+  return !order.specialOrder || ["accepted", "countered"].includes(order.specialOrder.status);
+}
+
 function emptyAdminMessage(view) {
   if (view === "ready") return "No paid orders are ready to pack.";
+  if (view === "external") return "No external fulfillment orders need tracking.";
   if (view === "completed") return "No completed orders yet.";
   return "No orders are waiting for payment confirmation.";
 }
@@ -1888,11 +1986,82 @@ function collectPaymentSettings(formData) {
   };
 }
 
+function renderFulfillmentSettings(fulfillment) {
+  const rulesByVendor = new Map((fulfillment.rules || []).filter((rule) => rule.matchType === "vendor").map((rule) => [normalizeSearch(rule.matchValue), rule]));
+  const vendors = [...new Set([...(state.products || []).map((product) => product.vendor).filter(Boolean), ...(fulfillment.rules || []).map((rule) => rule.matchValue).filter(Boolean)])]
+    .sort((a, b) => a.localeCompare(b));
+  const special = fulfillment.specialOrders || defaultShopSettings().fulfillment.specialOrders;
+  return `
+    <section class="settings-grid">
+      <label class="check-option wide"><input type="checkbox" name="specialOrdersEnabled" ${special.enabled === false ? "" : "checked"}> Allow customers to submit special orders</label>
+      <label class="wide">Unavailable message
+        <input name="specialOrdersUnavailableMessage" maxlength="180" value="${escapeHtml(special.unavailableMessage || "Special orders are temporarily unavailable.")}">
+      </label>
+    </section>
+    <section class="fulfillment-rule-list">
+      <div class="section-heading compact-heading">
+        <div>
+          <h3>External vendors</h3>
+          <p class="muted small">Selected vendors default to external fulfillment and use this manual availability switch.</p>
+        </div>
+      </div>
+      ${
+        vendors.length
+          ? vendors
+              .map((vendor, index) => {
+                const rule = rulesByVendor.get(normalizeSearch(vendor));
+                const enabled = Boolean(rule);
+                const inStock = !rule || rule.availability !== "out_of_stock";
+                return `
+                  <div class="fulfillment-rule-row">
+                    <label class="check-option">
+                      <input type="checkbox" name="externalVendor-${index}" value="${escapeHtml(vendor)}" ${enabled ? "checked" : ""}>
+                      ${escapeHtml(vendor)}
+                    </label>
+                    <label class="check-option availability-toggle">
+                      <input type="checkbox" name="externalVendorInStock-${index}" ${inStock ? "checked" : ""}>
+                      Show as in stock
+                    </label>
+                  </div>
+                `;
+              })
+              .join("")
+          : `<p class="muted">Load the catalog to choose external vendors.</p>`
+      }
+    </section>
+  `;
+}
+
+function collectFulfillmentSettings(formData) {
+  const rules = [];
+  for (const [key, value] of formData.entries()) {
+    const match = String(key).match(/^externalVendor-(\d+)$/);
+    if (!match || !value) continue;
+    rules.push({
+      id: `vendor:${normalizeSearch(value)}`,
+      matchType: "vendor",
+      matchValue: String(value),
+      route: "external",
+      availability: formData.get(`externalVendorInStock-${match[1]}`) === "on" ? "in_stock" : "out_of_stock",
+      locked: true,
+    });
+  }
+  return {
+    specialOrders: {
+      enabled: formData.get("specialOrdersEnabled") === "on",
+      unavailableMessage: formData.get("specialOrdersUnavailableMessage") || "Special orders are temporarily unavailable.",
+    },
+    rules,
+  };
+}
+
 function renderAdminShopSettings() {
   qsa("[data-admin-view]").forEach((button) => button.classList.toggle("is-active", button.dataset.adminView === state.adminView));
   const allSettings = currentShopSettings();
   const settings = allSettings.featured;
   const payment = allSettings.payment || defaultShopSettings().payment;
+  const courier = allSettings.courier || defaultShopSettings().courier;
+  const fulfillment = allSettings.fulfillment || defaultShopSettings().fulfillment;
   const references = allSettings.references || defaultShopSettings().references;
   const selected = new Set(settings.customProductIds || []);
   const productSearch = normalizeSearch(state.adminProductSearch);
@@ -1950,8 +2119,28 @@ function renderAdminShopSettings() {
         </section>
       </details>
       <details class="settings-accordion">
+        <summary><span>Courier</span><small>Fixed delivery charge and Shopify service product</small></summary>
+        <section class="settings-grid">
+          <label>Courier charge
+            <input name="courierAmount" type="number" min="0" step="0.01" value="${escapeHtml(courier.amount ?? 150)}" required>
+          </label>
+          <label>Customer label
+            <input name="courierTitle" maxlength="80" value="${escapeHtml(courier.title || "Courier")}">
+          </label>
+          <label class="wide">Shopify courier product match
+            <input name="courierProductQuery" maxlength="120" value="${escapeHtml(courier.productQuery || "Courier")}" placeholder="Courier">
+          </label>
+          <label class="check-option wide"><input type="checkbox" name="courierEnabled" ${courier.enabled === false ? "" : "checked"}> Add courier charge to every order</label>
+          <p class="muted small wide">The matched Shopify product is hidden from the shop and added automatically during Shopify order creation.</p>
+        </section>
+      </details>
+      <details class="settings-accordion">
         <summary><span>Payments</span><small>Provider module, customer instructions and future webhook readiness</small></summary>
         ${renderPaymentProviderSettings(payment)}
+      </details>
+      <details class="settings-accordion">
+        <summary><span>Fulfillment</span><small>External vendors and special-order availability</small></summary>
+        ${renderFulfillmentSettings(fulfillment)}
       </details>
       <details class="settings-accordion">
         <summary><span>References</span><small>Standard and special order formats</small></summary>
@@ -2000,6 +2189,13 @@ async function submitShopSettings(event) {
           customProductIds: state.shopSettings?.featured?.customProductIds || formData.getAll("customProductIds"),
         },
         payment: collectPaymentSettings(formData),
+        courier: {
+          enabled: formData.get("courierEnabled") === "on",
+          amount: Number(formData.get("courierAmount") || 0),
+          title: formData.get("courierTitle"),
+          productQuery: formData.get("courierProductQuery"),
+        },
+        fulfillment: collectFulfillmentSettings(formData),
         references: {
           standardFormat: formData.get("standardFormat"),
           specialFormat: formData.get("specialFormat"),
@@ -2020,21 +2216,23 @@ function adminOrderStatusLabel(order) {
   if (order.paymentStatus === "confirmed") {
     if (order.shopifySync?.status === "storage_pending") return "Storage transfer required";
     if (order.fulfillmentStatus === "back_order") return "Back order";
+    if (hasExternalFulfillment(order) && !order.externalTracking?.number) return "External tracking required";
     return "Ready to pack";
   }
   if (order.paymentIssue?.type === "paid_pending") return "Payment to verify";
   if (order.paymentIssue && order.paymentIssue.status !== "resolved") return "Payment support";
   if (order.specialOrder?.status === "pending") return "Review required";
+  if (!fulfillmentReadyForPayment(order)) return "Fulfillment review";
   if (order.specialOrder?.status === "countered") return "Counter sent";
   if (order.paymentLink) return "Payment required";
   return "Awaiting confirmation";
 }
 
 function renderAdminOrder(order) {
-  const readyForPayment = !order.specialOrder || ["accepted", "countered"].includes(order.specialOrder.status);
+  const readyForPayment = fulfillmentReadyForPayment(order);
   const hasPaymentEvidence = Boolean(order.paymentLink || order.proof);
   const canConfirm = order.paymentStatus !== "confirmed" && readyForPayment && hasPaymentEvidence;
-  const hasShopifyRelevantItems = !order.specialOrder || (order.officeItems || []).length > 0;
+  const hasShopifyRelevantItems = (order.officeItems || []).length > 0;
   const canCheckStockTransfer =
     hasShopifyRelevantItems && order.paymentStatus === "confirmed" && !order.shopifyOrder?.id && order.shopifySync?.status === "storage_pending";
   const view = adminOrderView(order);
@@ -2049,6 +2247,7 @@ function renderAdminOrder(order) {
   const paymentLinkForm = renderAdminPaymentLinkForm(order, readyForPayment);
   const paymentIssue = renderAdminPaymentIssue(order);
   const specialReview = order.specialOrder ? renderAdminSpecialOrder(order) : "";
+  const fulfillmentReview = !order.specialOrder || order.specialOrder?.status !== "pending" ? renderFulfillmentReview(order) : "";
   const manualTracking = renderManualTrackingForm(order);
   const shopifySync = renderShopifySync(order);
   const storageTransferNote = (order.items || []).some((item) => Number(item.storageBackedQuantity || 0) > 0)
@@ -2065,11 +2264,13 @@ function renderAdminOrder(order) {
         <span class="status-badge">${escapeHtml(statusLabel)}</span>
       </summary>
       <div class="admin-order-details">
-        <ul>${order.items.map((item) => `<li>${item.quantity} x ${escapeHtml(item.productTitle)}</li>`).join("")}</ul>
+        ${renderAdminFulfillmentLines(order)}
+        ${Number(order.deliveryFee || 0) ? `<p><strong>${escapeHtml(courierSettings().title || "Courier")}:</strong> ${money.format(order.deliveryFee)}</p>` : ""}
         <p><strong>Total:</strong> ${money.format(order.total)}</p>
         ${workflowNote}
         ${storageTransferNote}
         ${specialReview}
+        ${fulfillmentReview}
         ${paymentIssue}
         ${paymentLinkForm}
         ${manualTracking}
@@ -2090,6 +2291,40 @@ function renderAdminOrder(order) {
         }
       </div>
     </details>
+  `;
+}
+
+function renderAdminFulfillmentLines(order) {
+  const officeItems = order.officeItems || [];
+  const externalItems = order.externalItems || [];
+  if (!officeItems.length && !externalItems.length) {
+    return `<ul>${(order.items || []).map((item) => `<li>${item.quantity} x ${escapeHtml(item.productTitle)}</li>`).join("")}</ul>`;
+  }
+  return `
+    <ul class="fulfillment-line-list">
+      ${officeItems.map((item) => `<li>${escapeHtml(item.quantity)} x ${escapeHtml(item.productTitle)} <span class="route-chip">OFFICE</span></li>`).join("")}
+      ${externalItems.map((item) => `<li>${escapeHtml(item.quantity)} x ${escapeHtml(item.productTitle)} <span class="route-chip external">EXTERNAL</span></li>`).join("")}
+    </ul>
+  `;
+}
+
+function renderFulfillmentReview(order) {
+  if (order.paymentLink || order.paymentStatus === "confirmed") {
+    return renderAdminFulfillmentSummary(order);
+  }
+  if (order.specialOrder?.status === "declined") return "";
+  const needsReview = !fulfillmentReadyForPayment(order);
+  return `
+    <form class="fulfillment-review-panel" data-fulfillment-review="${escapeHtml(order.id)}">
+      <div>
+        <strong>Fulfillment review${needsReview ? " required" : ""}</strong>
+        <p class="muted">Confirm which units will be sent from Office and which units will be externally fulfilled before payment details are sent.</p>
+      </div>
+      <div class="counter-lines fulfillment-lines">
+        ${renderFulfillmentAllocationInputs(order.items || [], order.fulfillmentAllocations || [])}
+      </div>
+      <button type="submit">${needsReview ? "Save fulfillment review" : "Update fulfillment review"}</button>
+    </form>
   `;
 }
 
@@ -2145,10 +2380,10 @@ function renderAdminPaymentLinkForm(order, readyForPayment) {
 }
 
 function readyWorkflowMessage(order, hasShopifyRelevantItems, hasManualItems) {
-  if (order.specialOrder && hasShopifyRelevantItems && hasManualItems) {
+  if (hasShopifyRelevantItems && hasManualItems) {
     return "Payment confirmed. Retail Shark will handle its allocation; add external shipment tracking here when available.";
   }
-  if (order.specialOrder && hasManualItems) {
+  if (hasManualItems) {
     return "Payment confirmed. Add external shipment tracking here when available.";
   }
   return "Payment confirmed. This order is ready for packing and tracking in Retail Shark.";
@@ -2227,7 +2462,7 @@ function renderAdminSpecialOrder(order) {
 
 function renderManualTrackingForm(order) {
   const manualItems = order.externalItems || [];
-  if (!order.specialOrder || !manualItems.length) return "";
+  if (!manualItems.length) return "";
   const tracking = order.externalTracking || {};
   const items = manualItems.map((item) => `<li>${escapeHtml(item.quantity)} x ${escapeHtml(item.productTitle)}</li>`).join("");
   if (order.paymentStatus !== "confirmed") {
@@ -2243,7 +2478,7 @@ function renderManualTrackingForm(order) {
     <form class="manual-tracking-panel" data-manual-tracking="${escapeHtml(order.id)}">
       <div>
         <strong>External shipment tracking</strong>
-        <p class="muted">Add tracking here for the externally fulfilled part of this special order.</p>
+        <p class="muted">Add tracking here for the externally fulfilled part of this order.</p>
       </div>
       <ul>${items}</ul>
       <div class="tracking-grid">
@@ -2257,46 +2492,56 @@ function renderManualTrackingForm(order) {
   `;
 }
 
-function renderFulfillmentAllocationInputs(items) {
+function renderFulfillmentAllocationInputs(items, allocations = []) {
+  const allocationByVariant = new Map((allocations || []).map((entry) => [entry.variantId, entry]));
   return items
-    .map(
-      (item) => `
+    .map((item) => {
+      const allocation = allocationByVariant.get(item.variantId) || {};
+      const lockedExternal = Boolean(item.externalLocked || item.fulfillmentRoute === "external" || allocation.externalLocked);
+      const officeValue = allocation.officeQuantity ?? (lockedExternal ? 0 : item.quantity);
+      const externalValue = allocation.externalQuantity ?? (lockedExternal ? item.quantity : 0);
+      return `
         <div class="fulfillment-allocation-row" data-special-allocation-row data-variant-id="${escapeHtml(item.variantId)}" data-total="${escapeHtml(item.quantity)}">
           <strong>${escapeHtml(item.productTitle)}</strong>
-          <span>Requested: ${escapeHtml(item.quantity)}</span>
+          <span>Requested: ${escapeHtml(item.quantity)}${lockedExternal ? " - external only" : ""}</span>
           <label>Retail Shark / Shopify
-            <input name="office-${escapeHtml(item.variantId)}" type="number" min="0" max="999" value="${escapeHtml(item.quantity)}">
+            <input name="office-${escapeHtml(item.variantId)}" type="number" min="0" max="999" value="${escapeHtml(officeValue)}" ${lockedExternal ? "readonly" : ""}>
           </label>
           <label>External
-            <input name="external-${escapeHtml(item.variantId)}" type="number" min="0" max="999" value="0">
+            <input name="external-${escapeHtml(item.variantId)}" type="number" min="0" max="999" value="${escapeHtml(externalValue)}">
           </label>
         </div>
-      `,
-    )
+      `;
+    })
     .join("");
 }
 
-function renderCounterAllocationInputs(items) {
+function renderCounterAllocationInputs(items, allocations = []) {
+  const allocationByVariant = new Map((allocations || []).map((entry) => [entry.variantId, entry]));
   return items
-    .map(
-      (item) => `
+    .map((item) => {
+      const allocation = allocationByVariant.get(item.variantId) || {};
+      const lockedExternal = Boolean(item.externalLocked || item.fulfillmentRoute === "external" || allocation.externalLocked);
+      const officeValue = allocation.officeQuantity ?? (lockedExternal ? 0 : item.quantity);
+      const externalValue = allocation.externalQuantity ?? (lockedExternal ? item.quantity : 0);
+      return `
         <div class="fulfillment-allocation-row" data-special-allocation-row data-variant-id="${escapeHtml(item.variantId)}" data-total="${escapeHtml(item.quantity)}">
           <strong>${escapeHtml(item.productTitle)}</strong>
-          <span>Requested: ${escapeHtml(item.quantity)}</span>
+          <span>Requested: ${escapeHtml(item.quantity)}${lockedExternal ? " - external only" : ""}</span>
           <label>Retail Shark / Shopify
-            <input name="office-${escapeHtml(item.variantId)}" type="number" min="0" max="999" value="${escapeHtml(item.quantity)}">
+            <input name="office-${escapeHtml(item.variantId)}" type="number" min="0" max="999" value="${escapeHtml(officeValue)}" ${lockedExternal ? "readonly" : ""}>
           </label>
           <label>External
-            <input name="external-${escapeHtml(item.variantId)}" type="number" min="0" max="999" value="0">
+            <input name="external-${escapeHtml(item.variantId)}" type="number" min="0" max="999" value="${escapeHtml(externalValue)}">
           </label>
         </div>
-      `,
-    )
+      `;
+    })
     .join("");
 }
 
 function renderAdminFulfillmentSummary(order) {
-  const allocations = order.specialOrder?.fulfillmentAllocations || [];
+  const allocations = order.fulfillmentAllocations || order.specialOrder?.fulfillmentAllocations || [];
   if (!allocations.length) return "";
   return `
     <div class="fulfillment-summary">
@@ -2368,6 +2613,27 @@ function collectSpecialAllocations(form) {
       externalQuantity: externalInput?.value || 0,
     };
   });
+}
+
+async function submitFulfillmentReview(event) {
+  event.preventDefault();
+  const form = event.target;
+  const allocations = collectSpecialAllocations(form);
+  const invalidAllocation = allocations.find((item) => Number(item.officeQuantity || 0) + Number(item.externalQuantity || 0) !== Number(item.requestedQuantity || 0));
+  if (invalidAllocation) {
+    toast("Office and external quantities must match the ordered quantity.");
+    return;
+  }
+  try {
+    await api(`/api/admin/orders/${encodeURIComponent(form.dataset.fulfillmentReview)}/fulfillment`, {
+      method: "POST",
+      body: JSON.stringify({ allocations }),
+    });
+    toast("Fulfillment review saved.");
+    await loadAdminOrders();
+  } catch (error) {
+    toast(error.message);
+  }
 }
 
 async function confirmPayment(orderId) {
@@ -2818,6 +3084,7 @@ document.addEventListener("submit", (event) => {
   if (event.target.matches("#orderForm")) submitOrder(event);
   if (event.target.matches(".payment-issue-form")) submitPaymentIssueForm(event);
   if (event.target.matches("[data-payment-link]")) submitPaymentLink(event);
+  if (event.target.matches("[data-fulfillment-review]")) submitFulfillmentReview(event);
   if (event.target.matches("[data-special-review]")) submitSpecialReviewForm(event);
   if (event.target.matches("[data-manual-tracking]")) submitManualTracking(event);
   if (event.target.matches(".shop-settings-form")) submitShopSettings(event);

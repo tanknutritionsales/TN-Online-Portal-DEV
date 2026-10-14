@@ -677,6 +677,19 @@ function defaultShopSettings() {
       note: "Once payment has been marked as paid, the order will be verified and tracking details will follow.",
       providers: paymentProviders,
     },
+    courier: {
+      enabled: true,
+      amount: 150,
+      productQuery: "pudo-courier",
+      title: "Courier",
+    },
+    fulfillment: {
+      specialOrders: {
+        enabled: true,
+        unavailableMessage: "Special orders are temporarily unavailable.",
+      },
+      rules: [],
+    },
     references: {
       standardFormat: "OP-{YYYY}{MM}{DD}-{RAND4}",
       specialFormat: "SO-{YYYY}{MM}{DD}-{RAND4}",
@@ -687,6 +700,8 @@ function defaultShopSettings() {
 function normalizeShopSettings(input = {}) {
   const featured = input.featured || input;
   const payment = input.payment || {};
+  const courier = input.courier || {};
+  const fulfillment = input.fulfillment || {};
   const references = input.references || {};
   const defaults = defaultShopSettings();
   const providerDefaults = defaultPaymentProviders();
@@ -703,6 +718,8 @@ function normalizeShopSettings(input = {}) {
       customProductIds,
     },
     payment: normalizePaymentSettings(payment, defaults.payment, providerDefaults),
+    courier: normalizeCourierSettings(courier, defaults.courier),
+    fulfillment: normalizeFulfillmentSettings(fulfillment, defaults.fulfillment),
     references: {
       standardFormat: normalizeReferenceFormat(references.standardFormat || defaults.references.standardFormat, defaults.references.standardFormat),
       specialFormat: normalizeReferenceFormat(references.specialFormat || defaults.references.specialFormat, defaults.references.specialFormat),
@@ -750,6 +767,49 @@ function normalizePaymentSettings(payment = {}, defaults = { activeProvider: "yo
     reviewWindow: cleanText(payment.reviewWindow || defaults.reviewWindow || "12-24 hours", 80),
     note: cleanText(payment.note || defaults.note, 500),
     providers,
+  };
+}
+
+function normalizeCourierSettings(courier = {}, defaults = defaultShopSettings().courier) {
+  const amount = money(courier.amount ?? defaults.amount ?? 150);
+  return {
+    enabled: courier.enabled === undefined ? Boolean(defaults.enabled) : Boolean(courier.enabled),
+    amount: amount > 0 ? amount : money(defaults.amount || 150),
+    productQuery: cleanText(courier.productQuery || defaults.productQuery || "Courier", 120),
+    title: cleanText(courier.title || defaults.title || "Courier", 80),
+  };
+}
+
+function normalizeFulfillmentSettings(fulfillment = {}, defaults = defaultShopSettings().fulfillment) {
+  const specialOrders = fulfillment.specialOrders || {};
+  const rules = Array.isArray(fulfillment.rules) ? fulfillment.rules : [];
+  const seen = new Set();
+  return {
+    specialOrders: {
+      enabled: specialOrders.enabled === undefined ? defaults.specialOrders.enabled !== false : Boolean(specialOrders.enabled),
+      unavailableMessage: cleanText(
+        specialOrders.unavailableMessage || defaults.specialOrders.unavailableMessage || "Special orders are temporarily unavailable.",
+        180,
+      ),
+    },
+    rules: rules
+      .map((rule) => {
+        const matchType = cleanText(rule.matchType || "vendor", 40).toLowerCase() === "vendor" ? "vendor" : "";
+        const matchValue = cleanText(rule.matchValue || rule.vendor || "", 120);
+        const key = `${matchType}:${normalizeSearchText(matchValue)}`;
+        if (!matchType || !matchValue || seen.has(key)) return null;
+        seen.add(key);
+        return {
+          id: cleanText(rule.id || key, 160) || key,
+          matchType,
+          matchValue,
+          route: "external",
+          availability: rule.availability === "out_of_stock" || rule.inStock === false ? "out_of_stock" : "in_stock",
+          locked: rule.locked === undefined ? true : Boolean(rule.locked),
+        };
+      })
+      .filter(Boolean)
+      .slice(0, 80),
   };
 }
 
@@ -1305,6 +1365,7 @@ function publicOrder(order) {
     paymentLink: publicPaymentLink(order.paymentLink),
     paymentIssue: publicPaymentIssue(order.paymentIssue),
     fulfillmentStatus: order.fulfillmentStatus,
+    fulfillmentReview: publicFulfillmentReview(order.fulfillmentReview),
     specialOrder: publicSpecialOrder(order.specialOrder),
     customerStatus: customerStatus(order),
     proof: order.proof ? { filename: order.proof.filename, uploadedAt: order.proof.uploadedAt } : null,
@@ -1326,6 +1387,14 @@ function publicOrderItems(items = []) {
     quantity: item.quantity,
     price: item.price,
   }));
+}
+
+function publicFulfillmentReview(review) {
+  if (!review) return null;
+  return {
+    status: review.status || "reviewed",
+    reviewedAt: review.reviewedAt || null,
+  };
 }
 
 function publicPaymentLink(paymentLink) {
@@ -1389,8 +1458,14 @@ function customerShipments(order) {
   ].filter(Boolean);
 }
 
-function specialOrderReadyForPayment(order) {
+function fulfillmentReadyForPayment(order) {
+  if (order.specialOrder?.status === "pending" || order.specialOrder?.status === "declined") return false;
+  if (order.fulfillmentReview?.status === "pending") return false;
   return !order.specialOrder || ["accepted", "countered"].includes(order.specialOrder.status);
+}
+
+function specialOrderReadyForPayment(order) {
+  return fulfillmentReadyForPayment(order);
 }
 
 function staffOrder(order) {
@@ -1402,6 +1477,8 @@ function staffOrder(order) {
     paymentIssue: order.paymentIssue || null,
     officeItems: officeFulfillmentItems(order),
     externalItems: externalFulfillmentItems(order),
+    fulfillmentAllocations: orderFulfillmentAllocations(order),
+    fulfillmentReview: order.fulfillmentReview || null,
     externalTracking: order.externalTracking || null,
     proof: order.proof
       ? {
@@ -1414,6 +1491,7 @@ function staffOrder(order) {
     staffNotes: order.staffNotes || "",
     paymentConfirmedAt: order.paymentConfirmedAt || null,
     paymentConfirmedBy: order.paymentConfirmedBy || null,
+    officeShippedAt: order.officeShippedAt || null,
     backOrderReason: order.backOrderReason || "",
     shopifyOrder: order.shopifyOrder || null,
     shopifySync: order.shopifySync || { status: "not_started", message: "" },
@@ -1441,6 +1519,7 @@ function customerStatus(order) {
 
 function orderReadyForRetailShark(order) {
   if (order.paymentStatus !== "confirmed" || order.fulfillmentStatus === "shipped") return false;
+  if (order.officeShippedAt) return false;
   if (order.specialOrder && !officeFulfillmentItems(order).length) return false;
   if (!shopifyOrderSyncEnabled) return true;
   return Boolean(order.shopifyOrder?.id);
@@ -1448,7 +1527,8 @@ function orderReadyForRetailShark(order) {
 
 function orderCompletedForRetailShark(order) {
   if (order.specialOrder && !officeFulfillmentItems(order).length) return false;
-  return order.paymentStatus === "confirmed" && order.fulfillmentStatus === "shipped";
+  if (!officeFulfillmentItems(order).length) return false;
+  return order.paymentStatus === "confirmed" && (order.fulfillmentStatus === "shipped" || Boolean(order.officeShippedAt));
 }
 
 async function buildReference(kind = "standard") {
@@ -1479,6 +1559,9 @@ function formatReference(template) {
 }
 
 async function validateOrderRequest(input, user, options = {}) {
+  const settings = normalizeShopSettings(options.settings || defaultShopSettings());
+  const courier = normalizeCourierSettings(settings.courier);
+  const fulfillment = normalizeFulfillmentSettings(settings.fulfillment);
   const customer = {
     id: user.id,
     username: user.username || "",
@@ -1498,12 +1581,17 @@ async function validateOrderRequest(input, user, options = {}) {
     notes: cleanText(input.delivery?.notes, 500),
   };
   const allowSpecial = Boolean(options.allowSpecial);
+  if (allowSpecial && fulfillment.specialOrders.enabled === false) {
+    throw Object.assign(new Error(fulfillment.specialOrders.unavailableMessage || "Special orders are temporarily unavailable."), { status: 409 });
+  }
   const catalog = await catalogProducts();
-  const items = validateCartItems(input.items, catalog.products, { allowSpecial });
+  const routedProducts = applyFulfillmentSettingsToProducts(catalog.products, fulfillment);
+  const items = validateCartItems(input.items, routedProducts, { allowSpecial, courier, fulfillment });
   if (!items.length) throw new Error("Add at least one product to the order.");
   const subtotal = money(items.reduce((sum, item) => sum + item.price * item.quantity, 0));
-  const deliveryFee = money(input.deliveryFee || 0);
-  return { customer, delivery, items, subtotal, deliveryFee, total: money(subtotal + deliveryFee) };
+  const courierLine = courier.enabled ? resolveCourierLine(routedProducts, courier) : null;
+  const deliveryFee = courierLine ? money(courierLine.price) : 0;
+  return { customer, delivery, items, subtotal, deliveryFee, courierLine, total: money(subtotal + deliveryFee) };
 }
 
 function validateCartItems(inputItems, catalogProducts, options = {}) {
@@ -1512,12 +1600,15 @@ function validateCartItems(inputItems, catalogProducts, options = {}) {
   for (const product of catalogProducts) {
     if (product.variant?.id) catalogByVariant.set(product.variant.id, product);
   }
+  const courier = normalizeCourierSettings(options.courier || defaultShopSettings().courier);
+  const courierProduct = resolveCourierProduct(catalogProducts, courier);
   const items = (Array.isArray(inputItems) ? inputItems : [])
     .map((item) => {
       const variantId = cleanText(item.variantId, 160);
       const product = catalogByVariant.get(variantId);
       const quantity = Math.max(0, Math.floor(Number(item.quantity || 0)));
       if (!product || !product.variant) return null;
+      if (courierProduct?.variant?.id === product.variant.id) return null;
       if (quantity <= 0) return null;
       if (!allowSpecial) assertQuantityAvailable(product, quantity);
       const officeAvailableQuantity = Number.isFinite(product.variant.officeAvailableQuantity)
@@ -1530,14 +1621,72 @@ function validateCartItems(inputItems, catalogProducts, options = {}) {
         productTitle: product.title,
         variantTitle: product.variant.title || "Default Title",
         sku: product.variant.sku,
+        vendor: product.vendor || "",
         quantity,
         price: money(product.variant.price),
+        fulfillmentRoute: product.fulfillment?.route || "office",
+        externalLocked: Boolean(product.fulfillment?.externalLocked),
         ...(storageBackedQuantity > 0 ? { storageBackedQuantity } : {}),
       };
     })
     .filter(Boolean);
   if (!items.length) throw Object.assign(new Error("Add at least one product to the order."), { status: 400 });
   return items;
+}
+
+function fulfillmentRuleForProduct(product, fulfillment = defaultShopSettings().fulfillment) {
+  const settings = normalizeFulfillmentSettings(fulfillment);
+  const vendor = normalizeSearchText(product?.vendor);
+  if (!vendor) return null;
+  return settings.rules.find((rule) => rule.matchType === "vendor" && normalizeSearchText(rule.matchValue) === vendor) || null;
+}
+
+function applyFulfillmentSettingsToProducts(products, fulfillment = defaultShopSettings().fulfillment) {
+  return (products || []).map((product) => {
+    const rule = fulfillmentRuleForProduct(product, fulfillment);
+    if (!rule) return { ...product, fulfillment: { route: "office", externalLocked: false } };
+    const inStock = rule.availability !== "out_of_stock";
+    return {
+      ...product,
+      fulfillment: {
+        route: "external",
+        externalLocked: rule.locked !== false,
+        availability: rule.availability,
+        ruleId: rule.id,
+      },
+      variant: product.variant
+        ? {
+            ...product.variant,
+            inStock,
+            availableQuantity: inStock ? null : 0,
+            officeAvailableQuantity: product.variant.officeAvailableQuantity,
+          }
+        : null,
+    };
+  });
+}
+
+function resolveCourierLine(products, courier) {
+  const product = resolveCourierProduct(products, courier);
+  return {
+    variantId: product?.variant?.id || "",
+    productTitle: courier.title || product?.title || "Courier",
+    variantTitle: product?.variant?.title || "Default Title",
+    sku: product?.variant?.sku || "",
+    quantity: 1,
+    price: money(courier.amount),
+    system: "courier",
+  };
+}
+
+function resolveCourierProduct(products, courier = defaultShopSettings().courier) {
+  const query = normalizeSearchText(courier.productQuery || courier.title || "Courier");
+  if (!query) return null;
+  const queryTokens = query.split(" ").filter(Boolean);
+  return (products || []).find((product) => {
+    const searchable = normalizeSearchText([product.title, product.handle, product.vendor, product.productType, product.variant?.sku, ...(product.tags || [])].join(" "));
+    return searchable === query || queryTokens.every((token) => searchable.includes(token));
+  }) || null;
 }
 
 function assertQuantityAvailable(product, quantity) {
@@ -1549,7 +1698,7 @@ function assertQuantityAvailable(product, quantity) {
 }
 
 function orderHasStorageBackedItems(order) {
-  return (order.items || []).some((item) => Number(item.storageBackedQuantity || 0) > 0);
+  return officeFulfillmentItems(order).some((item) => Number(item.storageBackedQuantity || 0) > 0);
 }
 
 async function createOrder(input, user) {
@@ -1561,8 +1710,8 @@ async function createOrder(input, user) {
     const existing = data.orders.find((order) => order.customer?.id === user.id && order.idempotencyKey === idempotencyKey);
     if (existing) return existing;
   }
-  const request = await validateOrderRequest(input, user, { allowSpecial: isSpecialOrder });
   const settings = (await readShopSettingsData()).settings;
+  const request = await validateOrderRequest(input, user, { allowSpecial: isSpecialOrder, settings });
   const provider = activePaymentProvider(settings);
   const order = {
     id: randomUUID(),
@@ -1587,6 +1736,12 @@ async function createOrder(input, user) {
           counterItems: [],
         }
       : null,
+    fulfillmentReview: {
+      status: isSpecialOrder ? "pending" : "pending",
+      reviewedAt: null,
+      reviewedBy: null,
+    },
+    fulfillmentAllocations: isSpecialOrder ? [] : defaultFulfillmentAllocations(request.items),
     staffNotes: "",
     shopifyOrder: null,
     shopifySync: { status: "not_started", message: "" },
@@ -1672,6 +1827,7 @@ async function confirmPayment(orderId, input, admin) {
   if (!order) throw Object.assign(new Error("Order not found."), { status: 404 });
   if (order.specialOrder?.status === "pending") throw Object.assign(new Error("Review the special order before confirming payment."), { status: 409 });
   if (order.specialOrder?.status === "declined") throw Object.assign(new Error("Declined special orders cannot be confirmed."), { status: 409 });
+  if (!fulfillmentReadyForPayment(order)) throw Object.assign(new Error("Review fulfillment before confirming payment."), { status: 409 });
   if (!orderPaymentReady(order)) throw Object.assign(new Error("Attach payment instructions before confirming payment."), { status: 409 });
   const settings = (await readShopSettingsData()).settings;
   const provider = paymentProviderSettings(settings, order.paymentProvider);
@@ -1698,6 +1854,13 @@ async function confirmPayment(orderId, input, admin) {
     };
   } else if (shopifyOrderSyncEnabled && !order.shopifyOrder?.id) {
     await syncOrderToShopify(order, admin, { throwOnError: false });
+  } else if (!shopifyFulfillmentItems(order).length) {
+    order.shopifySync = {
+      status: "external",
+      message: "No Retail Shark / Shopify items. Shopify order creation skipped.",
+      attemptedAt: null,
+      syncedAt: new Date().toISOString(),
+    };
   } else if (!shopifyOrderSyncEnabled && !order.shopifyOrder?.id) {
     order.shopifySync = {
       status: "disabled",
@@ -1718,6 +1881,7 @@ async function attachPaymentLink(orderId, input, admin) {
   if (order.paymentStatus === "confirmed") throw Object.assign(new Error("Payment has already been confirmed."), { status: 409 });
   if (order.specialOrder?.status === "pending") throw Object.assign(new Error("Review the special order before attaching a payment link."), { status: 409 });
   if (order.specialOrder?.status === "declined") throw Object.assign(new Error("Declined special orders cannot receive a payment link."), { status: 409 });
+  if (!fulfillmentReadyForPayment(order)) throw Object.assign(new Error("Review fulfillment before attaching payment details."), { status: 409 });
   const settings = (await readShopSettingsData()).settings;
   const providerId = cleanText(input.provider || order.paymentProvider || activePaymentProvider(settings), 30);
   const provider = paymentProviderSettings(settings, providerId);
@@ -1785,7 +1949,7 @@ async function checkStorageTransfer(orderId, admin) {
 async function storageTransferShortfalls(order) {
   const catalog = await catalogProducts();
   const productsByVariant = new Map(catalog.products.map((product) => [product.variant?.id, product]).filter(([variantId]) => variantId));
-  return (order.items || [])
+  return officeFulfillmentItems(order)
     .filter((item) => Number(item.storageBackedQuantity || 0) > 0)
     .map((item) => {
       const product = productsByVariant.get(item.variantId);
@@ -1816,11 +1980,15 @@ async function reviewSpecialOrder(orderId, input, admin) {
     order.total = money(order.subtotal + money(order.deliveryFee || 0));
     order.specialOrder.status = "accepted";
     order.specialOrder.fulfillmentAllocations = allocations.filter((entry) => entry.officeQuantity + entry.externalQuantity > 0);
+    order.fulfillmentAllocations = order.specialOrder.fulfillmentAllocations;
+    order.fulfillmentReview = { status: "reviewed", reviewedAt: now, reviewedBy: cleanText(admin.username || "admin", 120) };
     order.statusEvents.push({ at: now, actor: "admin", type: "special_order_accepted", label: "Special order approved" });
   } else if (action === "decline") {
     order.specialOrder.status = "declined";
     order.specialOrder.declineReason = cleanText(input.reason, 500);
     order.specialOrder.fulfillmentAllocations = [];
+    order.fulfillmentAllocations = [];
+    order.fulfillmentReview = { status: "declined", reviewedAt: now, reviewedBy: cleanText(admin.username || "admin", 120) };
     order.statusEvents.push({ at: now, actor: "admin", type: "special_order_declined", label: "Special order declined" });
   } else if (action === "counter") {
     const allocations = normalizeFulfillmentAllocations(order.items, input.allocations);
@@ -1831,12 +1999,42 @@ async function reviewSpecialOrder(orderId, input, admin) {
     order.specialOrder.status = "countered";
     order.specialOrder.counterItems = counterItems.map((item) => ({ ...item }));
     order.specialOrder.fulfillmentAllocations = allocations.filter((entry) => entry.officeQuantity + entry.externalQuantity > 0);
+    order.fulfillmentAllocations = order.specialOrder.fulfillmentAllocations;
+    order.fulfillmentReview = { status: "reviewed", reviewedAt: now, reviewedBy: cleanText(admin.username || "admin", 120) };
     order.specialOrder.counterNote = cleanText(input.note, 500);
     order.statusEvents.push({ at: now, actor: "admin", type: "special_order_countered", label: "Special order countered" });
   } else {
     throw Object.assign(new Error("Choose a valid special order action."), { status: 400 });
   }
   order.updatedAt = now;
+  await writeOrdersData(data);
+  return order;
+}
+
+async function reviewFulfillment(orderId, input, admin) {
+  const data = await readOrdersData();
+  const order = data.orders.find((entry) => entry.id === orderId);
+  if (!order) throw Object.assign(new Error("Order not found."), { status: 404 });
+  if (order.paymentLink || order.paymentStatus === "confirmed") {
+    throw Object.assign(new Error("Fulfillment must be reviewed before payment details are attached."), { status: 409 });
+  }
+  if (order.specialOrder?.status === "pending") {
+    throw Object.assign(new Error("Review the special order before saving fulfillment."), { status: 409 });
+  }
+  if (order.specialOrder?.status === "declined") {
+    throw Object.assign(new Error("Declined special orders cannot be fulfilled."), { status: 409 });
+  }
+  const now = new Date().toISOString();
+  const allocations = normalizeFulfillmentAllocations(order.items, input.allocations, { exactTotal: true });
+  order.fulfillmentAllocations = allocations.filter((entry) => entry.officeQuantity + entry.externalQuantity > 0);
+  if (order.specialOrder) order.specialOrder.fulfillmentAllocations = order.fulfillmentAllocations;
+  order.fulfillmentReview = {
+    status: "reviewed",
+    reviewedAt: now,
+    reviewedBy: cleanText(admin.username || "admin", 120),
+  };
+  order.updatedAt = now;
+  order.statusEvents.push({ at: now, actor: "admin", type: "fulfillment_reviewed", label: "Fulfillment reviewed" });
   await writeOrdersData(data);
   return order;
 }
@@ -1853,17 +2051,24 @@ function counterOrderItems(currentItems, inputItems, allocations = []) {
   return items;
 }
 
-function normalizeFulfillmentAllocations(items, inputAllocations) {
+function normalizeFulfillmentAllocations(items, inputAllocations, options = {}) {
   const allocationByVariant = new Map(
     (Array.isArray(inputAllocations) ? inputAllocations : []).map((entry) => [cleanText(entry.variantId, 160), entry]),
   );
   return (items || []).map((item) => {
     const raw = allocationByVariant.get(item.variantId) || {};
     const requestedQuantity = Math.max(0, Math.floor(Number(item.quantity || 0)));
-    const officeQuantity = Math.max(0, Math.floor(Number(raw.officeQuantity ?? requestedQuantity)));
-    const externalQuantity = Math.max(0, Math.floor(Number(raw.externalQuantity ?? 0)));
+    const defaultAllocation = defaultFulfillmentAllocation(item);
+    const officeQuantity = Math.max(0, Math.floor(Number(raw.officeQuantity ?? defaultAllocation.officeQuantity)));
+    const externalQuantity = Math.max(0, Math.floor(Number(raw.externalQuantity ?? defaultAllocation.externalQuantity)));
+    if (item.externalLocked && officeQuantity > 0) {
+      throw Object.assign(new Error(`${item.productTitle} is set for external fulfillment.`), { status: 400 });
+    }
     if (officeQuantity + externalQuantity > requestedQuantity) {
       throw Object.assign(new Error(`The approved quantity for ${item.productTitle} cannot exceed the requested quantity.`), { status: 400 });
+    }
+    if (options.exactTotal && officeQuantity + externalQuantity !== requestedQuantity) {
+      throw Object.assign(new Error(`The fulfillment split for ${item.productTitle} must match the ordered quantity.`), { status: 400 });
     }
     return {
       variantId: item.variantId,
@@ -1871,8 +2076,26 @@ function normalizeFulfillmentAllocations(items, inputAllocations) {
       requestedQuantity,
       officeQuantity,
       externalQuantity,
+      externalLocked: Boolean(item.externalLocked),
     };
   });
+}
+
+function defaultFulfillmentAllocation(item) {
+  const requestedQuantity = Math.max(0, Math.floor(Number(item.quantity || 0)));
+  const externalLocked = Boolean(item.externalLocked || item.fulfillmentRoute === "external");
+  return {
+    variantId: item.variantId,
+    productTitle: item.productTitle,
+    requestedQuantity,
+    officeQuantity: externalLocked ? 0 : requestedQuantity,
+    externalQuantity: externalLocked ? requestedQuantity : 0,
+    externalLocked,
+  };
+}
+
+function defaultFulfillmentAllocations(items = []) {
+  return (items || []).map(defaultFulfillmentAllocation).filter((entry) => entry.requestedQuantity > 0);
 }
 
 function orderItemsFromAllocations(items, allocations) {
@@ -1885,14 +2108,23 @@ function orderItemsFromAllocations(items, allocations) {
 }
 
 function allocationQuantity(order, variantId, key) {
-  const allocation = (order.specialOrder?.fulfillmentAllocations || []).find((entry) => entry.variantId === variantId);
+  const allocation = orderFulfillmentAllocations(order).find((entry) => entry.variantId === variantId);
   if (!allocation) return null;
   return Math.max(0, Math.floor(Number(allocation[key] || 0)));
 }
 
+function orderFulfillmentAllocations(order) {
+  if (Array.isArray(order.fulfillmentAllocations) && order.fulfillmentAllocations.length) return order.fulfillmentAllocations;
+  if (Array.isArray(order.specialOrder?.fulfillmentAllocations) && order.specialOrder.fulfillmentAllocations.length) {
+    return order.specialOrder.fulfillmentAllocations;
+  }
+  return [];
+}
+
 function officeFulfillmentItems(order) {
-  if (!order.specialOrder) return (order.items || []).map((item) => ({ ...item }));
-  if (!Array.isArray(order.specialOrder.fulfillmentAllocations) || !order.specialOrder.fulfillmentAllocations.length) {
+  const allocations = orderFulfillmentAllocations(order);
+  if (!allocations.length && !order.specialOrder) return (order.items || []).map((item) => ({ ...item }));
+  if (order.specialOrder && !allocations.length) {
     return ["accepted", "countered"].includes(order.specialOrder.status) ? (order.items || []).map((item) => ({ ...item })) : [];
   }
   return (order.items || [])
@@ -1901,7 +2133,7 @@ function officeFulfillmentItems(order) {
 }
 
 function externalFulfillmentItems(order) {
-  if (!order.specialOrder || !Array.isArray(order.specialOrder.fulfillmentAllocations)) return [];
+  if (!orderFulfillmentAllocations(order).length) return [];
   return (order.items || [])
     .map((item) => ({ ...item, quantity: allocationQuantity(order, item.variantId, "externalQuantity") || 0 }))
     .filter((item) => item.quantity > 0);
@@ -1942,7 +2174,7 @@ async function updateExternalTracking(orderId, input, admin) {
     addedBy: cleanText(admin?.username || "admin", 120),
   };
   if (!order.externalTracking.number) throw new Error("Tracking number is required.");
-  if (!officeFulfillmentItems(order).length) {
+  if (!officeFulfillmentItems(order).length || order.officeShippedAt || order.tracking?.number) {
     order.fulfillmentStatus = "shipped";
     order.shippedAt = now;
   }
@@ -1974,8 +2206,11 @@ async function markShipped(orderId) {
     throw Object.assign(new Error("This order must complete stock transfer and Shopify processing before it can be marked as shipped."), { status: 409 });
   }
   const now = new Date().toISOString();
-  order.fulfillmentStatus = "shipped";
-  order.shippedAt = now;
+  order.officeShippedAt = now;
+  if (!externalFulfillmentItems(order).length || order.externalTracking?.number) {
+    order.fulfillmentStatus = "shipped";
+    order.shippedAt = now;
+  }
   order.updatedAt = now;
   order.statusEvents.push({ at: now, actor: "staff", type: "shipped", label: "Order shipped" });
   await writeOrdersData(data);
@@ -2113,6 +2348,19 @@ function buildShopifyOrderInput(order, lineItems = shopifyFulfillmentItems(order
   const nameParts = splitCustomerName(order.customer?.name);
   const shippingAddress = shopifyMailingAddress(order.delivery?.address, order.customer);
   const providerLabel = paymentProviderLabel(order.paymentLink?.provider || order.paymentProvider);
+  const courierLine = shopifyCourierLineItem(order);
+  const shopifyLineItems = [
+    ...lineItems.map((item) => ({
+      variantId: item.variantId,
+      quantity: item.quantity,
+      properties: [
+        { name: "Online Portal reference", value: order.reference },
+        ...(order.specialOrder ? [{ name: "Order type", value: "Special order" }] : []),
+        ...(order.specialOrder ? [{ name: "Fulfillment source", value: "Retail Shark" }] : []),
+      ],
+    })),
+    ...(courierLine ? [courierLine] : []),
+  ];
   const input = {
     email: order.customer?.email || undefined,
     phone: shopifyPhone(order.customer?.phone),
@@ -2124,15 +2372,7 @@ function buildShopifyOrderInput(order, lineItems = shopifyFulfillmentItems(order
       },
     },
     financialStatus: "PAID",
-    lineItems: lineItems.map((item) => ({
-      variantId: item.variantId,
-      quantity: item.quantity,
-      properties: [
-        { name: "Online Portal reference", value: order.reference },
-        ...(order.specialOrder ? [{ name: "Order type", value: "Special order" }] : []),
-        ...(order.specialOrder ? [{ name: "Fulfillment source", value: "Retail Shark" }] : []),
-      ],
-    })),
+    lineItems: shopifyLineItems,
     shippingAddress,
     billingAddress: shippingAddress,
     sourceIdentifier: order.id,
@@ -2156,7 +2396,7 @@ function buildShopifyOrderInput(order, lineItems = shopifyFulfillmentItems(order
     ],
     tags: ["Online Portal", "Payment Confirmed", providerLabel, order.reference, ...(order.specialOrder ? ["Special Order"] : [])],
   };
-  if (money(order.deliveryFee) > 0) {
+  if (money(order.deliveryFee) > 0 && !courierLine) {
     input.shippingLines = [
       {
         title: "Delivery",
@@ -2167,6 +2407,20 @@ function buildShopifyOrderInput(order, lineItems = shopifyFulfillmentItems(order
     ];
   }
   return pruneEmpty(input);
+}
+
+function shopifyCourierLineItem(order) {
+  const courierLine = order.courierLine;
+  if (!courierLine?.variantId || money(order.deliveryFee) <= 0) return null;
+  return {
+    variantId: courierLine.variantId,
+    quantity: 1,
+    priceSet: moneyBag(order.deliveryFee),
+    properties: [
+      { name: "Online Portal reference", value: order.reference },
+      { name: "System line", value: "Courier" },
+    ],
+  };
 }
 
 function paymentProviderLabel(provider) {
@@ -2317,16 +2571,70 @@ async function catalogProducts() {
       }
     }
   `;
+  const productByHandleQuery = `#graphql
+    query OnlinePortalProductByHandle($handle: String!) {
+      productByHandle(handle: $handle) {
+        id
+        title
+        handle
+        vendor
+        productType
+        tags
+        featuredMedia {
+          preview {
+            image {
+              url
+              altText
+            }
+          }
+        }
+        variants(first: 5) {
+          nodes {
+            id
+            title
+            sku
+            price
+            inventoryQuantity
+            availableForSale
+          }
+        }
+      }
+    }
+  `;
   const [productNodes, collectionNodes] = await Promise.all([
     fetchShopifyConnection(endpoint, accessToken, productsQuery, "products", { query: "status:active" }, 20),
     fetchShopifyConnection(endpoint, accessToken, collectionsQuery, "collections", {}, 10),
   ]);
   const collectionImages = buildCollectionImageLookup(collectionNodes);
-  const products = productNodes.map((product) => normalizeCatalogProduct(product, collectionImages)).filter((product) => product.variant);
+  const courierProduct = await fetchShopifyProductByHandle(endpoint, accessToken, productByHandleQuery, defaultShopSettings().courier.productQuery);
+  const productMap = new Map();
+  for (const product of [...productNodes, courierProduct].filter(Boolean)) {
+    productMap.set(product.id, product);
+  }
+  const products = [...productMap.values()].map((product) => normalizeCatalogProduct(product, collectionImages)).filter((product) => product.variant);
   const storageAvailability = await retailSharkStorageAvailability();
   const mergedProducts = mergeStorageAvailability(products, storageAvailability);
   const cachedProducts = await cacheCatalogImages(mergedProducts);
   return { source: "shopify", products: cachedProducts, filters: buildCatalogFilters(cachedProducts) };
+}
+
+async function fetchShopifyProductByHandle(endpoint, accessToken, query, handle) {
+  if (!handle) return null;
+  try {
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-shopify-access-token": accessToken,
+      },
+      body: JSON.stringify({ query, variables: { handle } }),
+    });
+    const payload = await response.json();
+    if (!response.ok || payload.errors) return null;
+    return payload.data?.productByHandle || null;
+  } catch {
+    return null;
+  }
 }
 
 async function retailSharkStorageAvailability() {
@@ -2762,13 +3070,29 @@ function mockCatalogProducts() {
       imageAlt: "Sample Injectable Oil",
       variant: { id: "mock-injectable-oil-default", title: "Default Title", sku: "TN-OIL", price: 950, availableQuantity: 0, inStock: false },
     },
+    {
+      id: "mock-courier",
+      title: "Courier",
+      handle: "courier",
+      vendor: "Tank Nutrition",
+      productType: "Service",
+      tags: ["Courier"],
+      image: "",
+      imageAlt: "Courier",
+      variant: { id: "mock-courier-default", title: "Default Title", sku: "COURIER", price: 150, availableQuantity: null, inStock: true },
+    },
   ].map((product) => ({ ...product, groups: product.groups || matchingCatalogGroups(product).map((group) => group.id) }));
 }
 
-function publicCatalogPayload(catalog) {
+function publicCatalogPayload(catalog, settings = defaultShopSettings()) {
+  const courier = normalizeCourierSettings(settings.courier);
+  const products = applyFulfillmentSettingsToProducts(catalog.products || [], settings.fulfillment).filter(
+    (product) => resolveCourierProduct([product], courier)?.id !== product.id,
+  );
   return {
     ...catalog,
-    products: catalog.products.map(publicCatalogProduct),
+    filters: buildCatalogFilters(products),
+    products: products.map(publicCatalogProduct),
   };
 }
 
@@ -2782,7 +3106,7 @@ function publicCatalogProduct(product) {
         inStock: product.variant.inStock,
       }
     : null;
-  return { ...product, variant };
+  return { ...product, fulfillment: product.fulfillment || { route: "office" }, variant };
 }
 
 function requireInternal(req) {
@@ -2796,7 +3120,8 @@ async function handleApi(req, res, url) {
   requirePortalClientHeader(req, url);
   if (req.method === "GET" && url.pathname === "/api/catalog") {
     await requirePortalAccess(req);
-    return json(res, 200, { ok: true, ...publicCatalogPayload(await catalogProducts()) });
+    const settings = (await readShopSettingsData()).settings;
+    return json(res, 200, { ok: true, ...publicCatalogPayload(await catalogProducts(), settings) });
   }
   if (req.method === "GET" && url.pathname === "/api/shop-settings") {
     await requirePortalAccess(req);
@@ -2807,7 +3132,9 @@ async function handleApi(req, res, url) {
     await requireCustomer(req);
     const input = await bodyJson(req);
     const catalog = await catalogProducts();
-    validateCartItems(input.items, catalog.products, { allowSpecial: Boolean(input.specialOrder) });
+    const settings = (await readShopSettingsData()).settings;
+    const routedProducts = applyFulfillmentSettingsToProducts(catalog.products, settings.fulfillment);
+    validateCartItems(input.items, routedProducts, { allowSpecial: Boolean(input.specialOrder), courier: settings.courier, fulfillment: settings.fulfillment });
     return json(res, 200, { ok: true });
   }
   if (req.method === "GET" && url.pathname === "/api/auth/me") {
@@ -2928,6 +3255,12 @@ async function handleApi(req, res, url) {
   if (req.method === "POST" && adminSpecialOrderMatch) {
     const admin = requireAdmin(req);
     const order = await reviewSpecialOrder(decodeURIComponent(adminSpecialOrderMatch[1]), await bodyJson(req), admin);
+    return json(res, 200, { ok: true, order: staffOrder(order) });
+  }
+  const adminFulfillmentMatch = url.pathname.match(/^\/api\/admin\/orders\/([^/]+)\/fulfillment$/);
+  if (req.method === "POST" && adminFulfillmentMatch) {
+    const admin = requireAdmin(req);
+    const order = await reviewFulfillment(decodeURIComponent(adminFulfillmentMatch[1]), await bodyJson(req), admin);
     return json(res, 200, { ok: true, order: staffOrder(order) });
   }
   const adminExternalTrackingMatch = url.pathname.match(/^\/api\/admin\/orders\/([^/]+)\/external-tracking$/);

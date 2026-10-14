@@ -70,6 +70,19 @@ await admin.request("/api/auth/admin-login", {
   method: "POST",
   body: JSON.stringify({ username: "admin", password: "admin" }),
 });
+await admin.request(`/api/admin/orders/${encodeURIComponent(order.order.id)}/fulfillment`, {
+  method: "POST",
+  body: JSON.stringify({
+    allocations: [
+      {
+        variantId: product.variant.id,
+        requestedQuantity: 1,
+        officeQuantity: 1,
+        externalQuantity: 0,
+      },
+    ],
+  }),
+});
 await admin.request(`/api/admin/orders/${encodeURIComponent(order.order.id)}/payment-link`, {
   method: "POST",
   body: JSON.stringify({

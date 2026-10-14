@@ -1096,6 +1096,23 @@ nav {
   font-size: 0.9rem;
 }
 
+.cart-line.system-line {
+  background: color-mix(in srgb, var(--panel) 92%, var(--red));
+  border: 1px solid var(--soft-line);
+  border-radius: 8px;
+  padding: 10px;
+}
+
+.locked-line {
+  align-self: center;
+  border-radius: 999px;
+  background: var(--black);
+  color: #fff !important;
+  padding: 4px 8px;
+  font-size: 0.78rem !important;
+  font-weight: 850;
+}
+
 .cart-line button {
   width: 32px;
   height: 32px;
@@ -1328,6 +1345,12 @@ nav {
 
 .summary-lines li span {
   min-width: 0;
+}
+
+.system-summary-lines {
+  border-top: 1px solid var(--soft-line);
+  margin-top: 10px;
+  padding-top: 10px;
 }
 
 .summary-total {
@@ -1995,6 +2018,7 @@ nav {
 .fulfillment-lines,
 .fulfillment-allocation-row,
 .fulfillment-summary,
+.fulfillment-review-panel,
 .payment-link-panel,
 .payment-issue-panel,
 .manual-tracking-panel {
@@ -2050,11 +2074,56 @@ nav {
   font-weight: 850;
 }
 
+.fulfillment-review-panel,
 .manual-tracking-panel {
   padding: 10px;
   border: 1px solid var(--soft-line);
   border-radius: 8px;
   background: var(--panel);
+}
+
+.fulfillment-line-list {
+  display: grid;
+  gap: 6px;
+}
+
+.route-chip {
+  display: inline-grid;
+  place-items: center;
+  min-height: 20px;
+  margin-left: 6px;
+  padding: 0 7px;
+  border-radius: 999px;
+  background: #e9eef5;
+  color: #263244;
+  font-size: 0.7rem;
+  font-weight: 950;
+}
+
+.route-chip.external {
+  background: #ffe7e7;
+  color: #b50816;
+}
+
+.fulfillment-rule-list {
+  display: grid;
+  gap: 10px;
+  margin: 0 14px 14px;
+}
+
+.fulfillment-rule-row {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  padding: 10px;
+  border: 1px solid var(--soft-line);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.availability-toggle {
+  justify-self: end;
 }
 
 .payment-link-panel {
@@ -2220,6 +2289,8 @@ nav {
 
 :root[data-theme="dark"] .fulfillment-allocation-row,
 :root[data-theme="dark"] .fulfillment-summary,
+:root[data-theme="dark"] .fulfillment-review-panel,
+:root[data-theme="dark"] .fulfillment-rule-row,
 :root[data-theme="dark"] .payment-link-panel,
 :root[data-theme="dark"] .payment-issue-panel,
 :root[data-theme="dark"] .manual-tracking-panel,
@@ -2456,6 +2527,7 @@ nav {
   .admin-order-tools,
   .cart-actions,
   .fulfillment-allocation-row,
+  .fulfillment-rule-row,
   .tracking-grid,
   .order-shell,
   .topbar {
@@ -2486,6 +2558,10 @@ nav {
 
   nav {
     overflow-x: auto;
+  }
+
+  .availability-toggle {
+    justify-self: start;
   }
 
   .checkout {
