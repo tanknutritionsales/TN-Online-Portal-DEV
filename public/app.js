@@ -37,6 +37,8 @@ const state = {
   cart: new Map(),
   adminOrderSearch: "",
   adminOrderFilter: "all",
+  manualId: "peptides",
+  manualPage: 1,
 };
 
 const productTypes = [
@@ -52,6 +54,25 @@ const shopGoals = [
   { id: "recovery-longevity", label: "Recovery & Longevity", tags: ["recovery longevity"] },
   { id: "fat-loss-metabolic", label: "Fat loss & Metabolic", tags: ["fat loss", "fat loss metabolic"] },
 ];
+
+const manuals = {
+  peptides: {
+    volume: "01",
+    title: "Peptides",
+    pages: 23,
+    pdf: "/manuals/tank-nutrition-handbook-vol-1.pdf",
+    pagePrefix: "vol-1",
+    download: "Tank-Nutrition-Handbook-Vol-1.pdf",
+  },
+  performance: {
+    volume: "02",
+    title: "Performance & Recovery",
+    pages: 12,
+    pdf: "/manuals/tank-nutrition-handbook-vol-2.pdf",
+    pagePrefix: "vol-2",
+    download: "Tank-Nutrition-Handbook-Vol-2.pdf",
+  },
+};
 
 const termsVersion = "research-use-v1-2026-10-08";
 let pendingRegistrationPayload = null;
@@ -209,6 +230,35 @@ async function showApp(session) {
   await loadCustomerOrders();
 }
 
+function renderManual() {
+  const manual = manuals[state.manualId];
+  if (!manual) return;
+  state.manualPage = Math.min(manual.pages, Math.max(1, Number(state.manualPage) || 1));
+  qsa("[data-manual]").forEach((button) => {
+    const selected = button.dataset.manual === state.manualId;
+    button.classList.toggle("is-active", selected);
+    if (selected) button.setAttribute("aria-current", "true");
+    else button.removeAttribute("aria-current");
+  });
+  qs("#manualVolumeLabel").textContent = `Volume ${manual.volume} · ${manual.pages} pages`;
+  qs("#manualTitle").textContent = manual.title;
+  qs("#manualOpen").href = manual.pdf;
+  qs("#manualDownload").href = manual.pdf;
+  qs("#manualDownload").download = manual.download;
+  qs("#manualPageNumber").max = String(manual.pages);
+  qs("#manualPageNumber").value = String(state.manualPage);
+  qs("#manualPageTotal").textContent = `of ${manual.pages}`;
+  qs("#manualPreviousPage").disabled = state.manualPage === 1;
+  qs("#manualNextPage").disabled = state.manualPage === manual.pages;
+  const pageImage = qs("#manualPageImage");
+  const pageUrl = `/manuals/pages/${manual.pagePrefix}-${String(state.manualPage).padStart(2, "0")}.jpg`;
+  if (pageImage.getAttribute("src") !== pageUrl) {
+    pageImage.src = pageUrl;
+    qs(".manuals-page-image").scrollTop = 0;
+  }
+  pageImage.alt = `Volume ${Number(manual.volume)}: ${manual.title}, page ${state.manualPage}`;
+}
+
 function switchView(view) {
   qsa(".tab").forEach((tab) => tab.classList.toggle("is-active", tab.dataset.view === view));
   qsa(".view").forEach((panel) => panel.classList.toggle("is-active", panel.id === `view-${view}`));
@@ -225,6 +275,7 @@ function switchView(view) {
     admin: "Admin",
   };
   qs("#screenTitle").textContent = titles[view] || "Shop";
+  if (view === "manuals") renderManual();
   if (view === "orders" && state.user) loadCustomerOrders();
   if (view === "account" && state.user) renderAccount();
   if (view === "admin" && state.admin) loadAdminOrders();
@@ -2978,6 +3029,24 @@ async function copyText(value, label = "text") {
 }
 
 document.addEventListener("click", (event) => {
+  const manualButton = event.target.closest("[data-manual]");
+  if (manualButton && manuals[manualButton.dataset.manual]) {
+    state.manualId = manualButton.dataset.manual;
+    state.manualPage = 1;
+    renderManual();
+  }
+  if (event.target.closest("#manualPreviousPage")) {
+    state.manualPage -= 1;
+    renderManual();
+  }
+  if (event.target.closest("#manualNextPage")) {
+    state.manualPage += 1;
+    renderManual();
+  }
+  if (event.target.closest("#manualContents")) {
+    state.manualPage = 2;
+    renderManual();
+  }
   if (event.target.closest("#mobileMenuToggle")) {
     const open = qs("#mainNav").classList.toggle("is-open");
     qs("#mobileMenuToggle").setAttribute("aria-expanded", String(open));
@@ -3155,6 +3224,10 @@ document.addEventListener("toggle", (event) => {
 }, true);
 
 document.addEventListener("change", async (event) => {
+  if (event.target.matches("#manualPageNumber")) {
+    state.manualPage = Number(event.target.value);
+    renderManual();
+  }
   if (event.target.matches("#termsAgeConfirm")) {
     updateTermsGate();
   }

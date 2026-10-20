@@ -245,10 +245,44 @@
 
         <section class="view" id="view-manuals">
           <div class="manuals-page">
-            <p class="eyebrow">Resources</p>
-            <h2>Protocol manuals</h2>
-            <p class="muted">The protocol manuals are being prepared for the portal. Browse the catalog in the meantime.</p>
-            <button class="primary" type="button" data-view="order" data-shop-all>Browse products</button>
+            <header class="manuals-heading">
+              <p class="eyebrow">Resources</p>
+              <h2>Protocol manuals</h2>
+              <p class="muted">Select a volume to read here, open it in a full-screen PDF viewer, or download a copy.</p>
+            </header>
+            <div class="manuals-layout">
+              <nav class="manuals-library" aria-label="Manual volumes">
+                <button class="manual-volume is-active" type="button" data-manual="peptides" aria-current="true">
+                  <img src="/manuals/pages/vol-1-01.jpg" alt="Volume 1 cover" loading="lazy">
+                  <span><small>Volume 01 &middot; 23 pages</small><strong>Peptides</strong></span>
+                </button>
+                <button class="manual-volume" type="button" data-manual="performance">
+                  <img src="/manuals/pages/vol-2-01.jpg" alt="Volume 2 cover" loading="lazy">
+                  <span><small>Volume 02 &middot; 12 pages</small><strong>Performance &amp; Recovery</strong></span>
+                </button>
+              </nav>
+              <div class="manuals-reader">
+                <div class="manuals-reader-heading">
+                  <div>
+                    <p class="eyebrow" id="manualVolumeLabel">Volume 01 &middot; 23 pages</p>
+                    <h3 id="manualTitle">Peptides</h3>
+                  </div>
+                  <div class="manuals-actions">
+                    <a id="manualOpen" class="primary" href="/manuals/tank-nutrition-handbook-vol-1.pdf" target="_blank" rel="noopener">Open PDF</a>
+                    <a id="manualDownload" class="manual-download" href="/manuals/tank-nutrition-handbook-vol-1.pdf" download="Tank-Nutrition-Handbook-Vol-1.pdf">Download</a>
+                  </div>
+                </div>
+                <div class="manuals-page-controls" aria-label="Manual page controls">
+                  <button type="button" id="manualPreviousPage" aria-label="Previous page">&larr;</button>
+                  <label for="manualPageNumber">Page <input id="manualPageNumber" type="number" min="1" max="23" value="1" inputmode="numeric"> <span id="manualPageTotal">of 23</span></label>
+                  <button type="button" id="manualNextPage" aria-label="Next page">&rarr;</button>
+                  <button class="manual-contents" type="button" id="manualContents">Contents</button>
+                </div>
+                <div class="manuals-page-image">
+                  <img id="manualPageImage" src="/manuals/pages/vol-1-01.jpg" alt="Volume 1: Peptides, page 1" loading="lazy">
+                </div>
+              </div>
+            </div>
           </div>
         </section>
 

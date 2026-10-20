@@ -596,8 +596,52 @@ nav {
 .home-process { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 20px; padding: 28px 24px; background: var(--black); color: #fff; }
 .home-process div { display: flex; align-items: center; gap: 12px; }
 .home-process strong { color: #ff5c62; }
-.manuals-page { display: grid; justify-items: start; gap: 16px; width: min(760px, 100%); margin: 30px auto; padding: 28px 0; }
-.manuals-page .primary { min-height: 42px; padding: 0 18px; }
+.manuals-page { width: min(1320px, 100%); margin: 0 auto; padding: 32px clamp(16px, 3vw, 36px) 48px; }
+.manuals-heading { margin-bottom: 24px; }
+.manuals-heading .muted { margin-top: 7px; }
+.manuals-layout { display: grid; grid-template-columns: minmax(220px, 280px) minmax(0, 1fr); gap: 28px; align-items: start; }
+.manuals-library { display: grid; grid-column: auto; grid-row: auto; gap: 10px; padding: 0; border: 0; }
+.manual-volume { display: flex; align-items: center; gap: 14px; width: 100%; min-height: 116px; padding: 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--ink); text-align: left; }
+.manual-volume:hover, .manual-volume.is-active { border-color: var(--red); }
+.manual-volume.is-active { box-shadow: inset 3px 0 var(--red); }
+.manual-volume img { width: 67px; height: 94px; flex: 0 0 67px; object-fit: cover; object-position: top; background: #fff; border: 1px solid var(--soft-line); }
+.manual-volume span { display: grid; gap: 6px; min-width: 0; }
+.manual-volume small { color: var(--muted); font-size: .74rem; line-height: 1.35; }
+.manual-volume strong { font-size: 1rem; line-height: 1.25; }
+.manuals-reader { min-width: 0; }
+.manuals-reader-heading { display: flex; justify-content: space-between; align-items: center; gap: 18px; min-height: 62px; margin-bottom: 15px; }
+.manuals-reader-heading h3 { font-size: 1.3rem; }
+.manuals-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.manuals-actions a { min-height: 42px; padding: 0 15px; white-space: nowrap; }
+.manual-download { display: inline-flex; align-items: center; justify-content: center; border: 1px solid var(--line); border-radius: 6px; color: var(--ink); font-weight: 800; text-decoration: none; }
+.manual-download:hover { border-color: var(--red); color: var(--red); }
+.manuals-page-controls { display: flex; align-items: center; gap: 7px; margin-bottom: 10px; }
+.manuals-page-controls button { display: grid; place-items: center; min-width: 38px; min-height: 38px; border: 1px solid var(--line); border-radius: 5px; background: var(--panel); color: var(--ink); font-weight: 800; }
+.manuals-page-controls button:hover:not(:disabled) { border-color: var(--red); color: var(--red); }
+.manuals-page-controls label { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: .85rem; white-space: nowrap; }
+.manuals-page-controls input { width: 56px; min-height: 38px; padding: 5px; text-align: center; }
+.manuals-page-controls .manual-contents { display: inline-flex; padding: 0 12px; margin-left: auto; }
+.manuals-page-image { width: 100%; max-height: min(80vh, 900px); overflow: auto; border: 1px solid var(--line); border-radius: 5px; background: #fff; text-align: center; }
+.manuals-page-image img { display: block; width: 100%; max-width: 940px; height: auto; margin: 0 auto; }
+@media (max-width: 800px) {
+  .manuals-layout { grid-template-columns: 1fr; gap: 22px; }
+  .manuals-library { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .manual-volume { min-height: 104px; }
+  .manual-volume img { width: 54px; height: 76px; flex-basis: 54px; }
+}
+@media (max-width: 560px) {
+  .manuals-page { padding-top: 24px; }
+  .manuals-library { gap: 8px; }
+  .manual-volume { display: grid; justify-items: start; align-content: start; min-height: 125px; gap: 8px; }
+  .manual-volume img { width: 38px; height: 54px; }
+  .manual-volume small { font-size: .68rem; }
+  .manual-volume strong { font-size: .86rem; overflow-wrap: anywhere; }
+  .manuals-reader-heading { align-items: start; flex-direction: column; }
+  .manuals-actions, .manuals-actions a { width: 100%; }
+  .manuals-page-controls { flex-wrap: wrap; }
+  .manuals-page-controls .manual-contents { flex: 1 1 100%; justify-content: center; margin-left: 0; }
+  .manuals-page-image { max-height: none; }
+}
 
 .order-shell {
   display: grid;
