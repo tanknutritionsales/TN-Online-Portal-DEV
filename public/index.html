@@ -98,20 +98,34 @@
             <img src="/assets/tank-nutrition-logo.png" alt="Tank Nutrition">
             <div>
               <p class="eyebrow">Online Portal</p>
-              <h1 id="screenTitle">Shop</h1>
+              <h1 id="screenTitle">Home</h1>
             </div>
           </div>
           <nav id="mainNav" aria-label="Portal views">
-            <button class="tab customer-tab is-active" data-view="order">Shop</button>
-            <button class="tab customer-tab cart-tab icon-tab" data-view="cart" aria-label="Cart">
+            <div class="main-nav-links customer-only">
+              <button class="tab customer-tab is-active" data-view="home">Home</button>
+              <button class="tab customer-tab" data-view="order" data-shop-all>Shop all</button>
+              <details class="nav-dropdown" id="goalNav">
+                <summary>Shop by Goal</summary>
+                <div class="nav-dropdown-panel" id="goalNavOptions"></div>
+              </details>
+              <details class="nav-dropdown" id="brandNav">
+                <summary>Shop by Brand</summary>
+                <div class="nav-dropdown-panel" id="brandNavOptions"></div>
+              </details>
+              <button class="tab customer-tab" data-view="manuals">Protocol Manuals</button>
+            </div>
+            <div class="nav-utility-links customer-only">
+              <button class="tab customer-tab cart-tab icon-tab" data-view="cart" aria-label="Cart" title="Cart">
               <svg aria-hidden="true" viewBox="0 0 24 24" focusable="false">
                 <path d="M6.2 6h14.1l-1.7 8.1a2 2 0 0 1-2 1.6H8.9a2 2 0 0 1-2-1.6L5.4 3.9H2.8V2.4h3.9L7 4.5 7.2 6Zm1.3 1.5 1.2 6.3c.1.3.3.5.7.5h7.2c.3 0 .6-.2.7-.5l1.3-6.3H7.5ZM9.2 21.6a2 2 0 1 1 0-4.1 2 2 0 0 1 0 4.1Zm7 0a2 2 0 1 1 0-4.1 2 2 0 0 1 0 4.1Z"></path>
               </svg>
               <span class="visually-hidden">Cart</span>
               <span id="cartBubble" class="cart-bubble" hidden>0</span>
-            </button>
-            <button class="tab customer-tab" data-view="orders">My orders</button>
-            <button class="tab customer-tab" data-view="account">My account</button>
+              </button>
+              <button class="tab customer-tab" data-view="orders">My orders</button>
+              <button class="tab customer-tab" data-view="account">My account</button>
+            </div>
             <button class="tab admin-tab" data-view="admin" hidden>Admin</button>
           </nav>
           <div class="account-pill">
@@ -126,11 +140,45 @@
               </svg>
             </button>
           </div>
+          <button id="mobileMenuToggle" class="mobile-menu-toggle customer-only" type="button" aria-label="Open menu" aria-expanded="false" aria-controls="mainNav"><span></span><span></span><span></span></button>
         </header>
 
-        <section class="view is-active" id="view-order">
+        <section class="view is-active" id="view-home">
+          <div class="home-shell">
+            <section class="home-hero" aria-labelledby="homeTitle">
+              <div class="home-hero-content">
+                <p class="hero-kicker">Online Portal</p>
+                <h2 id="homeTitle">Tank Nutrition</h2>
+                <p>Explore the catalog, find what you need, and submit an order request. Our team reviews availability before sending payment details.</p>
+                <div class="hero-actions">
+                  <button class="primary" type="button" data-view="order" data-shop-all>Browse products</button>
+                  <button class="hero-secondary" type="button" data-home-goals>Shop by goal</button>
+                </div>
+                <small>Products are intended for research use only.</small>
+              </div>
+            </section>
+            <section class="home-section home-goals" id="homeGoals" aria-labelledby="homeGoalsTitle">
+              <div class="section-heading">
+                <div><p class="eyebrow">Explore</p><h2 id="homeGoalsTitle">Shop by goal</h2></div>
+                <button class="text-button" type="button" data-view="order" data-shop-all>View all products</button>
+              </div>
+              <div class="goal-grid" id="homeGoalOptions"></div>
+            </section>
+            <section class="home-section" aria-labelledby="homeBrandsTitle">
+              <div class="section-heading"><div><p class="eyebrow">Discover</p><h2 id="homeBrandsTitle">Shop by brand</h2></div></div>
+              <div class="home-brand-grid" id="homeBrandOptions"></div>
+            </section>
+            <section class="home-process" aria-label="Order process">
+              <div><strong>01</strong><span>Choose your products</span></div>
+              <div><strong>02</strong><span>We review your order</span></div>
+              <div><strong>03</strong><span>Pay securely, then track delivery</span></div>
+            </section>
+          </div>
+        </section>
+
+        <section class="view" id="view-order">
           <div class="order-shell">
-            <section class="panel catalog">
+            <section class="catalog">
               <div class="shop-lead">
                 <div>
                   <p class="eyebrow">Shop</p>
@@ -192,6 +240,15 @@
               <div id="products" class="products"></div>
               <div id="productsBottomPager" class="product-pager bottom"></div>
             </section>
+          </div>
+        </section>
+
+        <section class="view" id="view-manuals">
+          <div class="manuals-page">
+            <p class="eyebrow">Resources</p>
+            <h2>Protocol manuals</h2>
+            <p class="muted">The protocol manuals are being prepared for the portal. Browse the catalog in the meantime.</p>
+            <button class="primary" type="button" data-view="order" data-shop-all>Browse products</button>
           </div>
         </section>
 

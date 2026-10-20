@@ -8,7 +8,7 @@
     "start": "node server.js",
     "dev": "node --watch server.js",
     "check": "node --check server.js",
-    "check:all": "node --check server.js && node --check public/app.js && node --check netlify/functions/app.mjs && node --check scripts/reset-local-data.mjs && node --check scripts/smoke-local.mjs && node scripts/test-storage-availability-source.mjs && node scripts/test-courier-charge-source.mjs",
+    "check:all": "node --check server.js && node --check public/app.js && node --check netlify/functions/app.mjs && node --check scripts/reset-local-data.mjs && node --check scripts/smoke-local.mjs && node scripts/test-storage-availability-source.mjs && node scripts/test-fulfillment-stock.mjs && node scripts/test-courier-charge-source.mjs",
     "reset:local": "node scripts/reset-local-data.mjs",
     "smoke:local": "node scripts/smoke-local.mjs"
   },

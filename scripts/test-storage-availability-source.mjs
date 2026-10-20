@@ -13,7 +13,9 @@ assert.match(serverSource, /storageBackedQuantity/, "Storage-backed order quanti
 assert.match(serverSource, /storage_pending/, "Storage-backed paid orders should require a staff transfer before automatic Shopify sync.");
 assert.match(serverSource, /function checkStorageTransfer/, "Staff should have a stock-transfer check before storage-backed orders continue.");
 assert.match(serverSource, /\/check-stock-transfer/, "Online Portal should expose a dedicated stock-transfer check endpoint.");
-assert.match(serverSource, /Complete the stock transfer check before processing this order\./, "Storage-backed orders should not be processed before the transfer check succeeds.");
+assert.match(serverSource, /findOfficeShortfalls\(officeFulfillmentItems\(order\), stock\.rows\)/, "Every Office allocation should be checked against current Office availability.");
+assert.match(serverSource, /return officeFulfillmentItems\(order\);/, "Shopify order lines should respect the approved Office split.");
+assert.match(serverSource, /if \(req\.method === "GET" && adminStockMatch\) \{\s*requireAdmin\(req\);/, "The order stock snapshot must be admin-only.");
 assert.match(serverSource, /complete stock transfer and Shopify processing before it can be marked as shipped/, "Storage-backed orders should not be marked shipped before processing completes.");
 
 const publicProductBlock = serverSource.match(/function publicCatalogProduct\(product\) \{[\s\S]*?\n\}/)?.[0] || "";

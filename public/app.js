@@ -7,6 +7,7 @@ const state = {
   filters: { groups: [], tags: [], vendors: [], productTypes: [] },
   brandCollections: [],
   selectedBrand: "",
+  selectedGoal: "",
   selectedTypes: new Set(),
   inStockOnly: false,
   search: "",
@@ -16,6 +17,7 @@ const state = {
   shopSettings: null,
   adminProductSearch: "",
   adminOrders: [],
+  adminStock: new Map(),
   customerOrders: [],
   adminView: "pending",
   adminAccounts: [],
@@ -42,6 +44,13 @@ const productTypes = [
   { id: "oral", label: "Orals", tokens: ["oral", "orals", "tablet", "tablets", "tabs", "caps", "capsules"] },
   { id: "pen", label: "Pens", tokens: ["pen", "pens", "kwikpen"] },
   { id: "nasal", label: "Nasal", tokens: ["nasal"] },
+];
+
+const shopGoals = [
+  { id: "lean-muscle-cutting", label: "Lean muscle & Cutting", tags: ["lean cutting", "lean muscle cutting"] },
+  { id: "mass-strength", label: "Mass & Strength", tags: ["mass strength"] },
+  { id: "recovery-longevity", label: "Recovery & Longevity", tags: ["recovery longevity"] },
+  { id: "fat-loss-metabolic", label: "Fat loss & Metabolic", tags: ["fat loss", "fat loss metabolic"] },
 ];
 
 const termsVersion = "research-use-v1-2026-10-08";
@@ -169,6 +178,7 @@ function showScreen(screen) {
 function showAuth() {
   state.user = null;
   state.admin = null;
+  qs("#loginForm").reset();
   applyTheme("light");
   showScreen("login");
 }
@@ -176,15 +186,17 @@ function showAuth() {
 async function showApp(session) {
   state.user = session.user || null;
   state.admin = session.admin || null;
+  qs(".topbar").classList.toggle("admin-header", Boolean(state.admin));
   showScreen("app");
   qsa(".customer-tab").forEach((tab) => {
     tab.hidden = Boolean(state.admin);
   });
+  qsa(".customer-only").forEach((group) => { group.hidden = Boolean(state.admin); });
   qs(".admin-tab").hidden = !state.admin;
   qs("#themeToggle").hidden = false;
   qs("#accountName").textContent = state.admin ? state.admin.name || state.admin.username || "Admin" : state.user.name;
   applyTheme(state.admin?.preferences?.theme || state.user?.preferences?.theme || "light");
-  switchView(state.admin ? "admin" : "order");
+  switchView(state.admin ? "admin" : "home");
   if (state.admin) {
     await loadAdminOrders();
     return;
@@ -200,8 +212,13 @@ async function showApp(session) {
 function switchView(view) {
   qsa(".tab").forEach((tab) => tab.classList.toggle("is-active", tab.dataset.view === view));
   qsa(".view").forEach((panel) => panel.classList.toggle("is-active", panel.id === `view-${view}`));
+  qsa(".nav-dropdown").forEach((menu) => { menu.open = false; });
+  qs("#mainNav")?.classList.remove("is-open");
+  qs("#mobileMenuToggle")?.setAttribute("aria-expanded", "false");
   const titles = {
+    home: "Home",
     order: "Shop",
+    manuals: "Protocol manuals",
     cart: "Cart",
     orders: "My orders",
     account: "My account",
@@ -439,6 +456,7 @@ async function loadCatalog() {
     state.shopSettings = mergeShopSettings(settingsPayload.settings || defaultShopSettings());
     state.brandCollections = buildBrandCollections(state.products);
     renderCatalogControls();
+    renderHome();
     renderFeaturedSlider();
     renderProducts();
   } catch (error) {
@@ -448,6 +466,10 @@ async function loadCatalog() {
       "Retry",
       "retry-catalog",
     );
+    if (!state.products.length) {
+      qs("#homeGoalOptions").innerHTML = `<p class="muted">Products are temporarily unavailable. <button type="button" class="secondary" data-retry-catalog>Retry</button></p>`;
+      qs("#homeBrandOptions").innerHTML = "";
+    }
   }
 }
 
@@ -528,7 +550,38 @@ function orderProviderConfig(order) {
 
 function renderCatalogControls() {
   renderBrandCollections();
+  renderBrowseMenus();
   updateFilterControls();
+}
+
+function renderBrowseMenus() {
+  qs("#goalNavOptions").innerHTML = shopGoals.map((goal) => `
+    <button type="button" data-goal-filter="${goal.id}">
+      <span>${goal.label}</span><small>${state.products.filter((product) => productMatchesGoal(product, goal)).length}</small>
+    </button>
+  `).join("");
+  qs("#brandNavOptions").innerHTML = state.brandCollections.map((brand) => `
+    <button type="button" data-brand-filter="${escapeHtml(brand.vendor)}">
+      <span>${escapeHtml(brand.vendor)}</span><small>${brand.count}</small>
+    </button>
+  `).join("");
+}
+
+function renderHome() {
+  qs("#homeGoalOptions").innerHTML = shopGoals.map((goal, index) => `
+    <button class="goal-tile goal-tile-${index + 1}" type="button" data-goal-filter="${goal.id}">
+      <span class="goal-index">0${index + 1}</span>
+      <strong>${goal.label}</strong>
+      <span class="goal-count">${state.products.filter((product) => productMatchesGoal(product, goal)).length} products <span aria-hidden="true">&rarr;</span></span>
+    </button>
+  `).join("");
+  qs("#homeBrandOptions").innerHTML = state.brandCollections.slice(0, 8).map((brand) => `
+    <button class="home-brand" type="button" data-brand-filter="${escapeHtml(brand.vendor)}">
+      <span class="home-brand-image">${brand.image ? `<img src="${escapeHtml(brand.image)}" alt="" loading="lazy">` : `<strong>${escapeHtml(brand.initials)}</strong>`}</span>
+      <span><strong>${escapeHtml(brand.vendor)}</strong><small>${brand.count} products</small></span>
+      <span class="home-brand-arrow" aria-hidden="true">&rarr;</span>
+    </button>
+  `).join("");
 }
 
 function renderBrandCollections() {
@@ -560,6 +613,9 @@ function renderBrandCollections() {
 function renderProducts() {
   const container = qs("#products");
   const products = filteredProducts();
+  const focused = Boolean(state.selectedBrand || state.selectedGoal || state.selectedTypes.size || state.inStockOnly || state.search);
+  qs("#featuredSection").hidden = focused || !qs("#featuredSlider").children.length;
+  qs(".brand-section").hidden = focused;
   updateFilterControls();
   renderCatalogSummary(products.length);
   if (!products.length) {
@@ -671,10 +727,19 @@ function filteredProducts() {
   const query = normalizeSearch(state.search);
   return state.products.filter((product) => {
     if (state.selectedBrand && normalizeSearch(product.vendor) !== normalizeSearch(state.selectedBrand)) return false;
+    if (state.selectedGoal && !productMatchesGoal(product, shopGoals.find((goal) => goal.id === state.selectedGoal))) return false;
     if (state.inStockOnly && !product.variant?.inStock) return false;
     if (state.selectedTypes.size && !matchesSelectedTypes(product)) return false;
     if (!query) return true;
     return searchableProductText(product).includes(query);
+  });
+}
+
+function productMatchesGoal(product, goal) {
+  if (!goal) return false;
+  return (product.tags || []).some((tag) => {
+    const normalized = normalizeSearch(tag).replace(/^goal\s+/, "").replace(/\band\b/g, "").replace(/\s+/g, " ").trim();
+    return /^goal[-_\s]/i.test(tag) && goal.tags.includes(normalized);
   });
 }
 
@@ -688,6 +753,24 @@ function matchesSelectedTypes(product) {
 
 function setSelectedBrand(vendor) {
   state.selectedBrand = vendor || "";
+  state.selectedGoal = "";
+  state.selectedTypes.clear();
+  state.inStockOnly = false;
+  state.search = "";
+  qs("#catalogSearch").value = "";
+  switchView("order");
+  state.productPage = 1;
+  renderProducts();
+}
+
+function setSelectedGoal(goalId) {
+  state.selectedGoal = shopGoals.some((goal) => goal.id === goalId) ? goalId : "";
+  state.selectedBrand = "";
+  state.selectedTypes.clear();
+  state.inStockOnly = false;
+  state.search = "";
+  qs("#catalogSearch").value = "";
+  switchView("order");
   state.productPage = 1;
   renderProducts();
 }
@@ -697,6 +780,7 @@ function updateFilterControls() {
     button.classList.toggle("is-active", normalizeSearch(button.dataset.brandFilter) === normalizeSearch(state.selectedBrand));
   });
   qs("#clearBrandFilter")?.classList.toggle("is-active", !state.selectedBrand);
+  qsa("[data-goal-filter]").forEach((button) => button.classList.toggle("is-active", button.dataset.goalFilter === state.selectedGoal));
   qsa("[data-type-filter]").forEach((input) => {
     input.checked = state.selectedTypes.has(input.dataset.typeFilter);
   });
@@ -706,6 +790,7 @@ function updateFilterControls() {
 
 function renderCatalogSummary(count) {
   const parts = [state.selectedBrand || "All brands"];
+  if (state.selectedGoal) parts.push(shopGoals.find((goal) => goal.id === state.selectedGoal)?.label || "Goal");
   if (state.selectedTypes.size) parts.push([...state.selectedTypes].map(typeLabel).join(", "));
   if (state.inStockOnly) parts.push("In stock");
   if (state.search) parts.push(`matching "${state.search}"`);
@@ -2248,9 +2333,11 @@ function renderAdminOrder(order) {
   const paymentIssue = renderAdminPaymentIssue(order);
   const specialReview = order.specialOrder ? renderAdminSpecialOrder(order) : "";
   const fulfillmentReview = !order.specialOrder || order.specialOrder?.status !== "pending" ? renderFulfillmentReview(order) : "";
+  const canReviewFulfillment = !order.paymentLink && order.paymentStatus !== "confirmed" && order.specialOrder?.status !== "declined";
+  const stockCheck = canReviewFulfillment ? `<div class="stock-check-heading"><span data-stock-checked="${escapeHtml(order.id)}">Stock is checked when you open this order.</span><button type="button" class="secondary" data-refresh-stock="${escapeHtml(order.id)}">Refresh stock</button></div>` : "";
   const manualTracking = renderManualTrackingForm(order);
   const shopifySync = renderShopifySync(order);
-  const storageTransferNote = (order.items || []).some((item) => Number(item.storageBackedQuantity || 0) > 0)
+  const storageTransferNote = order.shopifySync?.status === "storage_pending"
     ? `<p class="muted"><strong>Stock transfer:</strong> This order is paused until the required units have been moved to Office. Use the check button after the transfer has been completed.</p>`
     : "";
   const statusLabel = adminOrderStatusLabel(order);
@@ -2269,6 +2356,7 @@ function renderAdminOrder(order) {
         <p><strong>Total:</strong> ${money.format(order.total)}</p>
         ${workflowNote}
         ${storageTransferNote}
+        ${stockCheck}
         ${specialReview}
         ${fulfillmentReview}
         ${paymentIssue}
@@ -2502,9 +2590,13 @@ function renderFulfillmentAllocationInputs(items, allocations = []) {
       const externalValue = allocation.externalQuantity ?? (lockedExternal ? item.quantity : 0);
       return `
         <div class="fulfillment-allocation-row" data-special-allocation-row data-variant-id="${escapeHtml(item.variantId)}" data-total="${escapeHtml(item.quantity)}">
-          <strong>${escapeHtml(item.productTitle)}</strong>
-          <span>Requested: ${escapeHtml(item.quantity)}${lockedExternal ? " - external only" : ""}</span>
-          <label>Retail Shark / Shopify
+          <div class="fulfillment-line-details">
+            <strong>${escapeHtml(item.productTitle)}</strong>
+            <span>Requested: ${escapeHtml(item.quantity)}${lockedExternal ? " - external only" : ""}</span>
+            <small class="stock-facts" data-stock-variant="${escapeHtml(item.variantId)}">Open this order to check stock.</small>
+            <small class="stock-guidance" data-stock-guidance="${escapeHtml(item.variantId)}"></small>
+          </div>
+          <label>Office
             <input name="office-${escapeHtml(item.variantId)}" type="number" min="0" max="999" value="${escapeHtml(officeValue)}" ${lockedExternal ? "readonly" : ""}>
           </label>
           <label>External
@@ -2517,27 +2609,58 @@ function renderFulfillmentAllocationInputs(items, allocations = []) {
 }
 
 function renderCounterAllocationInputs(items, allocations = []) {
-  const allocationByVariant = new Map((allocations || []).map((entry) => [entry.variantId, entry]));
-  return items
-    .map((item) => {
-      const allocation = allocationByVariant.get(item.variantId) || {};
-      const lockedExternal = Boolean(item.externalLocked || item.fulfillmentRoute === "external" || allocation.externalLocked);
-      const officeValue = allocation.officeQuantity ?? (lockedExternal ? 0 : item.quantity);
-      const externalValue = allocation.externalQuantity ?? (lockedExternal ? item.quantity : 0);
-      return `
-        <div class="fulfillment-allocation-row" data-special-allocation-row data-variant-id="${escapeHtml(item.variantId)}" data-total="${escapeHtml(item.quantity)}">
-          <strong>${escapeHtml(item.productTitle)}</strong>
-          <span>Requested: ${escapeHtml(item.quantity)}${lockedExternal ? " - external only" : ""}</span>
-          <label>Retail Shark / Shopify
-            <input name="office-${escapeHtml(item.variantId)}" type="number" min="0" max="999" value="${escapeHtml(officeValue)}" ${lockedExternal ? "readonly" : ""}>
-          </label>
-          <label>External
-            <input name="external-${escapeHtml(item.variantId)}" type="number" min="0" max="999" value="${escapeHtml(externalValue)}">
-          </label>
-        </div>
-      `;
-    })
-    .join("");
+  return renderFulfillmentAllocationInputs(items, allocations);
+}
+
+async function loadAdminStock(orderId) {
+  const card = qsa(".admin-order-card").find((entry) => entry.dataset.adminOrderId === orderId);
+  if (!card) return;
+  const status = qs("[data-stock-checked]", card);
+  if (!status) return;
+  status.textContent = "Checking Office and storage stock...";
+  try {
+    const payload = await api(`/api/admin/orders/${encodeURIComponent(orderId)}/stock`);
+    state.adminStock.set(orderId, payload.stock);
+    paintAdminStock(orderId);
+  } catch {
+    state.adminStock.delete(orderId);
+    status.textContent = "Stock unavailable. Refresh to try again before reviewing this order.";
+    qsa("[data-stock-variant]", card).forEach((line) => { line.textContent = "Stock unavailable"; });
+    qsa("[data-stock-guidance]", card).forEach((line) => { line.textContent = ""; });
+  }
+}
+
+function paintAdminStock(orderId) {
+  const stock = state.adminStock.get(orderId);
+  const card = qsa(".admin-order-card").find((entry) => entry.dataset.adminOrderId === orderId);
+  if (!stock || !card) return;
+  const status = qs("[data-stock-checked]", card);
+  if (status) status.textContent = `Stock checked ${new Date(stock.checkedAt).toLocaleTimeString("en-ZA", { hour: "2-digit", minute: "2-digit" })}${stock.storageUpdatedAt ? `; storage updated ${new Date(stock.storageUpdatedAt).toLocaleString("en-ZA")}` : "; storage update time unavailable"}.`;
+  const byVariant = new Map((stock.rows || []).map((row) => [row.variantId, row]));
+  qsa("[data-special-allocation-row]", card).forEach((row) => {
+    const snapshot = byVariant.get(row.dataset.variantId);
+    const facts = qs("[data-stock-variant]", row);
+    const guidance = qs("[data-stock-guidance]", row);
+    const office = snapshot?.officeOnHand;
+    const available = snapshot?.officeAvailable;
+    const storage = snapshot?.storageOnHand;
+    facts.textContent = Number.isFinite(office) && Number.isFinite(storage)
+      ? `Office SOH ${office} (${available ?? "?"} available)  |  Storage SOH ${storage}  |  Total SOH ${office + storage}`
+      : `Office stock unavailable${Number.isFinite(storage) ? `  |  Storage SOH ${storage}` : ""}`;
+    const officeInput = qs(`input[name^="office-"]`, row);
+    const officeQuantity = Math.max(0, Number(officeInput?.value || 0));
+    const shortfall = Number.isFinite(available) ? Math.max(0, officeQuantity - available) : null;
+    guidance.classList.toggle("needs-transfer", shortfall > 0);
+    guidance.textContent = shortfall === null
+      ? "Office availability needs checking."
+      : officeQuantity === 0
+        ? "External fulfillment selected."
+        : shortfall === 0
+          ? "Ready from Office."
+          : Number.isFinite(storage) && shortfall <= storage
+            ? `Transfer ${shortfall} from storage before processing.`
+            : `Office short by ${shortfall}. Review the split or source more stock.`;
+  });
 }
 
 function renderAdminFulfillmentSummary(order) {
@@ -2855,8 +2978,29 @@ async function copyText(value, label = "text") {
 }
 
 document.addEventListener("click", (event) => {
-  const tab = event.target.closest(".tab");
+  if (event.target.closest("#mobileMenuToggle")) {
+    const open = qs("#mainNav").classList.toggle("is-open");
+    qs("#mobileMenuToggle").setAttribute("aria-expanded", String(open));
+    qs("#mobileMenuToggle").setAttribute("aria-label", open ? "Close menu" : "Open menu");
+  }
+  const tab = event.target.closest("[data-view]");
+  if (tab?.hasAttribute("data-shop-all")) {
+    state.selectedBrand = "";
+    state.selectedGoal = "";
+    state.selectedTypes.clear();
+    state.inStockOnly = false;
+    state.search = "";
+    state.productPage = 1;
+    qs("#catalogSearch").value = "";
+    renderProducts();
+  }
   if (tab) switchView(tab.dataset.view);
+
+  const goal = event.target.closest("[data-goal-filter]");
+  if (goal) setSelectedGoal(goal.dataset.goalFilter);
+  if (event.target.closest("[data-home-goals]")) qs("#homeGoals")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  const refreshStock = event.target.closest("[data-refresh-stock]");
+  if (refreshStock) loadAdminStock(refreshStock.dataset.refreshStock);
 
   if (event.target.closest("#showCreateAccount")) showScreen("create");
   if (event.target.closest("#backToLogin")) showAuth();
@@ -2899,6 +3043,8 @@ document.addEventListener("click", (event) => {
   if (event.target.closest("#clearBrandFilter")) setSelectedBrand("");
 
   if (event.target.closest("#clearProductFilters")) {
+    state.selectedGoal = "";
+    state.selectedBrand = "";
     state.selectedTypes.clear();
     state.inStockOnly = false;
     state.search = "";
@@ -3004,6 +3150,10 @@ document.addEventListener("click", (event) => {
   }
 });
 
+document.addEventListener("toggle", (event) => {
+  if (event.target.matches(".admin-order-card") && event.target.open) loadAdminStock(event.target.dataset.adminOrderId);
+}, true);
+
 document.addEventListener("change", async (event) => {
   if (event.target.matches("#termsAgeConfirm")) {
     updateTermsGate();
@@ -3044,6 +3194,11 @@ qs("#catalogSearch").addEventListener("input", (event) => {
 });
 
 document.addEventListener("input", (event) => {
+  const allocation = event.target.closest("[data-special-allocation-row]");
+  if (allocation) {
+    const card = event.target.closest(".admin-order-card");
+    if (card) paintAdminStock(card.dataset.adminOrderId);
+  }
   if (event.target.matches("#specialProductSearch")) {
     state.specialProductSearch = event.target.value.trim();
     state.selectedSpecialProductId = "";

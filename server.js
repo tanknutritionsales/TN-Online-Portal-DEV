@@ -4,6 +4,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHmac, randomBytes, randomUUID, scryptSync, timingSafeEqual } from "node:crypto";
+import { findOfficeShortfalls } from "./lib/fulfillment-stock.mjs";
 
 const moduleUrl = import.meta.url || "";
 const modulePath = moduleUrl ? fileURLToPath(moduleUrl) : "";
@@ -1697,10 +1698,6 @@ function assertQuantityAvailable(product, quantity) {
   }
 }
 
-function orderHasStorageBackedItems(order) {
-  return officeFulfillmentItems(order).some((item) => Number(item.storageBackedQuantity || 0) > 0);
-}
-
 async function createOrder(input, user) {
   const now = new Date().toISOString();
   const data = await readOrdersData();
@@ -1845,14 +1842,7 @@ async function confirmPayment(orderId, input, admin) {
     }
     order.statusEvents.push({ at: now, actor: "admin", type: "payment_confirmed", label: provider.confirmationLabel || "Payment confirmed" });
   }
-  if (shopifyOrderSyncEnabled && !order.shopifyOrder?.id && orderHasStorageBackedItems(order)) {
-    order.shopifySync = {
-      status: "storage_pending",
-      message: "This order is paused until the required storage stock has been transferred to Office.",
-      attemptedAt: null,
-      syncedAt: null,
-    };
-  } else if (shopifyOrderSyncEnabled && !order.shopifyOrder?.id) {
+  if (shopifyOrderSyncEnabled && !order.shopifyOrder?.id) {
     await syncOrderToShopify(order, admin, { throwOnError: false });
   } else if (!shopifyFulfillmentItems(order).length) {
     order.shopifySync = {
@@ -1922,45 +1912,15 @@ async function checkStorageTransfer(orderId, admin) {
   const order = data.orders.find((entry) => entry.id === orderId);
   if (!order) throw Object.assign(new Error("Order not found."), { status: 404 });
   if (order.paymentStatus !== "confirmed") throw Object.assign(new Error("Payment must be confirmed first."), { status: 409 });
-  if (!orderHasStorageBackedItems(order)) throw Object.assign(new Error("This order is not waiting for a storage transfer."), { status: 409 });
-  const missingItems = await storageTransferShortfalls(order);
-  if (missingItems.length) {
-    order.shopifySync = {
-      status: "storage_pending",
-      message: `Still waiting for Office stock: ${missingItems.map((item) => `${item.productTitle} needs ${item.required}, Office has ${item.officeAvailable}`).join("; ")}.`,
-      attemptedAt: new Date().toISOString(),
-      attemptedBy: cleanText(admin?.username || "admin", 120),
-      syncedAt: null,
-    };
-    order.updatedAt = new Date().toISOString();
-    await writeOrdersData(data);
-    return order;
-  }
-  order.items = (order.items || []).map((item) => {
-    const { storageBackedQuantity, ...rest } = item;
-    return rest;
-  });
+  if (order.shopifySync?.status !== "storage_pending") throw Object.assign(new Error("This order is not waiting for a stock transfer."), { status: 409 });
   await syncOrderToShopify(order, admin, { throwOnError: true });
   order.updatedAt = new Date().toISOString();
   await writeOrdersData(data);
   return order;
 }
 
-async function storageTransferShortfalls(order) {
-  const catalog = await catalogProducts();
-  const productsByVariant = new Map(catalog.products.map((product) => [product.variant?.id, product]).filter(([variantId]) => variantId));
-  return officeFulfillmentItems(order)
-    .filter((item) => Number(item.storageBackedQuantity || 0) > 0)
-    .map((item) => {
-      const product = productsByVariant.get(item.variantId);
-      const officeAvailable = Number.isFinite(product?.variant?.officeAvailableQuantity) ? Math.max(0, product.variant.officeAvailableQuantity) : 0;
-      return {
-        productTitle: item.productTitle,
-        required: Math.max(0, Number(item.quantity || 0)),
-        officeAvailable,
-      };
-    })
-    .filter((item) => item.officeAvailable < item.required);
+function storageTransferShortfalls(order, stock) {
+  return findOfficeShortfalls(officeFulfillmentItems(order), stock.rows);
 }
 
 async function reviewSpecialOrder(orderId, input, admin) {
@@ -2228,9 +2188,6 @@ async function syncOrderToShopify(order, admin, options = {}) {
   if (order.specialOrder?.status === "pending" || order.specialOrder?.status === "declined") {
     throw Object.assign(new Error("This special order is not ready for Shopify sync."), { status: 409 });
   }
-  if (orderHasStorageBackedItems(order)) {
-    throw Object.assign(new Error("Complete the stock transfer check before processing this order."), { status: 409 });
-  }
   if (!shopifyFulfillmentItems(order).length) {
     order.shopifySync = {
       status: "external",
@@ -2255,6 +2212,18 @@ async function syncOrderToShopify(order, admin, options = {}) {
     message: "Creating Shopify order.",
   };
   try {
+    const stock = await retailSharkFulfillmentStock(officeFulfillmentItems(order).map((item) => item.variantId));
+    const missingItems = storageTransferShortfalls(order, stock);
+    if (missingItems.length) {
+      order.shopifySync = {
+        status: "storage_pending",
+        attemptedAt: now,
+        attemptedBy: cleanText(admin?.username || "admin", 120),
+        syncedAt: null,
+        message: `Office stock needed: ${missingItems.map((item) => `${item.productTitle} needs ${item.required}, available ${item.officeAvailable}`).join("; ")}. Transfer stock to Office, then check again.`,
+      };
+      return { created: false, order: null };
+    }
     const shopifyOrder = await createShopifyOrder(order);
     order.shopifyOrder = shopifyOrder;
     order.shopifySync = {
@@ -2269,6 +2238,10 @@ async function syncOrderToShopify(order, admin, options = {}) {
       actor: "system",
       type: "shopify_order_created",
       label: `Shopify order ${shopifyOrder.name || shopifyOrder.id} created`,
+    });
+    order.items = (order.items || []).map((item) => {
+      const { storageBackedQuantity, ...rest } = item;
+      return rest;
     });
     return { created: true, order: shopifyOrder };
   } catch (error) {
@@ -2341,7 +2314,7 @@ async function createShopifyOrder(order) {
 }
 
 function shopifyFulfillmentItems(order) {
-  return order.specialOrder ? officeFulfillmentItems(order) : (order.items || []).map((item) => ({ ...item }));
+  return officeFulfillmentItems(order);
 }
 
 function buildShopifyOrderInput(order, lineItems = shopifyFulfillmentItems(order)) {
@@ -2653,6 +2626,31 @@ async function retailSharkStorageAvailability() {
   } catch {
     return new Map();
   }
+}
+
+async function retailSharkFulfillmentStock(variantIds) {
+  if (!retailSharkInternalUrl || !retailSharkInternalToken) {
+    throw Object.assign(new Error("Retail Shark stock check is not configured."), { status: 503 });
+  }
+  const stockUrl = new URL("/api/internal/fulfillment-stock", retailSharkInternalUrl).toString();
+  const { response, payload } = await fetchJsonWithTimeout(stockUrl, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-internal-token": retailSharkInternalToken },
+    body: JSON.stringify({ variantIds: [...new Set(variantIds)] }),
+  }, 25000);
+  if (!response.ok || payload.ok !== true || !Array.isArray(payload.rows)) {
+    throw Object.assign(new Error("Retail Shark stock could not be checked. Refresh and try again."), { status: 503 });
+  }
+  return {
+    checkedAt: payload.checkedAt || new Date().toISOString(),
+    storageUpdatedAt: payload.storageUpdatedAt || null,
+    rows: payload.rows.map((row) => ({
+      variantId: cleanText(row.variantId, 180),
+      officeOnHand: row.officeOnHand == null ? null : Number(row.officeOnHand),
+      officeAvailable: row.officeAvailable == null ? null : Number(row.officeAvailable),
+      storageOnHand: row.storageOnHand == null ? null : Math.max(0, Number(row.storageOnHand)),
+    })),
+  };
 }
 
 function mergeStorageAvailability(products, storageAvailability) {
@@ -3262,6 +3260,14 @@ async function handleApi(req, res, url) {
     const admin = requireAdmin(req);
     const order = await reviewFulfillment(decodeURIComponent(adminFulfillmentMatch[1]), await bodyJson(req), admin);
     return json(res, 200, { ok: true, order: staffOrder(order) });
+  }
+  const adminStockMatch = url.pathname.match(/^\/api\/admin\/orders\/([^/]+)\/stock$/);
+  if (req.method === "GET" && adminStockMatch) {
+    requireAdmin(req);
+    const data = await readOrdersData();
+    const order = data.orders.find((entry) => entry.id === decodeURIComponent(adminStockMatch[1]));
+    if (!order) throw Object.assign(new Error("Order not found."), { status: 404 });
+    return json(res, 200, { ok: true, stock: await retailSharkFulfillmentStock((order.items || []).map((item) => item.variantId)) });
   }
   const adminExternalTrackingMatch = url.pathname.match(/^\/api\/admin\/orders\/([^/]+)\/external-tracking$/);
   if (req.method === "POST" && adminExternalTrackingMatch) {

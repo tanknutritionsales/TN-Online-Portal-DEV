@@ -1,6 +1,6 @@
 # Online Portal App Memory
 
-Last updated: 2026-10-08
+Last updated: 2026-10-20
 
 ## Purpose
 
@@ -33,7 +33,7 @@ Retail Shark remains the internal staff operations app. Online Portal owns custo
 1. Customer starts on the login screen.
 2. Customer logs in or creates an account with required contact and delivery fields.
 3. New customer registration is blocked behind a required terms/disclaimer modal. The customer must scroll to the bottom, confirm they are 18 years or older, and accept the research-use-only disclaimer before the account is created. The accepted terms version/timestamp is stored on the customer account.
-4. Customer lands on Shop and browses Shopify products with featured slider, brand tiles, product search, type filters, availability filter, and 30-product pagination.
+4. Customer lands on Home, with a branded hero, Shop by Goal (`goal-*` Shopify tags), and Shop by Brand (Shopify vendors). The four goal groups are Lean muscle & Cutting, Mass & Strength, Recovery & Longevity, and Fat loss & Metabolic. Shop retains the featured slider, search, type and availability filters, and 30-product pagination. Protocol Manuals has a separate placeholder page; the two PDFs are not integrated yet.
 5. Customer adds normal in-stock products to cart. The user nav shows a cart quantity bubble.
 6. Customer can add/manage multiple delivery addresses from My account or checkout.
 7. Customer submits the cart as an order request.
@@ -43,7 +43,7 @@ Retail Shark remains the internal staff operations app. Online Portal owns custo
 11. Customer pays, can copy payment reference/details, and can click `I have paid`.
 12. Customer status becomes `Marked as paid, processing` until admin verifies payment.
 13. After admin confirmation, the order can sync to Shopify if mutations are enabled and then becomes visible to Retail Shark.
-14. If a normal order depends on Retail Shark storage stock, OP pauses it as `Storage transfer required` after payment confirmation. Staff must complete the Office stock transfer and click `Check stock transfer`; only then can OP create the Shopify order and release it to Retail Shark.
+14. After payment confirmation, every Office-allocated line (normal or special order) is checked against live Shopify Office available stock through Shark. If short, OP pauses the order as `Storage transfer required`. Staff transfers stock to Office and clicks `Check stock transfer`; OP checks again and, when sufficient, creates the Shopify order and releases it to Retail Shark. Externally allocated lines are excluded from Shopify order creation.
 15. Retail Shark supplies tracking/back-order/shipped updates.
 16. Customer can open My orders, view progress, and track shipped orders.
 
@@ -53,11 +53,12 @@ Retail Shark remains the internal staff operations app. Online Portal owns custo
 - Admin order panels are collapsed by default and show reference, customer name/email, and status tag.
 - Admin can filter orders by payment/details state, payment to verify, special review, and payment support.
 - Admin can review special orders, split approved quantities between Retail Shark/Shopify allocation and external fulfillment, decline, or counter.
+- Expanding an order awaiting fulfillment review fetches a protected live stock snapshot: Shopify Office SOH and available units, Shark storage SOH, total SOH, timestamps, and a per-line transfer shortfall hint. A Refresh stock action repeats the check. Exact quantities stay admin-only.
 - Admin can enter external tracking for externally fulfilled special-order items.
 - Admin attaches payment details after review. For Yoco, this is the Yoco payment link plus reference/customer note.
 - Admin confirms payment only after payment has truly cleared.
 - Admin can retry Shopify sync for confirmed orders if sync is enabled and previous sync failed or was disabled.
-- For storage-backed orders, admin sees `Storage transfer required` and uses `Check stock transfer` after moving stock to Office. Customers do not see storage/transfer details.
+- For Office allocations short on live available stock, admin sees `Storage transfer required` and uses `Check stock transfer` after moving stock to Office. Customers do not see storage/transfer details.
 - Admin can manage accounts, shop settings, system status, and payment provider settings.
 
 ## Payment Module
@@ -135,7 +136,7 @@ Guarded sync:
 - Default inventory behavior is `DECREMENT_OBEYING_POLICY`.
 - Online Portal stores Shopify order ID/name/admin URL so retries cannot duplicate orders.
 - Retail Shark receives confirmed orders only after Shopify sync succeeds when sync is enabled.
-- Storage-backed normal orders do not auto-create Shopify orders after payment confirmation. OP tags the internal line quantity that exceeded Office SOH, blocks shipping/processing, and clears the pause only after Office SOH is sufficient.
+- Before creating a paid Shopify order, OP checks every Office allocation against live, location-specific Office available stock. Shortages pause the order, including special orders; a staff transfer check retries the gate and automatically continues when sufficient. Standard and special orders send only Office-allocated lines to Shopify.
 
 ## Retail Shark Internal API
 
@@ -159,9 +160,12 @@ Online Portal also reads Retail Shark storage availability through Retail Shark'
 ```text
 GET <RETAIL_SHARK_INTERNAL_URL>/api/internal/storage-availability
 X-Internal-Token: <RETAIL_SHARK_INTERNAL_TOKEN>
+POST <RETAIL_SHARK_INTERNAL_URL>/api/internal/fulfillment-stock
+X-Internal-Token: <RETAIL_SHARK_INTERNAL_TOKEN>
+Body: {"variantIds": ["gid://shopify/ProductVariant/..."]}
 ```
 
-The storage availability response is used only server-side for customer availability and normal cart limits. Public catalog/order payloads must not expose exact SOH or storage quantities.
+The storage availability response is used only server-side for customer availability and normal cart limits. The fulfillment-stock response is for admin review and the paid-order Office stock gate. Public catalog/order payloads must not expose exact SOH or storage quantities.
 
 Office flow:
 
