@@ -102,7 +102,7 @@
             </div>
           </div>
           <nav id="mainNav" aria-label="Portal views">
-            <div class="main-nav-links customer-only">
+            <div class="main-nav-links">
               <button class="tab customer-tab is-active" data-view="home">Home</button>
               <button class="tab customer-tab" data-view="order" data-shop-all>Shop all</button>
               <details class="nav-dropdown" id="goalNav">
@@ -140,7 +140,7 @@
               </svg>
             </button>
           </div>
-          <button id="mobileMenuToggle" class="mobile-menu-toggle customer-only" type="button" aria-label="Open menu" aria-expanded="false" aria-controls="mainNav"><span></span><span></span><span></span></button>
+          <button id="mobileMenuToggle" class="mobile-menu-toggle" type="button" aria-label="Open menu" aria-expanded="false" aria-controls="mainNav"><span></span><span></span><span></span></button>
         </header>
 
         <section class="view is-active" id="view-home">
@@ -303,13 +303,17 @@
               </div>
               <form id="orderForm" class="form-stack delivery-form">
                 <section id="checkoutAddressPanel" class="checkout-address-panel"></section>
-                <label>Delivery notes<textarea name="notes" rows="2"></textarea></label>
+                <details class="delivery-note-details">
+                  <summary>Add delivery note <span>Optional</span></summary>
+                  <label for="deliveryNotes" class="visually-hidden">Delivery note</label>
+                  <textarea id="deliveryNotes" name="notes" rows="2" placeholder="Instructions for delivery"></textarea>
+                </details>
                 <div class="cart-actions">
+                  <button class="primary" id="reviewOrderButton" type="submit">Review order</button>
                   <button class="special-order-trigger" id="openSpecialOrder" type="button">
                     <span>Special order</span>
-                    <small>Request larger quantities or out-of-stock products</small>
+                    <small>Larger quantities or out-of-stock products</small>
                   </button>
-                  <button class="primary" type="submit">Submit order</button>
                 </div>
               </form>
             </section>

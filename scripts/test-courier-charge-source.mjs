@@ -16,7 +16,7 @@ assert.match(serverSource, /priceSet:\s*moneyBag\(order\.deliveryFee\)/, "Courie
 assert.match(serverSource, /resolveCourierProduct\(\[product\], courier\)\?\.id !== product\.id/, "Public catalog should filter the Courier product.");
 
 assert.match(appSource, /<span>Courier<\/span>|<span>Courier<\/span>|courierAmount/, "Admin UI should expose courier settings.");
-assert.match(appSource, /locked-line/, "Customer cart should render courier as a locked line.");
+assert.match(appSource, /class="cart-line system-line"/, "Customer cart should show the required courier charge.");
 assert.doesNotMatch(appSource, /data-remove=.*courier/i, "Customer UI must not render a remove action for courier.");
 
 console.log("courier charge source checks passed");

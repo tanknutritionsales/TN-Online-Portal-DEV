@@ -207,19 +207,15 @@ function showAuth() {
 async function showApp(session) {
   state.user = session.user || null;
   state.admin = session.admin || null;
-  qs(".topbar").classList.toggle("admin-header", Boolean(state.admin));
   showScreen("app");
-  qsa(".customer-tab").forEach((tab) => {
-    tab.hidden = Boolean(state.admin);
-  });
   qsa(".customer-only").forEach((group) => { group.hidden = Boolean(state.admin); });
   qs(".admin-tab").hidden = !state.admin;
   qs("#themeToggle").hidden = false;
   qs("#accountName").textContent = state.admin ? state.admin.name || state.admin.username || "Admin" : state.user.name;
   applyTheme(state.admin?.preferences?.theme || state.user?.preferences?.theme || "light");
-  switchView(state.admin ? "admin" : "home");
+  switchView(state.admin ? "admin" : "home", { refreshAdmin: false });
   if (state.admin) {
-    await loadAdminOrders();
+    await Promise.all([loadAdminOrders(), loadCatalog()]);
     return;
   }
   state.selectedAddressId = defaultUserAddress()?.id || "";
@@ -259,12 +255,14 @@ function renderManual() {
   pageImage.alt = `Volume ${Number(manual.volume)}: ${manual.title}, page ${state.manualPage}`;
 }
 
-function switchView(view) {
+function switchView(view, { refreshAdmin = true } = {}) {
+  if (state.admin && !["home", "order", "manuals", "admin"].includes(view)) return;
   qsa(".tab").forEach((tab) => tab.classList.toggle("is-active", tab.dataset.view === view));
   qsa(".view").forEach((panel) => panel.classList.toggle("is-active", panel.id === `view-${view}`));
   qsa(".nav-dropdown").forEach((menu) => { menu.open = false; });
   qs("#mainNav")?.classList.remove("is-open");
   qs("#mobileMenuToggle")?.setAttribute("aria-expanded", "false");
+  qs("#mobileMenuToggle")?.setAttribute("aria-label", "Open menu");
   const titles = {
     home: "Home",
     order: "Shop",
@@ -278,7 +276,7 @@ function switchView(view) {
   if (view === "manuals") renderManual();
   if (view === "orders" && state.user) loadCustomerOrders();
   if (view === "account" && state.user) renderAccount();
-  if (view === "admin" && state.admin) loadAdminOrders();
+  if (view === "admin" && state.admin && refreshAdmin) loadAdminOrders();
 }
 
 async function initSession() {
@@ -700,7 +698,7 @@ function renderProductCard(product, extraClass = "") {
   const canAdd = available;
   const availabilityLabel = available ? "In stock" : "Out of stock";
   return `
-    <article class="product ${escapeHtml(extraClass)}">
+    <article class="product ${state.admin ? "admin-preview" : ""} ${escapeHtml(extraClass)}">
       <div class="product-image">
         ${
           product.image
@@ -716,10 +714,10 @@ function renderProductCard(product, extraClass = "") {
           <span>${money.format(variant?.price || 0)}</span>
           <span class="availability ${available ? "in-stock" : "out-stock"}">${availabilityLabel}</span>
         </div>
-        <div class="add-row">
+        ${state.admin ? "" : `<div class="add-row">
           <label>Qty<input type="number" min="1" max="999" value="1" ${canAdd ? "" : "disabled"}></label>
           <button type="button" data-add-product="${product.id}" ${canAdd ? "" : "disabled"}>${available ? "Add" : "Out"}</button>
-        </div>
+        </div>`}
       </div>
     </article>
   `;
@@ -849,6 +847,7 @@ function renderCatalogSummary(count) {
 }
 
 async function addToCart(productId, card) {
+  if (state.admin || !state.user) return;
   const product = state.products.find((entry) => entry.id === productId);
   const variant = product?.variant;
   if (!product || !variant) return;
@@ -895,8 +894,9 @@ function renderCart() {
   const specialButton = qs("#openSpecialOrder");
   if (specialButton) {
     const note = qs("small", specialButton);
-    if (note) note.textContent = specialOrders.enabled === false ? specialOrders.unavailableMessage || "Special orders are temporarily unavailable." : "Request larger quantities or out-of-stock products";
+    if (note) note.textContent = specialOrders.enabled === false ? specialOrders.unavailableMessage || "Special orders are temporarily unavailable." : "Larger quantities or out-of-stock products";
   }
+  qs("#reviewOrderButton").disabled = !items.length;
   qs("#cartCount").textContent = `${totalQuantity} item${totalQuantity === 1 ? "" : "s"}`;
   qs("#cartTotal").textContent = money.format(total);
   const bubble = qs("#cartBubble");
@@ -920,7 +920,10 @@ function renderCart() {
             <strong>${escapeHtml(item.productTitle)}</strong>
             <span>${item.quantity} x ${money.format(item.price)}</span>
           </div>
-          <button type="button" data-remove="${escapeHtml(item.variantId)}" aria-label="Remove ${escapeHtml(item.productTitle)}">x</button>
+          <div class="cart-line-end">
+            <strong>${money.format(item.price * item.quantity)}</strong>
+            <button type="button" data-remove="${escapeHtml(item.variantId)}" aria-label="Remove ${escapeHtml(item.productTitle)}" title="Remove product">&times;</button>
+          </div>
         </div>
       `,
     )
@@ -928,11 +931,8 @@ function renderCart() {
     (courierFee
       ? `
         <div class="cart-line system-line">
-          <div>
-            <strong>${escapeHtml(courierSettings().title || "Courier")}</strong>
-            <span>Required per order - ${money.format(courierFee)}</span>
-          </div>
-          <span class="locked-line">Fixed</span>
+          <strong>${escapeHtml(courierSettings().title || "Courier")}</strong>
+          <strong>${money.format(courierFee)}</strong>
         </div>
       `
       : "");
@@ -940,6 +940,7 @@ function renderCart() {
 
 async function submitOrder(event) {
   event.preventDefault();
+  if (state.admin || !state.user) return;
   const items = [...state.cart.values()];
   if (!items.length) return toast("Add at least one product first.");
   const selectedAddress = selectedCheckoutAddress();
@@ -961,6 +962,7 @@ async function submitOrder(event) {
 }
 
 async function confirmPendingOrder() {
+  if (state.admin || !state.user) return;
   const draft = state.pendingOrderDraft;
   if (!draft) return;
   try {
@@ -986,47 +988,48 @@ async function confirmPendingOrder() {
 
 function openOrderSummaryModal(draft) {
   const modal = qs("#orderFlowModal");
-  const title = draft.specialOrder ? "Special order summary" : "Order summary";
+  const title = draft.specialOrder ? "Review special order" : "Review order";
+  const deliveryNote = String(draft.delivery?.notes || "").trim();
   qs("#orderFlowTitle").textContent = title;
   qs("#orderFlowContent").innerHTML = `
-    <div class="summary-stack">
-      <section class="summary-panel">
-        <p class="eyebrow">Products</p>
-        <ul class="summary-lines">${draft.items.map((item) => `<li><span>${escapeHtml(item.productTitle)}</span><strong>${item.quantity} x ${money.format(item.price)}</strong></li>`).join("")}</ul>
+    <div class="checkout-review">
+      <section class="review-section">
+        <p class="eyebrow">Items</p>
+        <ul class="summary-lines">${draft.items.map((item) => `<li><span>${item.quantity} x ${escapeHtml(item.productTitle)}</span><strong>${money.format(Number(item.price || 0) * Number(item.quantity || 0))}</strong></li>`).join("")}</ul>
         ${courierAmountForDraft(draft) ? `<ul class="summary-lines system-summary-lines"><li><span>${escapeHtml(courierSettings().title || "Courier")}</span><strong>${money.format(courierAmountForDraft(draft))}</strong></li></ul>` : ""}
       </section>
-      <section class="summary-panel">
-        <p class="eyebrow">Delivery address</p>
+      <section class="review-section">
+        <p class="eyebrow">Deliver to</p>
         ${renderAddressBlock(draft.delivery.address)}
       </section>
-      ${draft.specialOrderNote ? `<section class="summary-panel"><p class="eyebrow">Request note</p><p>${escapeHtml(draft.specialOrderNote)}</p></section>` : ""}
+      ${deliveryNote ? `<section class="review-section"><p class="eyebrow">Delivery note</p><p>${escapeHtml(deliveryNote)}</p></section>` : ""}
+      ${draft.specialOrderNote ? `<section class="review-section"><p class="eyebrow">Request note</p><p>${escapeHtml(draft.specialOrderNote)}</p></section>` : ""}
       <div class="summary-total"><span>Total</span><strong>${money.format(orderDraftTotal(draft))}</strong></div>
     </div>
   `;
   qs("#orderFlowActions").innerHTML = `
-    <button class="secondary" type="button" data-close-order-flow>Cancel</button>
-    <button class="primary" type="button" data-confirm-order>${draft.specialOrder ? "Submit special order" : "Confirm order"}</button>
+    <button class="secondary" type="button" data-close-order-flow>${draft.specialOrder ? "Back" : "Back to cart"}</button>
+    <button class="primary" type="button" data-confirm-order>${draft.specialOrder ? "Send request" : "Place order"}</button>
   `;
   modal.hidden = false;
 }
 
 function showPaymentModal(order) {
   state.activePaymentOrder = order;
-  const paymentUnlocked = order.canPay || order.paymentLink || order.paymentStatus === "confirmed";
-  qs("#orderFlowTitle").textContent = `${paymentUnlocked ? "Payment details" : "Order details"} - ${order.reference}`;
+  const declined = order.specialOrder?.status === "declined";
+  const paymentUnlocked = !declined && (order.canPay || order.paymentLink || order.paymentStatus === "confirmed" || order.paymentIssue?.type === "paid_pending");
+  const paymentReference = order.paymentLink?.reference || order.reference;
+  qs("#orderFlowTitle").textContent = paymentUnlocked && order.paymentStatus !== "confirmed" && order.paymentIssue?.type !== "paid_pending" ? "Payment" : "Order details";
   qs("#orderFlowContent").innerHTML = `
-    <div class="summary-stack">
-      <section class="summary-panel">
-        <p class="eyebrow">Order</p>
-        <ul class="summary-lines">${order.items.map((item) => `<li><span>${escapeHtml(item.productTitle)}</span><strong>${item.quantity}</strong></li>`).join("")}</ul>
-        ${orderCourierLineHtml(order)}
-        <div class="summary-total compact"><span>Total</span><strong>${money.format(order.total)}</strong></div>
-      </section>
-      ${
-        paymentUnlocked
-          ? `${paymentInstructions(order)}${order.paymentStatus === "confirmed" ? `<p class="muted">${escapeHtml(order.customerStatus)}</p>` : ""}`
-          : `<section class="summary-panel"><p class="eyebrow">Status</p><h3>${escapeHtml(order.customerStatus)}</h3>${order.specialOrder ? renderSpecialOrderStatus(order.specialOrder) : ""}<p class="muted">${escapeHtml(paymentReviewNote(order))}</p></section>`
-      }
+    <div class="payment-view">
+      <div class="payment-overview">
+        <div><span class="payment-overview-label">${order.paymentLink?.reference ? "Payment reference" : "Order reference"}</span><strong>${escapeHtml(paymentReference)}</strong></div>
+        ${paymentUnlocked ? `<button type="button" data-copy-value="${escapeHtml(paymentReference)}" data-copy-label="${order.paymentLink?.reference ? "payment reference" : "order reference"}">Copy reference</button>` : ""}
+      </div>
+      ${!declined ? `<div class="payment-amount"><span>Total</span><strong>${money.format(order.total)}</strong></div>` : ""}
+      ${paymentUnlocked
+        ? paymentInstructions(order)
+        : `<div class="payment-state"><strong>${escapeHtml(order.customerStatus)}</strong>${order.specialOrder ? renderSpecialOrderStatus(order.specialOrder) : ""}${declined ? "" : `<p>${escapeHtml(paymentReviewNote(order))}</p>`}</div>`}
     </div>
   `;
   qs("#orderFlowActions").innerHTML = `<button class="primary" type="button" data-close-order-flow>Done</button>`;
@@ -1068,14 +1071,12 @@ function showOrderSubmittedModal(order) {
   state.activePaymentOrder = order;
   qs("#orderFlowTitle").textContent = `${order.specialOrder ? "Special order" : "Order"} submitted`;
   qs("#orderFlowContent").innerHTML = `
-    <div class="summary-stack">
-      <section class="summary-panel">
-        <p class="eyebrow">Reference</p>
-        <h3>${escapeHtml(order.reference)}</h3>
-        <p class="muted">${escapeHtml(order.customerStatus)}</p>
-        ${order.deliveryFee ? `<p><strong>${escapeHtml(courierSettings().title || "Courier")}:</strong> ${money.format(order.deliveryFee)}</p>` : ""}
-      </section>
-      <p class="muted">${escapeHtml(paymentReviewNote(order))}</p>
+    <div class="payment-view">
+      <div class="payment-overview">
+        <div><span class="payment-overview-label">Order reference</span><strong>${escapeHtml(order.reference)}</strong></div>
+        <button type="button" data-copy-value="${escapeHtml(order.reference)}" data-copy-label="order reference">Copy reference</button>
+      </div>
+      <p class="submission-note">${escapeHtml(paymentReviewNote(order))}</p>
     </div>
   `;
   qs("#orderFlowActions").innerHTML = `<button class="primary" type="button" data-close-order-flow>Done</button>`;
@@ -1092,16 +1093,12 @@ function orderDraftTotal(draft) {
   return draft.items.reduce((sum, item) => sum + Number(item.price || 0) * Number(item.quantity || 0), 0) + courierAmountForDraft(draft);
 }
 
-function orderCourierLineHtml(order) {
-  if (!Number(order.deliveryFee || 0)) return "";
-  return `<ul class="summary-lines system-summary-lines"><li><span>${escapeHtml(courierSettings().title || "Courier")}</span><strong>${money.format(order.deliveryFee)}</strong></li></ul>`;
-}
-
 function renderAddressBlock(address) {
   return `<address class="summary-address">${addressLines(address).map((line) => `<span>${escapeHtml(line)}</span>`).join("")}</address>`;
 }
 
 function openSpecialOrderModal() {
+  if (state.admin || !state.user) return;
   const specialOrders = fulfillmentSettings().specialOrders || defaultShopSettings().fulfillment.specialOrders;
   if (specialOrders.enabled === false) {
     toast(specialOrders.unavailableMessage || "Special orders are temporarily unavailable.");
@@ -1426,7 +1423,9 @@ function renderCustomerOrder(order) {
     ? `<button type="button" data-view-order-tracking="${escapeHtml(order.id)}">Track Order</button>`
     : "";
   const provider = orderProviderConfig(order);
-  const paymentActionLabel = order.paymentIssue?.type === "paid_pending" ? "Payment details" : order.canPay ? provider.payButtonLabel || "Payment details" : order.paymentLink ? "Payment details" : "View order";
+  const paymentActionLabel = order.paymentStatus === "confirmed" || order.paymentIssue?.type === "paid_pending" || order.specialOrder?.status === "declined"
+    ? "View order"
+    : order.paymentLink?.url ? provider.payButtonLabel || "Pay now" : order.paymentLink ? "Payment details" : "View order";
   const special = order.specialOrder ? renderSpecialOrderStatus(order.specialOrder) : "";
   const reviewNote = !order.paymentLink && order.paymentStatus !== "confirmed" && order.specialOrder?.status !== "declined"
     ? `<p class="muted">${escapeHtml(paymentReviewNote(order))}</p>`
@@ -1492,9 +1491,12 @@ function paymentReviewNote(order) {
   const provider = orderProviderConfig(order);
   const paymentLabel = provider.requireLink ? "payment link" : "payment details";
   if (order.specialOrder) {
-    return `Your special order request has been submitted. Our team will review availability and confirm what we can supply, typically within ${reviewWindow}. If approved, your ${paymentLabel} will appear here.`;
+    if (["accepted", "countered"].includes(order.specialOrder.status)) {
+      return `Your request has been reviewed. Your ${paymentLabel} will appear here when ready.`;
+    }
+    return `We'll review your request and confirm availability, typically within ${reviewWindow}. If approved, your ${paymentLabel} will appear in My orders.`;
   }
-  return `Your order has been submitted. Our team will review availability and send your ${paymentLabel}, typically within ${reviewWindow}.`;
+  return `We'll review availability and provide your ${paymentLabel}, typically within ${reviewWindow}. Check My orders for updates.`;
 }
 
 function paymentIssueLabel(type) {
@@ -1538,6 +1540,18 @@ function paymentInstructions(order) {
   const hasPaymentLink = Boolean(order.paymentLink);
   const provider = orderProviderConfig(order);
   const markedPaid = order.paymentIssue?.type === "paid_pending";
+  if (confirmed) {
+    return `<div class="payment-state"><strong>Payment confirmed</strong><p>${order.fulfillmentStatus === "shipped" ? "Your order has shipped. Tracking is available in My orders." : "Your order is being processed."}</p></div>`;
+  }
+  if (markedPaid) {
+    return `<div class="payment-state"><strong>Marked as paid</strong><p>Our team is verifying your payment. Your order will move to processing once confirmed.</p><button type="button" data-report-payment-issue="${escapeHtml(order.id)}">Payment help</button></div>`;
+  }
+  if (!hasPaymentLink) {
+    return `<div class="payment-state"><strong>Awaiting payment details</strong><p>${escapeHtml(paymentReviewNote(order))}</p></div>`;
+  }
+  if (provider.requireLink && !paymentLink.url) {
+    return `<div class="payment-state"><strong>Awaiting payment link</strong><p>We'll make the payment link available here once your order has been reviewed.</p></div>`;
+  }
   const eftLines = [
     provider.accountName && `Account: ${provider.accountName}`,
     provider.bankName && `Bank: ${provider.bankName}`,
@@ -1552,32 +1566,24 @@ function paymentInstructions(order) {
     ...eftLines,
     paymentLink.note || provider.customerInstructions,
   ].filter(Boolean);
-  const paymentActions = !confirmed && hasPaymentLink
-    ? `
-      <div class="payment-support-actions">
-        ${markedPaid ? "" : `<button type="button" data-paid-notice="${escapeHtml(order.id)}">I have paid</button>`}
-        <button type="button" data-report-payment-issue="${escapeHtml(order.id)}">${provider.requireLink ? "Payment link not working" : "Payment help"}</button>
-      </div>
-    `
-    : "";
+  const instruction = paymentLink.note || provider.customerInstructions || "";
+  const showInstruction = instruction && !(paymentLink.url && instruction === defaultShopSettings().payment.providers.yoco.customerInstructions);
   return `
-    <div class="payment-box${confirmed ? " is-confirmed" : ""}">
-      <div class="payment-line important">
-        <strong>${confirmed ? "Payment confirmed" : escapeHtml(provider.customerTitle || provider.label || "Payment details")}</strong>
-        <button type="button" data-copy-value="${escapeHtml(order.reference)}" data-copy-label="order reference">Copy reference</button>
+    <div class="payment-due">
+      ${paymentLink.url ? `<a class="primary button-link payment-link-button" href="${escapeHtml(paymentLink.url)}" target="_blank" rel="noopener">${escapeHtml(provider.payButtonLabel || "Pay now")}</a>` : ""}
+      ${eftLines.length ? `<div class="payment-bank-details"><strong>${escapeHtml(provider.customerTitle || provider.label || "Payment details")}</strong>${eftLines.map((line) => `<span>${escapeHtml(line)}</span>`).join("")}</div>` : ""}
+      ${showInstruction ? `<p>${escapeHtml(instruction)}</p>` : ""}
+      ${order.paymentIssue ? `<p class="payment-issue-note">${escapeHtml(customerPaymentNotice(order))}</p>` : ""}
+      <div class="payment-support-actions">
+        <button type="button" data-paid-notice="${escapeHtml(order.id)}">I have paid</button>
+        <button type="button" data-report-payment-issue="${escapeHtml(order.id)}">Payment help</button>
       </div>
-      <span>Amount: ${money.format(order.total)}</span>
-      ${paymentLink.reference ? `<span>Payment reference: ${escapeHtml(paymentLink.reference)}</span>` : ""}
-      ${eftLines.map((line) => `<span>${escapeHtml(line)}</span>`).join("")}
-      ${paymentLink.note ? `<span>${escapeHtml(paymentLink.note)}</span>` : provider.customerInstructions ? `<span>${escapeHtml(provider.customerInstructions)}</span>` : ""}
-      ${paymentLink.url && !confirmed ? `<a class="primary button-link payment-link-button" href="${escapeHtml(paymentLink.url)}" target="_blank" rel="noopener">${escapeHtml(provider.payButtonLabel || "Pay now")}</a>` : ""}
-      ${order.paymentIssue ? `<span class="payment-issue-note">${escapeHtml(customerPaymentNotice(order))}</span>` : ""}
-      ${!hasPaymentLink && !confirmed ? `<span>${escapeHtml(paymentReviewNote(order))}</span>` : ""}
-      ${paymentActions}
-      <div class="payment-copy-actions">
-        ${paymentLink.url ? `<button type="button" data-copy-value="${escapeHtml(paymentLink.url)}" data-copy-label="${escapeHtml(provider.copyLabel || "payment link")}">Copy ${escapeHtml(provider.copyLabel || "payment link")}</button>` : ""}
-        <button type="button" data-copy-value="${escapeHtml(paymentLines.join("\n"))}" data-copy-label="payment details">Copy payment details</button>
-      </div>
+      <details class="payment-more"><summary>More options</summary>
+        <div class="payment-copy-actions">
+          ${paymentLink.url ? `<button type="button" data-copy-value="${escapeHtml(paymentLink.url)}" data-copy-label="${escapeHtml(provider.copyLabel || "payment link")}">Copy ${escapeHtml(provider.copyLabel || "payment link")}</button>` : ""}
+          <button type="button" data-copy-value="${escapeHtml(paymentLines.join("\n"))}" data-copy-label="payment details">Copy payment details</button>
+        </div>
+      </details>
     </div>
   `;
 }
