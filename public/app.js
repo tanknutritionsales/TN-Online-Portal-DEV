@@ -25,6 +25,7 @@ const state = {
   specialOrderItems: [],
   specialProductSearch: "",
   selectedSpecialProductId: "",
+  quickViewProductId: "",
   editingAdminAccountId: "",
   systemStatus: null,
   pendingAccountRemoval: null,
@@ -197,6 +198,7 @@ function showScreen(screen) {
 }
 
 function showAuth() {
+  closeProductQuickView();
   state.user = null;
   state.admin = null;
   qs("#loginForm").reset();
@@ -699,13 +701,13 @@ function renderProductCard(product, extraClass = "") {
   const availabilityLabel = available ? "In stock" : "Out of stock";
   return `
     <article class="product ${state.admin ? "admin-preview" : ""} ${escapeHtml(extraClass)}">
-      <div class="product-image">
+      <button class="product-image" type="button" data-view-product="${escapeHtml(product.id)}" aria-label="View ${escapeHtml(product.title)}" aria-haspopup="dialog" aria-controls="productQuickView" title="View product">
         ${
           product.image
             ? `<img src="${escapeHtml(product.image)}" alt="${escapeHtml(product.imageAlt || product.title)}">`
             : `<div class="image-fallback">${escapeHtml(fallbackLabel(product))}</div>`
         }
-      </div>
+      </button>
       <div class="product-image-divider" aria-hidden="true"></div>
       <div class="product-body">
         <p class="eyebrow">${escapeHtml(product.vendor)}</p>
@@ -721,6 +723,61 @@ function renderProductCard(product, extraClass = "") {
       </div>
     </article>
   `;
+}
+
+function openProductQuickView(productId) {
+  const product = state.products.find((entry) => entry.id === productId);
+  if (!product || (!state.user && !state.admin)) return;
+  const available = Boolean(product.variant?.inStock);
+  state.quickViewProductId = product.id;
+  qs("#quickViewContent").innerHTML = `
+    <div class="quick-view-image">
+      ${product.image
+        ? `<img src="${escapeHtml(product.image)}" alt="${escapeHtml(product.imageAlt || product.title)}">`
+        : `<div class="image-fallback">${escapeHtml(fallbackLabel(product))}</div>`}
+    </div>
+    <div class="quick-view-details">
+      <div class="quick-view-heading">
+        ${product.vendor ? `<p class="eyebrow">${escapeHtml(product.vendor)}</p>` : ""}
+        <h2 id="quickViewTitle">${escapeHtml(product.title)}</h2>
+      </div>
+      <span class="quick-view-availability ${available ? "in-stock" : "out-stock"}">${available ? "In stock" : "Out of stock"}</span>
+      <strong class="quick-view-price">${money.format(product.variant?.price || 0)}</strong>
+      ${state.admin ? "" : `
+        <form class="quick-view-purchase" id="quickViewPurchase">
+          <div class="quick-view-add-row">
+            <label for="quickViewQuantity">Quantity
+              <input id="quickViewQuantity" type="number" min="1" max="999" step="1" value="1" inputmode="numeric" required ${available ? "" : "disabled"}>
+            </label>
+            <button class="primary" type="submit" ${available ? "" : "disabled"}>${available ? "Add to cart" : "Out of stock"}</button>
+          </div>
+          <p class="quick-view-feedback" data-product-feedback role="status"></p>
+          <div class="quick-view-cart" id="quickViewCart" hidden>
+            <span id="quickViewCartQuantity" class="muted"></span>
+            <button class="secondary" type="button" id="quickViewCartButton" hidden>View cart</button>
+          </div>
+        </form>`}
+    </div>
+  `;
+  renderQuickViewCart();
+  document.body.classList.add("product-quick-view-open");
+  qs("#productQuickView").showModal();
+}
+
+function closeProductQuickView() {
+  const dialog = qs("#productQuickView");
+  if (dialog?.open) dialog.close();
+}
+
+function renderQuickViewCart() {
+  const product = state.products.find((entry) => entry.id === state.quickViewProductId);
+  const quantity = state.cart.get(product?.variant?.id)?.quantity || 0;
+  const summary = qs("#quickViewCartQuantity");
+  if (summary) summary.textContent = quantity ? `${quantity} in your cart` : "";
+  const cartButton = qs("#quickViewCartButton");
+  if (cartButton) cartButton.hidden = quantity === 0;
+  const cartSummary = qs("#quickViewCart");
+  if (cartSummary) cartSummary.hidden = quantity === 0;
 }
 
 function renderProductPager(targetId, totalProducts) {
@@ -852,8 +909,14 @@ async function addToCart(productId, card) {
   const variant = product?.variant;
   if (!product || !variant) return;
   if (!variant.inStock) return toast("Use Special order for out-of-stock or larger requests.");
-  const requested = Math.max(1, Number(qs('input[type="number"]', card).value || 1));
-  const quantity = Math.min(requested, 999);
+  const quantityInput = qs('input[type="number"]', card);
+  if (!quantityInput || !quantityInput.reportValidity()) return;
+  const quantity = Math.min(Math.max(1, Number(quantityInput.value || 1)), 999);
+  const button = qs('[data-add-product], button[type="submit"]', card);
+  if (button?.disabled) return;
+  const feedback = qs("[data-product-feedback]", card);
+  if (feedback) feedback.textContent = "";
+  const buttonLabel = button?.textContent;
   const existing = state.cart.get(variant.id);
   const nextItem = {
     variantId: variant.id,
@@ -865,15 +928,27 @@ async function addToCart(productId, card) {
   };
   const nextCart = new Map(state.cart);
   nextCart.set(variant.id, nextItem);
+  if (button) {
+    button.disabled = true;
+    button.setAttribute("aria-busy", "true");
+    if (feedback) button.textContent = "Adding...";
+  }
   try {
     await checkCart([...nextCart.values()], false);
+    state.cart = nextCart;
+    renderCart();
+    if (feedback) feedback.textContent = "Added to cart.";
+    else toast("Added to cart.");
   } catch (error) {
-    toast(error.message);
-    return;
+    if (feedback) feedback.textContent = error.message;
+    else toast(error.message);
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.removeAttribute("aria-busy");
+      if (feedback) button.textContent = buttonLabel;
+    }
   }
-  state.cart = nextCart;
-  renderCart();
-  toast("Added to cart.");
 }
 
 async function checkCart(items, specialOrder) {
@@ -885,6 +960,7 @@ async function checkCart(items, specialOrder) {
 
 function renderCart() {
   renderCheckoutAddresses();
+  renderQuickViewCart();
   const items = [...state.cart.values()];
   const totalQuantity = items.reduce((sum, item) => sum + item.quantity, 0);
   const subtotal = items.reduce((sum, item) => sum + item.price * item.quantity, 0);
@@ -3085,6 +3161,14 @@ document.addEventListener("click", (event) => {
   const add = event.target.closest("[data-add-product]");
   if (add) addToCart(add.dataset.addProduct, add.closest(".product"));
 
+  const viewProduct = event.target.closest("[data-view-product]");
+  if (viewProduct) openProductQuickView(viewProduct.dataset.viewProduct);
+  if (event.target.closest("[data-close-product]")) closeProductQuickView();
+  if (event.target.closest("#quickViewCartButton")) {
+    closeProductQuickView();
+    switchView("cart");
+  }
+
   const remove = event.target.closest("[data-remove]");
   if (remove) {
     state.cart.delete(remove.dataset.remove);
@@ -3313,6 +3397,10 @@ document.addEventListener("input", (event) => {
 });
 
 document.addEventListener("submit", (event) => {
+  if (event.target.matches("#quickViewPurchase")) {
+    event.preventDefault();
+    addToCart(state.quickViewProductId, event.target);
+  }
   if (event.target.matches("#loginForm")) login(event);
   if (event.target.matches("#registerForm")) register(event);
   if (event.target.matches("#orderForm")) submitOrder(event);
@@ -3330,6 +3418,15 @@ document.addEventListener("submit", (event) => {
 });
 
 qs("#logoutButton").addEventListener("click", logout);
+qs("#productQuickView").addEventListener("close", () => {
+  state.quickViewProductId = "";
+  document.body.classList.remove("product-quick-view-open");
+});
+qs("#productQuickView").addEventListener("click", (event) => {
+  if (event.target !== event.currentTarget) return;
+  const bounds = event.currentTarget.getBoundingClientRect();
+  if (event.clientX < bounds.left || event.clientX > bounds.right || event.clientY < bounds.top || event.clientY > bounds.bottom) closeProductQuickView();
+});
 qs("#themeToggle").addEventListener("click", toggleTheme);
 qs("#refreshCatalog").addEventListener("click", loadCatalog);
 qs("#refreshOrders").addEventListener("click", loadCustomerOrders);
