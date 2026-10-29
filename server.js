@@ -3,8 +3,11 @@ import { existsSync, readFileSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { createHmac, randomBytes, randomUUID, scryptSync, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomBytes, randomUUID, scryptSync, timingSafeEqual } from "node:crypto";
 import { findOfficeShortfalls } from "./lib/fulfillment-stock.mjs";
+import { normalizeProductContent, productFacts } from "./public/product-content.js";
+import { createCustomerMessageStore } from "./lib/customer-message-store.mjs";
+import { normalizeCustomerCare, emailSetupStatus, createOrderEmail, deliverQueuedEmail } from "./lib/customer-notifications.mjs";
 
 const moduleUrl = import.meta.url || "";
 const modulePath = moduleUrl ? fileURLToPath(moduleUrl) : "";
@@ -43,6 +46,12 @@ const proofBlobStoreName = process.env.PROOF_BLOB_STORE || env.PROOF_BLOB_STORE 
 const retailSharkInternalUrl = process.env.RETAIL_SHARK_INTERNAL_URL || env.RETAIL_SHARK_INTERNAL_URL || "";
 const retailSharkInternalToken = process.env.RETAIL_SHARK_INTERNAL_TOKEN || env.RETAIL_SHARK_INTERNAL_TOKEN || "";
 const termsVersion = "research-use-v1-2026-10-08";
+const customerMessages = createCustomerMessageStore({
+  database: async () => { await ensureDatabaseSchema(); return database(); },
+  useDatabase: dataStorageUsesDatabase,
+  filePath: path.join(dataDir, "customer-messages.json"),
+  localAllowed: !isProduction && !dataStorageUsesBlobs(),
+});
 
 let shopifyClientCredentialsToken = null;
 let databasePool = null;
@@ -517,6 +526,7 @@ function applyRouteRateLimit(req, url) {
   if (url.pathname === "/api/auth/login" || url.pathname === "/api/auth/admin-login") return rateLimit(req, "login", 12, 10 * 60 * 1000);
   if (url.pathname === "/api/auth/register") return rateLimit(req, "register", 5, 60 * 60 * 1000);
   if (url.pathname === "/api/orders") return rateLimit(req, "orders", 20, 10 * 60 * 1000);
+  if (url.pathname === "/api/support") return rateLimit(req, "support", 10, 10 * 60 * 1000);
   if (url.pathname.includes("/payment") || url.pathname.includes("/proof")) return rateLimit(req, "payment", 40, 10 * 60 * 1000);
 }
 
@@ -695,6 +705,8 @@ function defaultShopSettings() {
       standardFormat: "OP-{YYYY}{MM}{DD}-{RAND4}",
       specialFormat: "SO-{YYYY}{MM}{DD}-{RAND4}",
     },
+    productContent: {},
+    customerCare: normalizeCustomerCare(),
   };
 }
 
@@ -721,6 +733,8 @@ function normalizeShopSettings(input = {}) {
     payment: normalizePaymentSettings(payment, defaults.payment, providerDefaults),
     courier: normalizeCourierSettings(courier, defaults.courier),
     fulfillment: normalizeFulfillmentSettings(fulfillment, defaults.fulfillment),
+    productContent: normalizeProductContent(input.productContent),
+    customerCare: normalizeCustomerCare(input.customerCare),
     references: {
       standardFormat: normalizeReferenceFormat(references.standardFormat || defaults.references.standardFormat, defaults.references.standardFormat),
       specialFormat: normalizeReferenceFormat(references.specialFormat || defaults.references.specialFormat, defaults.references.specialFormat),
@@ -1511,7 +1525,8 @@ function customerStatus(order) {
   if (order.specialOrder?.status === "pending") return "Special order review";
   if (order.specialOrder?.status === "declined") return "Special order declined";
   if (order.fulfillmentStatus === "shipped") return "Shipped";
-  if (order.paymentStatus === "confirmed" || order.paymentIssue?.type === "paid_pending") return "Marked as paid, processing";
+  if (order.paymentStatus === "confirmed") return "Processing";
+  if (order.paymentIssue?.type === "paid_pending") return "Marked as paid, processing";
   if (specialOrderReadyForPayment(order) && order.paymentLink) return "Payment required";
   if (specialOrderReadyForPayment(order)) return "Awaiting payment link";
   if (order.specialOrder?.status === "countered") return "Special order countered";
@@ -1748,6 +1763,7 @@ async function createOrder(input, user) {
   };
   data.orders.unshift(order);
   await writeOrdersData(data);
+  await queueOrderEmail(order, "order_received", now);
   return order;
 }
 
@@ -1861,6 +1877,7 @@ async function confirmPayment(orderId, input, admin) {
   }
   order.updatedAt = new Date().toISOString();
   await writeOrdersData(data);
+  if (!wasConfirmed) await queueOrderEmail(order, "payment_confirmed", order.paymentConfirmedAt);
   return order;
 }
 
@@ -1894,6 +1911,7 @@ async function attachPaymentLink(orderId, input, admin) {
   order.updatedAt = now;
   order.statusEvents.push({ at: now, actor: "admin", type: "payment_link_attached", label: `${provider.label || "Payment"} attached` });
   await writeOrdersData(data);
+  await queueOrderEmail(order, "payment_ready", now);
   return order;
 }
 
@@ -2141,6 +2159,7 @@ async function updateExternalTracking(orderId, input, admin) {
   order.updatedAt = now;
   order.statusEvents.push({ at: now, actor: "admin", type: "external_tracking_added", label: "External shipment tracking added" });
   await writeOrdersData(data);
+  await queueOrderEmail(order, "shipped", `external:${now}`);
   return order;
 }
 
@@ -2165,6 +2184,7 @@ async function markShipped(orderId) {
   if (shopifyFulfillmentItems(order).length && shopifyOrderSyncEnabled && !order.shopifyOrder?.id) {
     throw Object.assign(new Error("This order must complete stock transfer and Shopify processing before it can be marked as shipped."), { status: 409 });
   }
+  if (order.officeShippedAt) return order;
   const now = new Date().toISOString();
   order.officeShippedAt = now;
   if (!externalFulfillmentItems(order).length || order.externalTracking?.number) {
@@ -2174,7 +2194,102 @@ async function markShipped(orderId) {
   order.updatedAt = now;
   order.statusEvents.push({ at: now, actor: "staff", type: "shipped", label: "Order shipped" });
   await writeOrdersData(data);
+  await queueOrderEmail(order, "shipped", `office:${now}`);
   return order;
+}
+
+function emailRuntimeConfig(care) {
+  return {
+    apiKey: process.env.RESEND_API_KEY || env.RESEND_API_KEY || "",
+    from: String(process.env.EMAIL_FROM || env.EMAIL_FROM || "").trim(),
+    portalUrl: process.env.PORTAL_PUBLIC_URL || env.PORTAL_PUBLIC_URL || process.env.URL || "https://online-portal-tn.netlify.app/",
+    senderName: care.senderName,
+    replyTo: care.supportEmail,
+    allowed: Boolean(isProduction && dataStorageUsesDatabase() && (!process.env.NETLIFY || process.env.CONTEXT === "production")),
+  };
+}
+
+async function queueOrderEmail(order, kind, eventId, { send = true, care: suppliedCare } = {}) {
+  try {
+    const care = suppliedCare || (await readShopSettingsData()).settings.customerCare;
+    if (!care.events[kind]) return;
+    const config = emailRuntimeConfig(care);
+    const setup = emailSetupStatus(config);
+    const message = createOrderEmail(order, kind, { portalUrl: config.portalUrl, care, eventId });
+    message.status = !care.emailEnabled ? "disabled" : !setup.configured ? "setup_required" : "pending";
+    const inserted = await customerMessages.insert(message);
+    if (send && inserted.created && message.status === "pending") await deliverQueuedEmail(customerMessages, message.id, config);
+  } catch {
+    console.warn("Customer notification could not be queued; the order was saved.");
+  }
+}
+
+export async function flushCustomerNotifications() {
+  const care = (await readShopSettingsData()).settings.customerCare;
+  const config = emailRuntimeConfig(care);
+  const setup = emailSetupStatus(config);
+  if (!care.emailEnabled || !setup.configured) return { sent: 0, paused: true };
+  const orders = (await readOrdersData()).orders;
+  const cutoff = Math.max(Date.now() - 23 * 60 * 60 * 1000, Date.parse(care.emailEnabledAt || new Date().toISOString()));
+  const candidates = [];
+  for (const order of orders) {
+    for (const event of order.statusEvents || []) {
+      if (!Number.isFinite(Date.parse(event.at)) || Date.parse(event.at) < cutoff) continue;
+      const kind = { submitted: "order_received", payment_link_attached: "payment_ready", payment_confirmed: "payment_confirmed", shipped: "shipped", external_tracking_added: "shipped" }[event.type];
+      if (!kind || !care.events[kind] || (kind === "payment_ready" && (order.paymentStatus === "confirmed" || order.specialOrder?.status === "declined"))) continue;
+      const eventId = event.type === "shipped" ? `office:${event.at}` : event.type === "external_tracking_added" ? `external:${event.at}` : event.at;
+      const { id } = createOrderEmail(order, kind, { portalUrl: config.portalUrl, care, eventId });
+      candidates.push({ order, kind, eventId, id });
+    }
+  }
+  // One lookup avoids re-inserting every historical event on each short scheduled run.
+  const existing = await customerMessages.existingIds(candidates.map((entry) => entry.id));
+  for (const { order, kind, eventId } of candidates.filter((entry) => !existing.has(entry.id)).slice(0, 10)) {
+    await queueOrderEmail(order, kind, eventId, { send: false, care });
+  }
+  const pending = (await customerMessages.list({ kind: "email", statuses: ["pending", "failed", "sending"], limit: 100 }))
+    .filter((message) => message.attempts < 5 && (!message.nextAttemptAt || Date.parse(message.nextAttemptAt) <= Date.now()) && (message.status !== "sending" || Date.parse(message.lockedUntil || 0) <= Date.now()))
+    .sort((a, b) => a.createdAt.localeCompare(b.createdAt)).slice(0, 2);
+  const results = await Promise.all(pending.map(async (message) => {
+    const order = orders.find((entry) => entry.id === message.orderId);
+    if (!order || !care.events[message.event] || (message.event === "payment_ready" && (order.paymentStatus === "confirmed" || order.specialOrder?.status === "declined"))) {
+      return customerMessages.update(message.id, (entry) => ({ ...entry, status: "superseded", updatedAt: new Date().toISOString() }));
+    }
+    return deliverQueuedEmail(customerMessages, message.id, config);
+  }));
+  return { sent: results.filter((message) => message?.status === "sent").length, processed: results.length };
+}
+
+function publicSupportRequest(message) {
+  return { id: message.id, orderId: message.orderId || "", reference: message.reference || "", topic: message.topic, message: message.message, replies: message.replies || [], status: message.status, createdAt: message.createdAt, updatedAt: message.updatedAt };
+}
+
+async function createSupportRequest(input, user) {
+  const text = cleanText(input.message, 1500);
+  if (text.length < 5) throw Object.assign(new Error("Please enter a message of at least 5 characters."), { status: 400 });
+  const orderId = cleanText(input.orderId, 180);
+  const order = orderId ? (await readOrdersData()).orders.find((entry) => entry.id === orderId && entry.customer?.id === user.id) : null;
+  if (orderId && !order) throw Object.assign(new Error("Order not found."), { status: 404 });
+  const topic = ["Order enquiry", "Payment", "Delivery", "Other"].includes(input.topic) ? input.topic : "Other";
+  const requestKey = cleanText(input.idempotencyKey, 180) || randomUUID();
+  const id = `support-${createHash("sha256").update(`${user.id}:${requestKey}`).digest("hex")}`;
+  const now = new Date().toISOString();
+  const result = await customerMessages.insert({ id, kind: "support", customerId: user.id, customerName: user.name, customerEmail: user.email, orderId: order?.id || null, reference: order?.reference || "", topic, message: text, replies: [], status: "open", createdAt: now, updatedAt: now });
+  return publicSupportRequest(result.message);
+}
+
+async function replyToSupportRequest(id, input, admin) {
+  const reply = cleanText(input.reply, 1500);
+  if (reply.length < 2) throw Object.assign(new Error("Enter a reply for the customer."), { status: 400 });
+  const updated = await customerMessages.update(id, (message) => {
+    if (message.kind !== "support") return null;
+    const replyKey = cleanText(input.idempotencyKey, 180) || randomUUID();
+    if ((message.replies || []).some((entry) => entry.id === replyKey)) return message;
+    const now = new Date().toISOString();
+    return { ...message, replies: [...(message.replies || []), { id: replyKey, message: reply, at: now, author: cleanText(admin.name || "Customer support", 120) }].slice(-30), status: input.status === "open" ? "open" : "resolved", updatedAt: now };
+  });
+  if (!updated) throw Object.assign(new Error("Support request not found."), { status: 404 });
+  return updated;
 }
 
 async function syncOrderToShopify(order, admin, options = {}) {
@@ -2499,6 +2614,13 @@ async function catalogProducts() {
           vendor
           productType
           tags
+          media(first: 8) {
+            nodes {
+              ... on MediaImage {
+                image { url altText }
+              }
+            }
+          }
           featuredMedia {
             preview {
               image {
@@ -2797,6 +2919,8 @@ function normalizeCatalogProduct(product, collectionImages = new Map()) {
   const inventoryQuantity = Number(variant?.inventoryQuantity);
   const hasQuantity = Number.isFinite(inventoryQuantity);
   const brandImage = collectionImageForVendor(product.vendor, collectionImages);
+  const featuredImage = product.featuredMedia?.preview?.image;
+  const images = [...new Map([featuredImage, ...(product.media?.nodes || []).map((media) => media.image)].filter((image) => image?.url).map((image) => [image.url, { url: image.url, alt: image.altText || product.title }])).values()].slice(0, 8);
   const normalized = {
     id: product.id,
     title: product.title,
@@ -2806,6 +2930,7 @@ function normalizeCatalogProduct(product, collectionImages = new Map()) {
     tags: Array.isArray(product.tags) ? product.tags.filter(Boolean) : [],
     image: product.featuredMedia?.preview?.image?.url || "",
     imageAlt: product.featuredMedia?.preview?.image?.altText || product.title,
+    images,
     brandImage: brandImage?.image || "",
     brandImageAlt: brandImage?.imageAlt || product.vendor || "",
     variant: variant
@@ -2858,7 +2983,7 @@ async function cacheCatalogImages(products) {
     products.map(async (product) => {
       const image = await cacheRemoteImage(product.image, product.handle || product.id);
       const brandImage = await cacheRemoteImage(product.brandImage, `brand-${product.vendor || product.brandImageAlt || product.id}`);
-      return { ...product, image, brandImage };
+      return { ...product, image, brandImage, images: (product.images || []).map((entry, index) => index === 0 ? { ...entry, url: image || entry.url } : entry) };
     }),
   );
 }
@@ -3090,7 +3215,7 @@ function publicCatalogPayload(catalog, settings = defaultShopSettings()) {
   return {
     ...catalog,
     filters: buildCatalogFilters(products),
-    products: products.map(publicCatalogProduct),
+    products: products.map((product) => ({ ...publicCatalogProduct(product), facts: productFacts(product, settings.productContent?.[product.id]) })),
   };
 }
 
@@ -3125,6 +3250,46 @@ async function handleApi(req, res, url) {
     await requirePortalAccess(req);
     const data = await readShopSettingsData();
     return json(res, 200, { ok: true, settings: data.settings });
+  }
+  if (req.method === "GET" && url.pathname === "/api/support") {
+    const user = await requireCustomer(req);
+    const messages = await customerMessages.list({ customerId: user.id, kind: "support", limit: 100 });
+    return json(res, 200, { ok: true, requests: messages.map(publicSupportRequest) });
+  }
+  if (req.method === "POST" && url.pathname === "/api/support") {
+    const user = await requireCustomer(req);
+    const request = await createSupportRequest(await bodyJson(req), user);
+    return json(res, 201, { ok: true, request });
+  }
+  if (req.method === "GET" && url.pathname === "/api/admin/customer-care") {
+    requireAdmin(req);
+    const care = (await readShopSettingsData()).settings.customerCare;
+    const [requests, emails] = await Promise.all([customerMessages.list({ kind: "support", limit: 200 }), customerMessages.list({ kind: "email", limit: 80 })]);
+    return json(res, 200, { ok: true, requests, emails: emails.map(({ id, reference, event, to, subject, status, attempts, lastError, sentAt, createdAt }) => ({ id, reference, event, to, subject, status, attempts, lastError, sentAt, createdAt })), emailSetup: { ...emailSetupStatus(emailRuntimeConfig(care)), enabled: care.emailEnabled } });
+  }
+  const supportReplyMatch = url.pathname.match(/^\/api\/admin\/support\/([^/]+)\/reply$/);
+  if (req.method === "POST" && supportReplyMatch) {
+    const admin = requireAdmin(req);
+    const request = await replyToSupportRequest(decodeURIComponent(supportReplyMatch[1]), await bodyJson(req), admin);
+    return json(res, 200, { ok: true, request });
+  }
+  const emailRetryMatch = url.pathname.match(/^\/api\/admin\/notifications\/([^/]+)\/retry$/);
+  if (req.method === "POST" && emailRetryMatch) {
+    requireAdmin(req);
+    const care = (await readShopSettingsData()).settings.customerCare;
+    const config = emailRuntimeConfig(care);
+    if (!care.emailEnabled || !emailSetupStatus(config).configured) throw Object.assign(new Error("Configure and enable email delivery first."), { status: 409 });
+    const id = decodeURIComponent(emailRetryMatch[1]);
+    const orders = (await readOrdersData()).orders;
+    const message = await customerMessages.update(id, (entry) => {
+      if (entry.kind !== "email" || ["sent", "expired", "superseded"].includes(entry.status) || (entry.status === "sending" && Date.parse(entry.lockedUntil || 0) > Date.now())) return null;
+      const order = orders.find((item) => item.id === entry.orderId);
+      if (!order || !care.events[entry.event] || Date.now() - Date.parse(entry.createdAt) >= 23 * 60 * 60 * 1000 || (entry.event === "payment_ready" && (order.paymentStatus === "confirmed" || order.specialOrder?.status === "declined"))) return null;
+      return { ...entry, status: "pending", attempts: 0, nextAttemptAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+    });
+    if (!message) throw Object.assign(new Error("This notification is not available for retry."), { status: 409 });
+    const updated = await deliverQueuedEmail(customerMessages, id, config);
+    return json(res, 200, { ok: true, status: updated?.status || "pending" });
   }
   if (req.method === "POST" && url.pathname === "/api/cart/check") {
     await requireCustomer(req);
@@ -3306,7 +3471,14 @@ async function handleApi(req, res, url) {
   }
   if (req.method === "POST" && url.pathname === "/api/admin/shop-settings") {
     requireAdmin(req);
-    const data = await writeShopSettingsData(await bodyJson(req));
+    const existing = (await readShopSettingsData()).settings;
+    const input = await bodyJson(req);
+    if (input.customerCare) {
+      const care = normalizeCustomerCare({ ...existing.customerCare, ...input.customerCare, events: { ...existing.customerCare.events, ...input.customerCare.events } });
+      care.emailEnabledAt = care.emailEnabled && (!existing.customerCare.emailEnabled || !existing.customerCare.emailEnabledAt) ? new Date().toISOString() : existing.customerCare.emailEnabledAt;
+      input.customerCare = care;
+    }
+    const data = await writeShopSettingsData({ ...existing, ...input });
     return json(res, 200, { ok: true, settings: data.settings });
   }
   const adminProofMatch = url.pathname.match(/^\/api\/admin\/orders\/([^/]+)\/proof$/);
@@ -3380,6 +3552,7 @@ export async function handleRequest(req, res) {
     if (url.pathname.startsWith("/api/")) return await handleApi(req, res, url);
     return await serveStatic(res, url.pathname);
   } catch (error) {
+    if (url.pathname === "/api/support" && !error.status) return json(res, 503, { ok: false, error: "Customer support is temporarily unavailable. Please try again shortly." });
     json(res, error.status || 500, { ok: false, error: error.message || "Something went wrong." });
   }
 }

@@ -1,3 +1,6 @@
+import { cartStorageKey, readSavedCart, saveCart } from "/cart-storage.js";
+import { productFacts } from "/product-content.js";
+
 const money = new Intl.NumberFormat("en-ZA", { style: "currency", currency: "ZAR" });
 
 const state = {
@@ -11,6 +14,11 @@ const state = {
   selectedTypes: new Set(),
   inStockOnly: false,
   search: "",
+  sort: "recommended",
+  catalogReady: false,
+  cartRestoredFor: "",
+  cartBusy: false,
+  cartWarning: "",
   theme: "light",
   productPage: 1,
   productsPerPage: 30,
@@ -19,6 +27,14 @@ const state = {
   adminOrders: [],
   adminStock: new Map(),
   customerOrders: [],
+  customerSupport: [],
+  customerSupportLoaded: false,
+  customerSupportError: "",
+  customerOrdersLoaded: false,
+  adminCustomerCare: null,
+  adminCareView: "support",
+  adminSupportFilter: "open",
+  handledOrderLink: false,
   adminView: "pending",
   adminAccounts: [],
   adminAccountFilter: "all",
@@ -26,6 +42,9 @@ const state = {
   specialProductSearch: "",
   selectedSpecialProductId: "",
   quickViewProductId: "",
+  quickViewImageIndex: 0,
+  adminFactsProductId: "",
+  adminFactsSearch: "",
   editingAdminAccountId: "",
   systemStatus: null,
   pendingAccountRemoval: null,
@@ -35,6 +54,7 @@ const state = {
   selectedAddressId: "",
   pendingOrderDraft: null,
   activePaymentOrder: null,
+  orderFlowView: "",
   cart: new Map(),
   adminOrderSearch: "",
   adminOrderFilter: "all",
@@ -77,6 +97,14 @@ const manuals = {
 
 const termsVersion = "research-use-v1-2026-10-08";
 let pendingRegistrationPayload = null;
+let researchNoticeDeadline = 0;
+let researchNoticeTimer = null;
+let researchNoticeAcknowledged = false;
+let productImagePanzoom = null;
+let productImageLoadId = 0;
+let customerPollTimer = null;
+let lastCustomerPoll = 0;
+let supportRequestKey = "";
 
 const qs = (selector, root = document) => root.querySelector(selector);
 const qsa = (selector, root = document) => [...root.querySelectorAll(selector)];
@@ -161,6 +189,8 @@ function defaultShopSettings() {
       standardFormat: "OP-{YYYY}{MM}{DD}-{RAND4}",
       specialFormat: "SO-{YYYY}{MM}{DD}-{RAND4}",
     },
+    productContent: {},
+    customerCare: { supportEmail: "", whatsappNumber: "", supportHours: "", emailEnabled: false, senderName: "Tank Nutrition", events: { order_received: true, payment_ready: true, payment_confirmed: true, shipped: true } },
   };
 }
 
@@ -199,8 +229,20 @@ function showScreen(screen) {
 
 function showAuth() {
   closeProductQuickView();
+  closeOrderFlowModal();
+  if (qs("#customerSupportDialog").open) qs("#customerSupportDialog").close();
+  clearInterval(customerPollTimer);
   state.user = null;
   state.admin = null;
+  state.cartRestoredFor = "";
+  state.cartWarning = "";
+  state.catalogReady = false;
+  state.customerOrders = [];
+  state.customerSupport = [];
+  state.customerSupportLoaded = false;
+  state.customerSupportError = "";
+  qs("#supportReplyBadge").hidden = true;
+  state.customerOrdersLoaded = false;
   qs("#loginForm").reset();
   applyTheme("light");
   showScreen("login");
@@ -210,7 +252,7 @@ async function showApp(session) {
   state.user = session.user || null;
   state.admin = session.admin || null;
   showScreen("app");
-  qsa(".customer-only").forEach((group) => { group.hidden = Boolean(state.admin); });
+  qsa(".customer-only").forEach((group) => { group.hidden = Boolean(state.admin) || group.id === "homeOrderUpdates"; });
   qs(".admin-tab").hidden = !state.admin;
   qs("#themeToggle").hidden = false;
   qs("#accountName").textContent = state.admin ? state.admin.name || state.admin.username || "Admin" : state.user.name;
@@ -224,8 +266,8 @@ async function showApp(session) {
   fillDeliveryForm(selectedCheckoutAddress() || state.user.defaultAddress);
   renderAccount();
   renderCheckoutAddresses();
-  await loadCatalog();
-  await loadCustomerOrders();
+  startCustomerPolling();
+  await Promise.all([loadCatalog(), loadCustomerOrders(), loadCustomerSupport()]);
 }
 
 function renderManual() {
@@ -286,6 +328,36 @@ async function initSession() {
   state.cart.clear();
   renderCart();
   showAuth();
+}
+
+function showResearchNotice() {
+  const notice = qs("#researchNotice");
+  researchNoticeDeadline = performance.now() + 3000;
+  qs("#acknowledgeResearchNotice").disabled = true;
+  document.body.classList.add("research-notice-open");
+  notice.showModal();
+  const updateCountdown = () => {
+    const remaining = Math.max(0, Math.ceil((researchNoticeDeadline - performance.now()) / 1000));
+    const button = qs("#acknowledgeResearchNotice");
+    const label = remaining ? `Continue in ${remaining}s` : "I understand";
+    if (button.textContent !== label) button.textContent = label;
+    button.disabled = remaining > 0;
+    if (!remaining) {
+      clearInterval(researchNoticeTimer);
+      researchNoticeTimer = null;
+    }
+  };
+  updateCountdown();
+  researchNoticeTimer = setInterval(updateCountdown, 100);
+}
+
+function acknowledgeResearchNotice() {
+  if (performance.now() < researchNoticeDeadline) return;
+  researchNoticeAcknowledged = true;
+  qs("#portalMain").inert = false;
+  qs("#researchNotice").close();
+  document.body.classList.remove("research-notice-open");
+  qs('#loginForm input[name="login"]').focus();
 }
 
 async function login(event) {
@@ -503,6 +575,7 @@ async function loadCatalog() {
   try {
     const [payload, settingsPayload] = await Promise.all([api("/api/catalog"), loadShopSettings()]);
     state.products = payload.products || [];
+    state.catalogReady = true;
     state.filters = payload.filters || deriveFilters(state.products);
     state.shopSettings = mergeShopSettings(settingsPayload.settings || defaultShopSettings());
     state.brandCollections = buildBrandCollections(state.products);
@@ -510,10 +583,11 @@ async function loadCatalog() {
     renderHome();
     renderFeaturedSlider();
     renderProducts();
+    restoreSavedCart();
   } catch (error) {
     qs("#products").innerHTML = renderLoadError(
       "Products could not load.",
-      "Refresh the catalog. If it keeps failing, our team needs to check the Shopify connection.",
+      "Please try again shortly. Contact our team if the problem continues.",
       "Retry",
       "retry-catalog",
     );
@@ -526,7 +600,9 @@ async function loadCatalog() {
 
 async function loadShopSettings() {
   try {
-    return await api("/api/shop-settings");
+    const payload = await api("/api/shop-settings");
+    state.shopSettings = mergeShopSettings(payload.settings);
+    return payload;
   } catch {
     return { settings: defaultShopSettings() };
   }
@@ -555,6 +631,7 @@ function mergeShopSettings(settings = {}) {
     courier: { ...defaults.courier, ...(settings.courier || {}) },
     fulfillment: mergeFulfillmentSettings(settings.fulfillment || {}, defaults.fulfillment),
     references: { ...defaults.references, ...(settings.references || {}) },
+    customerCare: { ...defaults.customerCare, ...(settings.customerCare || {}), events: { ...defaults.customerCare.events, ...(settings.customerCare?.events || {}) } },
   };
 }
 
@@ -619,6 +696,7 @@ function renderBrowseMenus() {
 }
 
 function renderHome() {
+  renderHomeOrderUpdates();
   qs("#homeGoalOptions").innerHTML = shopGoals.map((goal, index) => `
     <button class="goal-tile goal-tile-${index + 1}" type="button" data-goal-filter="${goal.id}">
       <span class="goal-index">0${index + 1}</span>
@@ -672,7 +750,7 @@ function renderProducts() {
   if (!products.length) {
     renderProductPager("productsTopPager", 0);
     renderProductPager("productsBottomPager", 0);
-    container.innerHTML = `<p class="muted">No products found.</p>`;
+    container.innerHTML = `<div class="load-error-panel"><strong>No matching products</strong><p class="muted">Try a shorter search or browse the full catalog.</p><button class="secondary" type="button" data-view="order" data-shop-all>Clear search and filters</button></div>`;
     return;
   }
   const totalPages = Math.max(1, Math.ceil(products.length / state.productsPerPage));
@@ -730,11 +808,16 @@ function openProductQuickView(productId) {
   if (!product || (!state.user && !state.admin)) return;
   const available = Boolean(product.variant?.inStock);
   state.quickViewProductId = product.id;
+  state.quickViewImageIndex = 0;
+  const images = productImages(product);
+  const facts = productFacts(product, currentShopSettings().productContent?.[product.id]);
+  const firstImage = images[0];
   qs("#quickViewContent").innerHTML = `
-    <div class="quick-view-image">
-      ${product.image
-        ? `<img src="${escapeHtml(product.image)}" alt="${escapeHtml(product.imageAlt || product.title)}">`
-        : `<div class="image-fallback">${escapeHtml(fallbackLabel(product))}</div>`}
+    <div class="quick-view-media">
+      ${firstImage
+        ? `<button type="button" class="quick-view-image quick-view-image-button" data-enlarge-product-image aria-label="Enlarge ${escapeHtml(product.title)} image" title="Enlarge image"><img src="${escapeHtml(firstImage.url)}" alt="${escapeHtml(firstImage.alt || product.title)}"><span class="image-expand-mark" aria-hidden="true">+</span></button>`
+        : `<div class="quick-view-image"><div class="image-fallback">${escapeHtml(fallbackLabel(product))}</div></div>`}
+      ${images.length > 1 ? `<div class="product-thumbnails" role="group" aria-label="Product photos">${images.map((image, index) => `<button type="button" data-product-photo="${index}" aria-label="View image ${index + 1} of ${images.length}" aria-pressed="${index === 0}"><img src="${escapeHtml(image.url)}" alt="" loading="lazy"></button>`).join("")}</div>` : ""}
     </div>
     <div class="quick-view-details">
       <div class="quick-view-heading">
@@ -743,6 +826,7 @@ function openProductQuickView(productId) {
       </div>
       <span class="quick-view-availability ${available ? "in-stock" : "out-stock"}">${available ? "In stock" : "Out of stock"}</span>
       <strong class="quick-view-price">${money.format(product.variant?.price || 0)}</strong>
+      ${facts.length ? `<dl class="quick-view-facts">${facts.map((fact) => `<div><dt>${escapeHtml(fact.label)}</dt><dd>${escapeHtml(fact.value)}</dd></div>`).join("")}</dl>` : ""}
       ${state.admin ? "" : `
         <form class="quick-view-purchase" id="quickViewPurchase">
           <div class="quick-view-add-row">
@@ -764,9 +848,92 @@ function openProductQuickView(productId) {
   qs("#productQuickView").showModal();
 }
 
+function productImages(product) {
+  const images = Array.isArray(product.images) ? product.images.filter((image) => image?.url) : [];
+  return images.length ? images.slice(0, 8) : product.image ? [{ url: product.image, alt: product.imageAlt || product.title }] : [];
+}
+
+function selectProductPhoto(index) {
+  const product = state.products.find((entry) => entry.id === state.quickViewProductId);
+  const images = product ? productImages(product) : [];
+  if (!Number.isInteger(index) || index < 0 || index >= images.length) return;
+  state.quickViewImageIndex = index;
+  const image = qs(".quick-view-image img");
+  if (image) { image.src = images[index].url; image.alt = images[index].alt || product.title; }
+  qsa("[data-product-photo]").forEach((button) => button.setAttribute("aria-pressed", String(Number(button.dataset.productPhoto) === index)));
+  if (qs("#productImageViewer").open) openProductImage();
+}
+
 function closeProductQuickView() {
+  closeProductImage();
   const dialog = qs("#productQuickView");
   if (dialog?.open) dialog.close();
+}
+
+async function openProductImage() {
+  const product = state.products.find((entry) => entry.id === state.quickViewProductId);
+  if (!product) return;
+  const images = productImages(product);
+  const photo = images[state.quickViewImageIndex] || images[0];
+  if (!photo) return;
+  const viewer = qs("#productImageViewer");
+  const image = qs("#imageViewerImage");
+  const loadId = ++productImageLoadId;
+  disposeProductImageZoom();
+  qs("#imageViewerTitle").textContent = product.title;
+  qs("#imageViewerMessage").textContent = "Loading image...";
+  qs("#imageViewerStatus").hidden = false;
+  qs("#retryProductImage").hidden = true;
+  qs("#imageZoomLevel").textContent = "100%";
+  qsa(".image-viewer-controls button").forEach((button) => { button.disabled = true; });
+  image.alt = photo.alt || product.title;
+  image.src = photo.url;
+  qs("#imageGalleryControls").hidden = images.length <= 1;
+  qs("#imagePhotoCount").textContent = `${state.quickViewImageIndex + 1} / ${images.length}`;
+  qs("#imagePhotoPrevious").disabled = state.quickViewImageIndex <= 0;
+  qs("#imagePhotoNext").disabled = state.quickViewImageIndex >= images.length - 1;
+  image.hidden = false;
+  if (!viewer.open) viewer.showModal();
+  try {
+    const [{ default: Panzoom }] = await Promise.all([import("/vendor/panzoom/panzoom.es.js"), image.decode()]);
+    if (!viewer.open || loadId !== productImageLoadId) return;
+    productImagePanzoom = Panzoom(qs("#imageZoomCanvas"), {
+      minScale: 1,
+      maxScale: 5,
+      contain: "outside",
+      canvas: true,
+      panOnlyWhenZoomed: true,
+      step: 0.25,
+    });
+    qs("#imageViewerMessage").textContent = "";
+    qs("#imageViewerStatus").hidden = true;
+    qs("#imageZoomIn").disabled = false;
+    qs("#imageZoomFit").disabled = false;
+    updateProductImageZoom();
+  } catch {
+    if (!viewer.open || loadId !== productImageLoadId) return;
+    image.hidden = true;
+    qs("#imageViewerMessage").textContent = "This image could not be loaded. Please try again.";
+    qs("#retryProductImage").hidden = false;
+  }
+}
+
+function closeProductImage() {
+  const viewer = qs("#productImageViewer");
+  if (viewer?.open) viewer.close();
+}
+
+function disposeProductImageZoom() {
+  productImagePanzoom?.destroy();
+  productImagePanzoom?.resetStyle();
+  productImagePanzoom = null;
+}
+
+function updateProductImageZoom() {
+  const scale = productImagePanzoom?.getScale() || 1;
+  qs("#imageZoomLevel").textContent = `${Math.round(scale * 100)}%`;
+  qs("#imageZoomOut").disabled = scale <= 1.001;
+  qs("#imageZoomIn").disabled = scale >= 4.999;
 }
 
 function renderQuickViewCart() {
@@ -831,14 +998,22 @@ function featuredProducts(settings) {
 
 function filteredProducts() {
   const query = normalizeSearch(state.search);
-  return state.products.filter((product) => {
+  const products = state.products.filter((product) => {
     if (state.selectedBrand && normalizeSearch(product.vendor) !== normalizeSearch(state.selectedBrand)) return false;
     if (state.selectedGoal && !productMatchesGoal(product, shopGoals.find((goal) => goal.id === state.selectedGoal))) return false;
     if (state.inStockOnly && !product.variant?.inStock) return false;
     if (state.selectedTypes.size && !matchesSelectedTypes(product)) return false;
     if (!query) return true;
-    return searchableProductText(product).includes(query);
+    const text = searchableProductText(product);
+    return query.split(" ").every((term) => text.includes(term));
   });
+  const byName = (a, b) => a.title.localeCompare(b.title, "en", { numeric: true, sensitivity: "base" });
+  if (state.sort === "price-asc") products.sort((a, b) => Number(a.variant?.price || 0) - Number(b.variant?.price || 0) || byName(a, b));
+  if (state.sort === "price-desc") products.sort((a, b) => Number(b.variant?.price || 0) - Number(a.variant?.price || 0) || byName(a, b));
+  if (state.sort === "name") products.sort(byName);
+  if (state.sort === "brand") products.sort((a, b) => a.vendor.localeCompare(b.vendor) || byName(a, b));
+  if (state.sort === "availability") products.sort((a, b) => Number(Boolean(b.variant?.inStock)) - Number(Boolean(a.variant?.inStock)) || byName(a, b));
+  return products;
 }
 
 function productMatchesGoal(product, goal) {
@@ -901,10 +1076,18 @@ function renderCatalogSummary(count) {
   if (state.inStockOnly) parts.push("In stock");
   if (state.search) parts.push(`matching "${state.search}"`);
   qs("#catalogSummary").innerHTML = `<span>${escapeHtml(parts.join(" - "))} - ${count} product${count === 1 ? "" : "s"}</span>`;
+  const chips = [];
+  if (state.selectedBrand) chips.push({ key: "brand", label: state.selectedBrand });
+  if (state.selectedGoal) chips.push({ key: "goal", label: shopGoals.find((goal) => goal.id === state.selectedGoal)?.label || "Goal" });
+  for (const type of state.selectedTypes) chips.push({ key: `type:${type}`, label: typeLabel(type) });
+  if (state.inStockOnly) chips.push({ key: "stock", label: "In stock" });
+  if (state.search) chips.push({ key: "search", label: `Search: ${state.search}` });
+  qs("#activeFilters").innerHTML = chips.map((chip) => `<button type="button" data-clear-filter="${escapeHtml(chip.key)}" aria-label="Remove filter: ${escapeHtml(chip.label)}">${escapeHtml(chip.label)} <span aria-hidden="true">&times;</span></button>`).join("");
 }
 
 async function addToCart(productId, card) {
   if (state.admin || !state.user) return;
+  const customerId = state.user.id;
   const product = state.products.find((entry) => entry.id === productId);
   const variant = product?.variant;
   if (!product || !variant) return;
@@ -914,6 +1097,7 @@ async function addToCart(productId, card) {
   const quantity = Math.min(Math.max(1, Number(quantityInput.value || 1)), 999);
   const button = qs('[data-add-product], button[type="submit"]', card);
   if (button?.disabled) return;
+  if (state.cartBusy) return toast("Your cart is updating. Please try again in a moment.");
   const feedback = qs("[data-product-feedback]", card);
   if (feedback) feedback.textContent = "";
   const buttonLabel = button?.textContent;
@@ -928,6 +1112,8 @@ async function addToCart(productId, card) {
   };
   const nextCart = new Map(state.cart);
   nextCart.set(variant.id, nextItem);
+  state.cartBusy = true;
+  qs("#reviewOrderButton").disabled = true;
   if (button) {
     button.disabled = true;
     button.setAttribute("aria-busy", "true");
@@ -935,7 +1121,10 @@ async function addToCart(productId, card) {
   }
   try {
     await checkCart([...nextCart.values()], false);
+    if (state.user?.id !== customerId) return;
     state.cart = nextCart;
+    state.cartWarning = "";
+    persistCart();
     renderCart();
     if (feedback) feedback.textContent = "Added to cart.";
     else toast("Added to cart.");
@@ -943,11 +1132,76 @@ async function addToCart(productId, card) {
     if (feedback) feedback.textContent = error.message;
     else toast(error.message);
   } finally {
+    state.cartBusy = false;
+    renderCart();
     if (button) {
       button.disabled = false;
       button.removeAttribute("aria-busy");
       if (feedback) button.textContent = buttonLabel;
     }
+  }
+}
+
+function persistCart() {
+  if (!state.user || !state.catalogReady) return;
+  try {
+    if (!saveCart(localStorage, state.user.id, [...state.cart.values()])) toast("Your cart could not be saved on this browser.");
+  } catch {
+    toast("Your cart could not be saved on this browser.");
+  }
+}
+
+function restoreSavedCart({ force = false } = {}) {
+  if (!state.user || !state.catalogReady) return;
+  let saved = [];
+  if (!force && state.cartRestoredFor === state.user.id) saved = [...state.cart.values()];
+  else try { saved = readSavedCart(localStorage, state.user.id); } catch { /* Browser storage may be unavailable. */ }
+  const products = new Map(state.products.filter((product) => product.variant).map((product) => [product.variant.id, product]));
+  const restored = new Map();
+  for (const item of saved) {
+    const product = products.get(item.variantId);
+    if (!product) continue;
+    restored.set(item.variantId, { variantId: item.variantId, productTitle: product.title, variantTitle: product.variant.title, sku: product.variant.sku, price: Number(product.variant.price), quantity: item.quantity });
+  }
+  state.cart = restored;
+  state.cartRestoredFor = state.user.id;
+  state.cartWarning = saved.length > restored.size ? "Some saved products are no longer available and have been removed." : "";
+  renderCart();
+}
+
+async function changeCartQuantity(variantId, quantity) {
+  if (!state.user || state.admin || state.cartBusy) return;
+  const item = state.cart.get(variantId);
+  if (!item || !Number.isInteger(quantity) || quantity < 0 || quantity > 999) { renderCart(); return; }
+  const nextCart = new Map(state.cart);
+  if (quantity) nextCart.set(variantId, { ...item, quantity });
+  else nextCart.delete(variantId);
+  const increasing = quantity > item.quantity;
+  if (!increasing) {
+    state.cart = nextCart;
+    state.cartWarning = "";
+    persistCart();
+    renderCart();
+    return;
+  }
+  const customerId = state.user.id;
+  state.cartBusy = true;
+  renderCart();
+  try {
+    let warning = "";
+    if (nextCart.size) {
+      try { await checkCart([...nextCart.values()], false); }
+      catch (error) { if (increasing) throw error; warning = error.message; }
+    }
+    if (state.user?.id !== customerId) return;
+    state.cart = nextCart;
+    state.cartWarning = warning;
+    persistCart();
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    state.cartBusy = false;
+    renderCart();
   }
 }
 
@@ -972,7 +1226,10 @@ function renderCart() {
     const note = qs("small", specialButton);
     if (note) note.textContent = specialOrders.enabled === false ? specialOrders.unavailableMessage || "Special orders are temporarily unavailable." : "Larger quantities or out-of-stock products";
   }
-  qs("#reviewOrderButton").disabled = !items.length;
+  const unavailable = state.catalogReady && items.some((item) => !state.products.find((product) => product.variant?.id === item.variantId)?.variant?.inStock);
+  qs("#reviewOrderButton").disabled = !items.length || state.cartBusy || unavailable;
+  qs("#cartNotice").textContent = unavailable ? "An item in your cart is out of stock. Remove it or request a special order." : state.cartWarning;
+  qs("#cartNotice").hidden = !qs("#cartNotice").textContent;
   qs("#cartCount").textContent = `${totalQuantity} item${totalQuantity === 1 ? "" : "s"}`;
   qs("#cartTotal").textContent = money.format(total);
   const bubble = qs("#cartBubble");
@@ -983,7 +1240,7 @@ function renderCart() {
   const container = qs("#cartItems");
   if (!items.length) {
     container.className = "cart-items empty";
-    container.textContent = "No products selected.";
+    container.innerHTML = `<p>${!state.catalogReady && state.user ? "Your saved cart will load when products are available." : "Your cart is empty."}</p><button class="secondary" type="button" data-view="order" data-shop-all>Browse products</button>`;
     return;
   }
   container.className = "cart-items";
@@ -996,9 +1253,14 @@ function renderCart() {
             <strong>${escapeHtml(item.productTitle)}</strong>
             <span>${item.quantity} x ${money.format(item.price)}</span>
           </div>
+          <div class="cart-quantity" role="group" aria-label="Quantity for ${escapeHtml(item.productTitle)}">
+            <button type="button" data-cart-step="-1" data-variant-id="${escapeHtml(item.variantId)}" aria-label="Decrease ${escapeHtml(item.productTitle)} quantity" ${state.cartBusy ? "disabled" : ""}>&minus;</button>
+            <input type="number" min="1" max="999" step="1" value="${item.quantity}" data-cart-quantity="${escapeHtml(item.variantId)}" aria-label="${escapeHtml(item.productTitle)} quantity" ${state.cartBusy ? "disabled" : ""}>
+            <button type="button" data-cart-step="1" data-variant-id="${escapeHtml(item.variantId)}" aria-label="Increase ${escapeHtml(item.productTitle)} quantity" ${state.cartBusy ? "disabled" : ""}>+</button>
+          </div>
           <div class="cart-line-end">
             <strong>${money.format(item.price * item.quantity)}</strong>
-            <button type="button" data-remove="${escapeHtml(item.variantId)}" aria-label="Remove ${escapeHtml(item.productTitle)}" title="Remove product">&times;</button>
+            <button type="button" data-remove="${escapeHtml(item.variantId)}" aria-label="Remove ${escapeHtml(item.productTitle)}" title="Remove product" ${state.cartBusy ? "disabled" : ""}>&times;</button>
           </div>
         </div>
       `,
@@ -1017,10 +1279,29 @@ function renderCart() {
 async function submitOrder(event) {
   event.preventDefault();
   if (state.admin || !state.user) return;
+  if (state.cartBusy) return toast("Please wait for your cart to finish updating.");
   const items = [...state.cart.values()];
   if (!items.length) return toast("Add at least one product first.");
   const selectedAddress = selectedCheckoutAddress();
   if (!selectedAddress) return toast("Add a delivery address first.");
+  const customerId = state.user.id;
+  const reviewButton = qs("#reviewOrderButton");
+  state.cartBusy = true;
+  renderCart();
+  reviewButton.disabled = true;
+  reviewButton.textContent = "Checking availability...";
+  try {
+    await checkCart(items, false);
+    if (state.user?.id !== customerId) return;
+  } catch (error) {
+    state.cartWarning = error.message;
+    renderCart();
+    return;
+  } finally {
+    state.cartBusy = false;
+    reviewButton.textContent = "Review order";
+    renderCart();
+  }
   const form = new FormData(event.target);
   state.pendingOrderDraft = {
     idempotencyKey: newIdempotencyKey("standard"),
@@ -1052,7 +1333,11 @@ async function confirmPendingOrder() {
         idempotencyKey: draft.idempotencyKey,
       }),
     });
-    if (!draft.specialOrder) state.cart.clear();
+    if (!draft.specialOrder) {
+      state.cart.clear();
+      state.cartWarning = "";
+      persistCart();
+    }
     state.pendingOrderDraft = null;
     renderCart();
     await loadCustomerOrders();
@@ -1063,6 +1348,7 @@ async function confirmPendingOrder() {
 }
 
 function openOrderSummaryModal(draft) {
+  state.orderFlowView = "summary";
   const modal = qs("#orderFlowModal");
   const title = draft.specialOrder ? "Review special order" : "Review order";
   const deliveryNote = String(draft.delivery?.notes || "").trim();
@@ -1091,6 +1377,7 @@ function openOrderSummaryModal(draft) {
 }
 
 function showPaymentModal(order) {
+  state.orderFlowView = "payment";
   state.activePaymentOrder = order;
   const declined = order.specialOrder?.status === "declined";
   const paymentUnlocked = !declined && (order.canPay || order.paymentLink || order.paymentStatus === "confirmed" || order.paymentIssue?.type === "paid_pending");
@@ -1108,11 +1395,12 @@ function showPaymentModal(order) {
         : `<div class="payment-state"><strong>${escapeHtml(order.customerStatus)}</strong>${order.specialOrder ? renderSpecialOrderStatus(order.specialOrder) : ""}${declined ? "" : `<p>${escapeHtml(paymentReviewNote(order))}</p>`}</div>`}
     </div>
   `;
-  qs("#orderFlowActions").innerHTML = `<button class="primary" type="button" data-close-order-flow>Done</button>`;
+  qs("#orderFlowActions").innerHTML = `<button class="secondary" type="button" data-order-support="${escapeHtml(order.id)}">Need help?</button><button class="primary" type="button" data-close-order-flow>Done</button>`;
   qs("#orderFlowModal").hidden = false;
 }
 
 function showTrackingModal(order) {
+  state.orderFlowView = "tracking";
   const shipments = customerShipments(order);
   qs("#orderFlowTitle").textContent = `Track order - ${order.reference}`;
   qs("#orderFlowContent").innerHTML = `
@@ -1144,6 +1432,7 @@ function customerShipments(order) {
 }
 
 function showOrderSubmittedModal(order) {
+  state.orderFlowView = "submitted";
   state.activePaymentOrder = order;
   qs("#orderFlowTitle").textContent = `${order.specialOrder ? "Special order" : "Order"} submitted`;
   qs("#orderFlowContent").innerHTML = `
@@ -1160,6 +1449,7 @@ function showOrderSubmittedModal(order) {
 }
 
 function closeOrderFlowModal() {
+  state.orderFlowView = "";
   state.pendingOrderDraft = null;
   state.activePaymentOrder = null;
   qs("#orderFlowModal").hidden = true;
@@ -1480,14 +1770,142 @@ async function confirmRemoveAddress(event) {
 
 async function loadCustomerOrders() {
   const container = qs("#statusOrders");
-  container.innerHTML = `<p class="muted">Loading orders...</p>`;
+  if (!state.user) return;
+  const customerId = state.user.id;
+  if (!state.customerOrdersLoaded) container.innerHTML = `<p class="muted">Loading orders...</p>`;
   try {
     const payload = await api("/api/orders");
+    if (state.user?.id !== customerId) return;
+    const previous = new Map(state.customerOrders.map((order) => [order.id, order]));
+    const changed = (payload.orders || []).filter((order) => previous.has(order.id) && previous.get(order.id).updatedAt !== order.updatedAt);
     state.customerOrders = payload.orders || [];
+    const wasLoaded = state.customerOrdersLoaded;
+    state.customerOrdersLoaded = true;
     container.innerHTML = state.customerOrders.length ? state.customerOrders.map(renderCustomerOrder).join("") : `<p class="muted">No orders yet.</p>`;
+    renderHomeOrderUpdates();
+    if (!qs("#orderFlowModal").hidden && ["payment", "submitted"].includes(state.orderFlowView)) {
+      const updated = changed.find((order) => order.id === state.activePaymentOrder?.id);
+      if (updated) showPaymentModal(updated);
+    }
+    if (wasLoaded && changed.length) toast(`Order ${changed[0].reference}: ${changed[0].customerStatus}`);
+    const linkedOrderId = new URLSearchParams(location.search).get("order");
+    if (linkedOrderId && !state.handledOrderLink) {
+      state.handledOrderLink = true;
+      const order = state.customerOrders.find((entry) => entry.id === linkedOrderId);
+      if (order) { await loadShopSettings(); if (state.user?.id === customerId) { switchView("orders"); showPaymentModal(order); } }
+      else toast("This order is not available in your account.");
+    }
   } catch (error) {
-    container.innerHTML = `<p class="muted">${escapeHtml(error.message)}</p>`;
+    if (!state.customerOrdersLoaded) container.innerHTML = `<p class="muted">${escapeHtml(error.message)}</p>`;
   }
+}
+
+function renderHomeOrderUpdates() {
+  const section = qs("#homeOrderUpdates");
+  if (!state.user) { section.hidden = true; return; }
+  const priority = (order) => order.canPay && order.paymentIssue?.type !== "paid_pending" ? 0 : order.paymentIssue?.type === "paid_pending" ? 1 : order.fulfillmentStatus === "shipped" ? 4 : order.paymentStatus === "confirmed" ? 3 : 2;
+  const orders = state.customerOrders.filter((order) => order.specialOrder?.status !== "declined" && (order.fulfillmentStatus !== "shipped" || Date.now() - Date.parse(order.updatedAt) < 7 * 24 * 60 * 60 * 1000)).sort((a, b) => priority(a) - priority(b) || Date.parse(b.updatedAt) - Date.parse(a.updatedAt)).slice(0, 3);
+  const unreadReplies = supportUnreadCount();
+  section.hidden = !orders.length && !unreadReplies;
+  qs("#homeOrderActions").innerHTML = orders.map((order) => {
+    const track = order.fulfillmentStatus === "shipped" && customerShipments(order).length;
+    const payable = order.canPay && order.paymentIssue?.type !== "paid_pending";
+    const label = track ? "Track order" : payable ? "View payment" : "View order";
+    const status = order.paymentStatus === "confirmed" && !track ? "Processing" : order.customerStatus;
+    return `<article class="home-order-row"><div><strong>${escapeHtml(order.reference)}</strong><span>${escapeHtml(status)}${payable ? ` &middot; ${money.format(order.total)}` : ""}</span></div><button type="button" class="${payable ? "primary" : "secondary"}" data-view-order-${track ? "tracking" : "payment"}="${escapeHtml(order.id)}">${label}</button></article>`;
+  }).join("") + (unreadReplies ? `<div class="home-order-row"><span>${unreadReplies} new support ${unreadReplies === 1 ? "reply" : "replies"}</span><button class="secondary" type="button" data-open-support>Read reply</button></div>` : "");
+}
+
+function startCustomerPolling() {
+  clearInterval(customerPollTimer);
+  customerPollTimer = setInterval(refreshCustomerUpdates, 60_000);
+}
+
+function refreshCustomerUpdates() {
+  if (!state.user || document.visibilityState !== "visible" || Date.now() - lastCustomerPoll < 15_000) return;
+  lastCustomerPoll = Date.now();
+  loadCustomerOrders();
+  loadCustomerSupport();
+}
+
+function supportUnreadCount() {
+  let seenAt = 0;
+  try { seenAt = Number(localStorage.getItem(`op-support-seen:${state.user?.id}`) || 0); } catch { /* Optional read markers. */ }
+  return state.customerSupport.filter((request) => (request.replies || []).some((reply) => Date.parse(reply.at) > seenAt)).length;
+}
+
+async function loadCustomerSupport() {
+  if (!state.user) return;
+  const customerId = state.user.id;
+  try {
+    const payload = await api("/api/support");
+    if (state.user?.id !== customerId) return;
+    state.customerSupport = payload.requests || [];
+    state.customerSupportLoaded = true;
+    state.customerSupportError = "";
+    const count = supportUnreadCount();
+    qs("#supportReplyBadge").textContent = String(count);
+    qs("#supportReplyBadge").hidden = count === 0;
+    renderHomeOrderUpdates();
+    if (qs("#customerSupportDialog").open) renderSupportHistory();
+  } catch {
+    if (state.user?.id !== customerId) return;
+    state.customerSupportError = "Your conversations could not be loaded. Please try again.";
+    if (qs("#customerSupportDialog").open) renderSupportHistory();
+  }
+}
+
+async function openCustomerSupport(orderId = "") {
+  if (!state.user || state.admin) return;
+  closeOrderFlowModal();
+  supportRequestKey = newIdempotencyKey("support");
+  qs("#customerSupportForm").reset();
+  qs("#supportFormFeedback").textContent = "Replies will appear in your conversations below.";
+  qs("#supportOrderId").innerHTML = `<option value="">General enquiry</option>${state.customerOrders.map((order) => `<option value="${escapeHtml(order.id)}" ${order.id === orderId ? "selected" : ""}>${escapeHtml(order.reference)}</option>`).join("")}`;
+  renderSupportContacts();
+  renderSupportHistory();
+  if (!qs("#customerSupportDialog").open) qs("#customerSupportDialog").showModal();
+  document.body.classList.add("customer-support-open");
+  await loadCustomerSupport();
+  if (state.user && !state.customerSupportError) {
+    try { localStorage.setItem(`op-support-seen:${state.user.id}`, String(Date.now())); } catch { /* Optional read markers. */ }
+    qs("#supportReplyBadge").hidden = true;
+  }
+  renderHomeOrderUpdates();
+}
+
+function renderSupportContacts() {
+  const care = currentShopSettings().customerCare;
+  const order = state.customerOrders.find((entry) => entry.id === qs("#supportOrderId").value);
+  const subject = `Order enquiry${order ? ` - ${order.reference}` : ""}`;
+  const message = order ? `Order reference: ${order.reference}\n\n` : "";
+  qs("#supportContacts").innerHTML = `${care.supportHours ? `<p class="muted small">${escapeHtml(care.supportHours)}</p>` : ""}<div>${care.supportEmail ? `<a class="secondary button-link" href="mailto:${encodeURIComponent(care.supportEmail)}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(message)}">Email support</a>` : ""}${care.whatsappNumber ? `<a class="secondary button-link" href="https://wa.me/${encodeURIComponent(care.whatsappNumber)}?text=${encodeURIComponent(message || subject)}" target="_blank" rel="noopener">WhatsApp</a>` : ""}</div>`;
+}
+
+function renderSupportHistory() {
+  if (state.customerSupportError) {
+    qs("#supportHistory").innerHTML = `<p role="status">${escapeHtml(state.customerSupportError)}</p><button class="secondary" type="button" data-retry-support>Try again</button>`;
+    return;
+  }
+  if (!state.customerSupportLoaded) { qs("#supportHistory").innerHTML = `<p class="muted" role="status">Loading conversations…</p>`; return; }
+  qs("#supportHistory").innerHTML = state.customerSupport.length ? state.customerSupport.map((request) => `<details class="support-thread"><summary><span><strong>${escapeHtml(request.reference || request.topic)}</strong><small>${new Date(request.createdAt).toLocaleDateString()}</small></span><span class="status-badge">${request.status === "resolved" ? "Replied" : "Open"}</span></summary><div class="support-thread-body"><p>${escapeHtml(request.message)}</p>${(request.replies || []).map((reply) => `<div class="support-reply"><strong>${escapeHtml(reply.author || "Customer support")}</strong><p>${escapeHtml(reply.message)}</p><small class="muted">${new Date(reply.at).toLocaleString()}</small></div>`).join("")}</div></details>`).join("") : `<p class="muted">No conversations yet.</p>`;
+}
+
+async function submitCustomerSupport(event) {
+  event.preventDefault();
+  const form = event.target;
+  const button = qs('button[type="submit"]', form);
+  if (button.disabled) return;
+  button.disabled = true;
+  try {
+    const values = new FormData(form);
+    await api("/api/support", { method: "POST", body: JSON.stringify({ orderId: values.get("orderId"), topic: values.get("topic"), message: values.get("message"), idempotencyKey: supportRequestKey }) });
+    form.message.value = "";
+    supportRequestKey = newIdempotencyKey("support");
+    qs("#supportFormFeedback").textContent = "Message sent. Our team will reply here.";
+    await loadCustomerSupport();
+  } catch (error) { qs("#supportFormFeedback").textContent = error.message; }
+  finally { button.disabled = false; }
 }
 
 function renderCustomerOrder(order) {
@@ -1525,6 +1943,7 @@ function renderCustomerOrder(order) {
       <div class="order-actions">
         <button type="button" data-view-order-payment="${escapeHtml(order.id)}">${paymentActionLabel}</button>
         ${trackButton}
+        <button class="order-help-button" type="button" data-order-support="${escapeHtml(order.id)}">Need help?</button>
       </div>
     </article>
   `;
@@ -1665,6 +2084,7 @@ function paymentInstructions(order) {
 }
 
 function showPaymentIssueModal(order) {
+  state.orderFlowView = "payment-help";
   state.activePaymentOrder = order;
   qs("#orderFlowTitle").textContent = `Report payment issue - ${order.reference}`;
   qs("#orderFlowContent").innerHTML = `
@@ -1745,6 +2165,11 @@ function renderAdminOrders() {
   qsa("[data-admin-view]").forEach((button) => button.classList.toggle("is-active", button.dataset.adminView === state.adminView));
   if (state.adminView === "shop-settings") {
     renderAdminShopSettings();
+    return;
+  }
+  if (state.adminView === "customer-care") {
+    if (state.adminCustomerCare) renderAdminCustomerCare();
+    else loadAdminCustomerCare();
     return;
   }
   if (state.adminView === "accounts") {
@@ -2273,6 +2698,59 @@ function collectFulfillmentSettings(formData) {
   };
 }
 
+async function loadAdminCustomerCare() {
+  qs("#adminOrdersSummary").innerHTML = `<span>Customer support</span>`;
+  qs("#adminOrders").innerHTML = `<p class="muted">Loading customer messages...</p>`;
+  try {
+    const payload = await api("/api/admin/customer-care");
+    if (!state.admin || state.adminView !== "customer-care") return;
+    state.adminCustomerCare = payload;
+    renderAdminCustomerCare();
+  } catch (error) { qs("#adminOrders").innerHTML = `<p class="muted">${escapeHtml(error.message)}</p>`; }
+}
+
+function renderAdminCustomerCare() {
+  const data = state.adminCustomerCare;
+  if (!data) return;
+  qsa("[data-admin-view]").forEach((button) => button.classList.toggle("is-active", button.dataset.adminView === state.adminView));
+  const openCount = data.requests.filter((request) => request.status !== "resolved").length;
+  qs("#adminOrdersSummary").innerHTML = `<span>${openCount} open support ${openCount === 1 ? "request" : "requests"}</span>`;
+  const toolbar = `<div class="care-view-tabs" role="group" aria-label="Customer communication views"><button type="button" data-care-view="support" class="${state.adminCareView === "support" ? "is-active" : ""}">Support requests</button><button type="button" data-care-view="email" class="${state.adminCareView === "email" ? "is-active" : ""}">Email delivery</button></div>`;
+  if (state.adminCareView === "email") {
+    const labels = { disabled: "Off", setup_required: "Setup required", pending: "Queued", sending: "Sending", failed: "Failed", expired: "Expired", superseded: "No longer required", sent: "Sent to email service" };
+    const ready = data.emailSetup.enabled && data.emailSetup.configured;
+    qs("#adminOrders").innerHTML = `${toolbar}<section class="email-setup"><h3>${!data.emailSetup.enabled ? "Order emails are turned off" : data.emailSetup.configured ? "Email delivery is enabled" : "Email setup required"}</h3>${data.emailSetup.missing.length ? `<p class="muted">Required: ${data.emailSetup.missing.map(escapeHtml).join(", ")}</p>` : ""}</section><div>${data.emails.length ? data.emails.map((email) => `<details class="support-thread"><summary><span><strong>${escapeHtml(email.reference)}</strong><small>${escapeHtml(email.subject)}</small></span><span class="status-badge">${escapeHtml(labels[email.status] || email.status)}</span></summary><div class="support-thread-body"><p>To: ${escapeHtml(email.to)}</p><p class="muted">${new Date(email.createdAt).toLocaleString()} &middot; ${email.attempts} ${email.attempts === 1 ? "attempt" : "attempts"}</p>${email.lastError ? `<p>${escapeHtml(email.lastError)}</p>` : ""}${!["sent", "expired", "superseded", "sending"].includes(email.status) ? `<button class="secondary inline-add" type="button" data-retry-email="${escapeHtml(email.id)}" ${ready ? "" : "disabled"}>Retry delivery</button>` : ""}</div></details>`).join("") : `<p class="muted">No order emails yet.</p>`}</div>`;
+    return;
+  }
+  const requests = data.requests.filter((request) => state.adminSupportFilter === "all" || request.status !== "resolved");
+  qs("#adminOrders").innerHTML = `${toolbar}<div class="care-view-tabs" role="group" aria-label="Support request filter"><button type="button" data-support-filter="open" class="${state.adminSupportFilter === "open" ? "is-active" : ""}">Open</button><button type="button" data-support-filter="all" class="${state.adminSupportFilter === "all" ? "is-active" : ""}">All</button></div><div>${requests.length ? requests.map((request) => `<details class="support-thread"><summary><span><strong>${escapeHtml(request.reference || request.topic)}</strong><small>${escapeHtml(request.customerName)} &middot; ${escapeHtml(request.customerEmail)}</small></span><span class="status-badge">${request.status === "resolved" ? "Resolved" : "Open"}</span></summary><div class="support-thread-body"><p class="muted">${escapeHtml(request.topic)} &middot; ${new Date(request.createdAt).toLocaleString()}</p><p>${escapeHtml(request.message)}</p>${(request.replies || []).map((reply) => `<div class="support-reply"><strong>${escapeHtml(reply.author)}</strong><p>${escapeHtml(reply.message)}</p></div>`).join("")}<form class="form-stack" data-support-reply="${escapeHtml(request.id)}"><label>Reply<textarea name="reply" rows="3" minlength="2" maxlength="1500" required></textarea></label><label>Status<select name="status"><option value="resolved">Resolved</option><option value="open">Keep open</option></select></label><button class="primary inline-add" type="submit">Send reply</button></form></div></details>`).join("") : `<p class="muted">${state.adminSupportFilter === "open" ? "No open requests." : "No support requests yet."}</p>`}</div>`;
+}
+
+async function submitSupportReply(event) {
+  event.preventDefault();
+  const form = event.target;
+  const button = qs('button[type="submit"]', form);
+  if (button.disabled) return;
+  button.disabled = true;
+  form.dataset.replyKey ||= newIdempotencyKey("support-reply");
+  try {
+    const values = new FormData(form);
+    await api(`/api/admin/support/${encodeURIComponent(form.dataset.supportReply)}/reply`, { method: "POST", body: JSON.stringify({ reply: values.get("reply"), status: values.get("status"), idempotencyKey: form.dataset.replyKey }) });
+    toast("Reply sent.");
+    await loadAdminCustomerCare();
+  } catch (error) { toast(error.message); button.disabled = false; }
+}
+
+async function retryCustomerEmail(id, button) {
+  if (button.disabled) return;
+  button.disabled = true;
+  try {
+    const payload = await api(`/api/admin/notifications/${encodeURIComponent(id)}/retry`, { method: "POST", body: "{}" });
+    toast(payload.status === "sent" ? "Email sent to the delivery service." : "Delivery status updated.");
+    await loadAdminCustomerCare();
+  } catch (error) { toast(error.message); button.disabled = false; }
+}
+
 function renderAdminShopSettings() {
   qsa("[data-admin-view]").forEach((button) => button.classList.toggle("is-active", button.dataset.adminView === state.adminView));
   const allSettings = currentShopSettings();
@@ -2281,6 +2759,7 @@ function renderAdminShopSettings() {
   const courier = allSettings.courier || defaultShopSettings().courier;
   const fulfillment = allSettings.fulfillment || defaultShopSettings().fulfillment;
   const references = allSettings.references || defaultShopSettings().references;
+  const care = allSettings.customerCare;
   const selected = new Set(settings.customProductIds || []);
   const productSearch = normalizeSearch(state.adminProductSearch);
   const customProducts = state.products
@@ -2361,6 +2840,29 @@ function renderAdminShopSettings() {
         ${renderFulfillmentSettings(fulfillment)}
       </details>
       <details class="settings-accordion">
+        <summary><span>Customer communication</span><small>Support contacts and order emails</small></summary>
+        <section class="settings-grid">
+          <label>Support email<input name="supportEmail" type="email" maxlength="180" value="${escapeHtml(care.supportEmail || "")}"></label>
+          <label>WhatsApp number<input name="whatsappNumber" type="tel" maxlength="30" placeholder="Country code and number" value="${escapeHtml(care.whatsappNumber || "")}"></label>
+          <label class="wide">Support hours<input name="supportHours" maxlength="180" value="${escapeHtml(care.supportHours || "")}"></label>
+          <label>Email display name<input name="senderName" maxlength="80" value="${escapeHtml(care.senderName || "Tank Nutrition")}"></label>
+          <label class="check-option"><input name="emailEnabled" type="checkbox" ${care.emailEnabled ? "checked" : ""}> Send order emails</label>
+          <div class="check-list wide">${[["order_received", "Order received"], ["payment_ready", "Payment details ready"], ["payment_confirmed", "Payment confirmed"], ["shipped", "Shipment updates"]].map(([key, label]) => `<label class="check-option"><input type="checkbox" name="emailEvent-${key}" ${care.events[key] !== false ? "checked" : ""}> ${label}</label>`).join("")}</div>
+          <p class="muted small wide">Email delivery requires a connected service and verified sender. View setup and delivery status under Customer support.</p>
+        </section>
+      </details>
+      <details class="settings-accordion">
+        <summary><span>Product details</span><small>Strength, format and pack size</small></summary>
+        <section class="settings-grid">
+          <label class="wide">Find product<input id="adminFactsSearch" type="search" value="${escapeHtml(state.adminFactsSearch)}" placeholder="Search product or brand"></label>
+          <label class="wide">Product<select id="adminFactsProduct"></select></label>
+          <label>Strength<input id="factsStrength" maxlength="100"></label>
+          <label>Format<input id="factsFormat" maxlength="100"></label>
+          <label>Pack size<input id="factsPackSize" maxlength="100"></label>
+          <p class="muted small wide">Blank fields use the catalog label when available. Product photos are managed in Shopify.</p>
+        </section>
+      </details>
+      <details class="settings-accordion">
         <summary><span>References</span><small>Standard and special order formats</small></summary>
         <section class="settings-grid">
           <label>Standard order format
@@ -2377,6 +2879,34 @@ function renderAdminShopSettings() {
       </div>
     </form>
   `;
+  renderProductFactsEditor();
+}
+
+function renderProductFactsEditor() {
+  const query = normalizeSearch(state.adminFactsSearch);
+  const products = state.products.filter((product) => !query || searchableProductText(product).includes(query)).slice(0, 150);
+  if (!products.some((product) => product.id === state.adminFactsProductId)) state.adminFactsProductId = products[0]?.id || "";
+  qs("#adminFactsProduct").innerHTML = products.length ? products.map((product) => `<option value="${escapeHtml(product.id)}" ${product.id === state.adminFactsProductId ? "selected" : ""}>${escapeHtml(product.title)}</option>`).join("") : `<option value="">No matching products</option>`;
+  loadProductFactsFields();
+}
+
+function loadProductFactsFields() {
+  const product = state.products.find((entry) => entry.id === state.adminFactsProductId);
+  const content = state.shopSettings?.productContent?.[state.adminFactsProductId] || {};
+  for (const [id, key, label] of [["factsStrength", "strength", "Strength"], ["factsFormat", "format", "Format"], ["factsPackSize", "packSize", "Pack size"]]) {
+    const field = qs(`#${id}`);
+    field.value = content[key] || "";
+    field.placeholder = product ? productFacts(product).find((fact) => fact.label === label)?.value || "Not specified" : "Not specified";
+    field.disabled = !product;
+  }
+}
+
+function syncProductFactsFields() {
+  if (!state.adminFactsProductId || !state.shopSettings) return;
+  state.shopSettings.productContent ||= {};
+  const content = { strength: qs("#factsStrength").value.trim(), format: qs("#factsFormat").value.trim(), packSize: qs("#factsPackSize").value.trim() };
+  if (Object.values(content).some(Boolean)) state.shopSettings.productContent[state.adminFactsProductId] = content;
+  else delete state.shopSettings.productContent[state.adminFactsProductId];
 }
 
 function syncDraftCustomSelections() {
@@ -2395,6 +2925,7 @@ async function submitShopSettings(event) {
   const form = event.target;
   const formData = new FormData(form);
   syncDraftCustomSelections();
+  syncProductFactsFields();
   try {
     const payload = await api("/api/admin/shop-settings", {
       method: "POST",
@@ -2414,6 +2945,11 @@ async function submitShopSettings(event) {
           productQuery: formData.get("courierProductQuery"),
         },
         fulfillment: collectFulfillmentSettings(formData),
+        productContent: state.shopSettings?.productContent || {},
+        customerCare: {
+          supportEmail: formData.get("supportEmail"), whatsappNumber: formData.get("whatsappNumber"), supportHours: formData.get("supportHours"), senderName: formData.get("senderName"), emailEnabled: formData.get("emailEnabled") === "on",
+          events: Object.fromEntries(["order_received", "payment_ready", "payment_confirmed", "shipped"].map((key) => [key, formData.get(`emailEvent-${key}`) === "on"])),
+        },
         references: {
           standardFormat: formData.get("standardFormat"),
           specialFormat: formData.get("specialFormat"),
@@ -3111,6 +3647,18 @@ async function copyText(value, label = "text") {
 }
 
 document.addEventListener("click", (event) => {
+  if (!event.target.closest(".nav-dropdown")) qsa(".nav-dropdown[open]").forEach((menu) => { menu.open = false; });
+  if (event.target.closest("[data-open-support]")) openCustomerSupport();
+  const orderSupport = event.target.closest("[data-order-support]");
+  if (orderSupport) openCustomerSupport(orderSupport.dataset.orderSupport);
+  if (event.target.closest("[data-close-support]")) qs("#customerSupportDialog").close();
+  if (event.target.closest("[data-retry-support]")) loadCustomerSupport();
+  const careView = event.target.closest("[data-care-view]");
+  if (careView) { state.adminCareView = careView.dataset.careView; renderAdminCustomerCare(); }
+  const supportFilter = event.target.closest("[data-support-filter]");
+  if (supportFilter) { state.adminSupportFilter = supportFilter.dataset.supportFilter; renderAdminCustomerCare(); }
+  const retryEmail = event.target.closest("[data-retry-email]");
+  if (retryEmail) retryCustomerEmail(retryEmail.dataset.retryEmail, retryEmail);
   const manualButton = event.target.closest("[data-manual]");
   if (manualButton && manuals[manualButton.dataset.manual]) {
     state.manualId = manualButton.dataset.manual;
@@ -3163,6 +3711,12 @@ document.addEventListener("click", (event) => {
 
   const viewProduct = event.target.closest("[data-view-product]");
   if (viewProduct) openProductQuickView(viewProduct.dataset.viewProduct);
+  const productPhoto = event.target.closest("[data-product-photo]");
+  if (productPhoto) selectProductPhoto(Number(productPhoto.dataset.productPhoto));
+  if (event.target.closest("#imagePhotoPrevious")) selectProductPhoto(state.quickViewImageIndex - 1);
+  if (event.target.closest("#imagePhotoNext")) selectProductPhoto(state.quickViewImageIndex + 1);
+  if (event.target.closest("[data-enlarge-product-image], #retryProductImage")) openProductImage();
+  if (event.target.closest("[data-close-image]")) closeProductImage();
   if (event.target.closest("[data-close-product]")) closeProductQuickView();
   if (event.target.closest("#quickViewCartButton")) {
     closeProductQuickView();
@@ -3171,8 +3725,20 @@ document.addEventListener("click", (event) => {
 
   const remove = event.target.closest("[data-remove]");
   if (remove) {
-    state.cart.delete(remove.dataset.remove);
-    renderCart();
+    changeCartQuantity(remove.dataset.remove, 0);
+  }
+  const cartStep = event.target.closest("[data-cart-step]");
+  if (cartStep) changeCartQuantity(cartStep.dataset.variantId, (state.cart.get(cartStep.dataset.variantId)?.quantity || 0) + Number(cartStep.dataset.cartStep));
+  const clearFilter = event.target.closest("[data-clear-filter]");
+  if (clearFilter) {
+    const key = clearFilter.dataset.clearFilter;
+    if (key === "brand") state.selectedBrand = "";
+    if (key === "goal") state.selectedGoal = "";
+    if (key.startsWith("type:")) state.selectedTypes.delete(key.slice(5));
+    if (key === "stock") state.inStockOnly = false;
+    if (key === "search") { state.search = ""; qs("#catalogSearch").value = ""; }
+    state.productPage = 1;
+    renderProducts();
   }
 
   const confirm = event.target.closest("[data-confirm]");
@@ -3235,6 +3801,7 @@ document.addEventListener("click", (event) => {
     state.adminOrderFilter = "all";
     state.adminOrderSearch = "";
     if (state.adminView === "shop-settings") loadAdminShopSettings();
+    else if (state.adminView === "customer-care") loadAdminCustomerCare();
     else if (state.adminView === "accounts") loadAdminAccounts();
     else if (state.adminView === "system-status") loadSystemStatus();
     else renderAdminOrders();
@@ -3310,10 +3877,37 @@ document.addEventListener("click", (event) => {
 });
 
 document.addEventListener("toggle", (event) => {
+  if (event.target.matches(".nav-dropdown") && event.target.open) {
+    qsa(".nav-dropdown[open]").forEach((menu) => { if (menu !== event.target) menu.open = false; });
+  }
   if (event.target.matches(".admin-order-card") && event.target.open) loadAdminStock(event.target.dataset.adminOrderId);
 }, true);
 
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape" || qs("dialog[open]")) return;
+  const openMenu = qs(".nav-dropdown[open]");
+  if (openMenu) {
+    event.preventDefault();
+    openMenu.open = false;
+    qs("summary", openMenu).focus();
+  }
+});
+
 document.addEventListener("change", async (event) => {
+  if (event.target.matches("#supportOrderId")) renderSupportContacts();
+  if (event.target.matches("#adminFactsProduct")) {
+    state.adminFactsProductId = event.target.value;
+    loadProductFactsFields();
+  }
+  if (event.target.matches("[data-cart-quantity]")) {
+    if (event.target.reportValidity()) changeCartQuantity(event.target.dataset.cartQuantity, Number(event.target.value));
+    else renderCart();
+  }
+  if (event.target.matches("#catalogSort")) {
+    state.sort = event.target.value;
+    state.productPage = 1;
+    renderProducts();
+  }
   if (event.target.matches("#manualPageNumber")) {
     state.manualPage = Number(event.target.value);
     renderManual();
@@ -3357,6 +3951,8 @@ qs("#catalogSearch").addEventListener("input", (event) => {
 });
 
 document.addEventListener("input", (event) => {
+  if (event.target.matches("#adminFactsSearch")) { state.adminFactsSearch = event.target.value; renderProductFactsEditor(); }
+  if (event.target.matches("#factsStrength, #factsFormat, #factsPackSize")) syncProductFactsFields();
   const allocation = event.target.closest("[data-special-allocation-row]");
   if (allocation) {
     const card = event.target.closest(".admin-order-card");
@@ -3397,6 +3993,8 @@ document.addEventListener("input", (event) => {
 });
 
 document.addEventListener("submit", (event) => {
+  if (event.target.matches("[data-support-reply]")) submitSupportReply(event);
+  if (event.target.matches("#customerSupportForm")) submitCustomerSupport(event);
   if (event.target.matches("#quickViewPurchase")) {
     event.preventDefault();
     addToCart(state.quickViewProductId, event.target);
@@ -3418,6 +4016,57 @@ document.addEventListener("submit", (event) => {
 });
 
 qs("#logoutButton").addEventListener("click", logout);
+document.addEventListener("visibilitychange", refreshCustomerUpdates);
+qs("#customerSupportDialog").addEventListener("click", (event) => {
+  if (event.target !== event.currentTarget) return;
+  const bounds = event.currentTarget.getBoundingClientRect();
+  if (event.clientX < bounds.left || event.clientX > bounds.right || event.clientY < bounds.top || event.clientY > bounds.bottom) event.currentTarget.close();
+});
+qs("#customerSupportDialog").addEventListener("close", () => document.body.classList.remove("customer-support-open"));
+qs("#researchNotice").addEventListener("cancel", (event) => event.preventDefault());
+qs("#researchNotice").addEventListener("keydown", (event) => {
+  if (event.key === "Escape") event.preventDefault();
+});
+qs("#researchNotice").addEventListener("close", () => {
+  if (!researchNoticeAcknowledged) qs("#researchNotice").showModal();
+});
+qs("#acknowledgeResearchNotice").addEventListener("click", acknowledgeResearchNotice);
+qs("#productImageViewer").addEventListener("close", () => {
+  productImageLoadId += 1;
+  disposeProductImageZoom();
+});
+qs("#productImageViewer").addEventListener("click", (event) => {
+  if (event.target !== event.currentTarget) return;
+  const bounds = event.currentTarget.getBoundingClientRect();
+  if (event.clientX < bounds.left || event.clientX > bounds.right || event.clientY < bounds.top || event.clientY > bounds.bottom) closeProductImage();
+});
+qs("#imageZoomCanvas").addEventListener("panzoomchange", updateProductImageZoom);
+qs("#imageViewerStage").addEventListener("wheel", (event) => productImagePanzoom?.zoomWithWheel(event), { passive: false });
+qs("#imageViewerStage").addEventListener("dblclick", (event) => {
+  if (!productImagePanzoom) return;
+  if (productImagePanzoom.getScale() > 1) productImagePanzoom.reset();
+  else productImagePanzoom.zoomToPoint(2.5, event);
+});
+qs("#imageZoomIn").addEventListener("click", () => productImagePanzoom?.zoomIn());
+qs("#imageZoomOut").addEventListener("click", () => productImagePanzoom?.zoomOut());
+qs("#imageZoomFit").addEventListener("click", () => productImagePanzoom?.reset());
+qs("#productImageViewer").addEventListener("keydown", (event) => {
+  if (!productImagePanzoom) return;
+  if (["+", "=", "-", "0", "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key)) event.preventDefault();
+  if (["+", "="].includes(event.key)) productImagePanzoom.zoomIn();
+  if (event.key === "-") productImagePanzoom.zoomOut();
+  if (event.key === "0") productImagePanzoom.reset();
+  if (event.key.startsWith("Arrow")) {
+    const distance = 50 / productImagePanzoom.getScale();
+    const x = event.key === "ArrowLeft" ? distance : event.key === "ArrowRight" ? -distance : 0;
+    const y = event.key === "ArrowUp" ? distance : event.key === "ArrowDown" ? -distance : 0;
+    productImagePanzoom.pan(x, y, { relative: true });
+  }
+});
+window.addEventListener("resize", () => productImagePanzoom?.reset({ animate: false }));
+window.addEventListener("storage", (event) => {
+  if (state.user && event.key === cartStorageKey(state.user.id) && !state.cartBusy) restoreSavedCart({ force: true });
+});
 qs("#productQuickView").addEventListener("close", () => {
   state.quickViewProductId = "";
   document.body.classList.remove("product-quick-view-open");
@@ -3433,6 +4082,7 @@ qs("#refreshOrders").addEventListener("click", loadCustomerOrders);
 qs("#termsScrollBody").addEventListener("scroll", updateTermsGate);
 qs("#refreshAdminPanel").addEventListener("click", () => {
   if (state.adminView === "shop-settings") loadAdminShopSettings();
+  else if (state.adminView === "customer-care") loadAdminCustomerCare();
   else if (state.adminView === "accounts") loadAdminAccounts();
   else if (state.adminView === "system-status") loadSystemStatus();
   else loadAdminOrders();
@@ -3440,4 +4090,5 @@ qs("#refreshAdminPanel").addEventListener("click", () => {
 
 installInputMasks();
 renderCart();
+showResearchNotice();
 initSession();

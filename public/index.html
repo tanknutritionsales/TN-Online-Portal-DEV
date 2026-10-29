@@ -7,10 +7,10 @@
     <link rel="icon" href="/favicon.ico" sizes="any">
     <link rel="icon" type="image/png" href="/favicon-32x32.png">
     <link rel="apple-touch-icon" href="/apple-touch-icon.png">
-    <link rel="stylesheet" href="/styles.css">
+    <link rel="stylesheet" href="/styles.css?v=20261029-customer-experience-1">
   </head>
   <body>
-    <main>
+    <main id="portalMain" inert>
       <section id="loginScreen" class="login-screen">
         <div class="login-card panel">
           <img class="login-logo" src="/assets/tank-nutrition-logo.png" alt="Tank Nutrition">
@@ -105,11 +105,11 @@
             <div class="main-nav-links">
               <button class="tab customer-tab is-active" data-view="home">Home</button>
               <button class="tab customer-tab" data-view="order" data-shop-all>Shop all</button>
-              <details class="nav-dropdown" id="goalNav">
+              <details class="nav-dropdown" id="goalNav" name="shop-navigation">
                 <summary>Shop by Goal</summary>
                 <div class="nav-dropdown-panel" id="goalNavOptions"></div>
               </details>
-              <details class="nav-dropdown" id="brandNav">
+              <details class="nav-dropdown" id="brandNav" name="shop-navigation">
                 <summary>Shop by Brand</summary>
                 <div class="nav-dropdown-panel" id="brandNavOptions"></div>
               </details>
@@ -125,6 +125,7 @@
               </button>
               <button class="tab customer-tab" data-view="orders">My orders</button>
               <button class="tab customer-tab" data-view="account">My account</button>
+              <button class="tab" type="button" data-open-support>Help<span id="supportReplyBadge" class="nav-count" hidden>0</span></button>
             </div>
             <button class="tab admin-tab" data-view="admin" hidden>Admin</button>
           </nav>
@@ -145,6 +146,10 @@
 
         <section class="view is-active" id="view-home">
           <div class="home-shell">
+            <section id="homeOrderUpdates" class="home-order-updates customer-only" aria-labelledby="homeOrderUpdatesTitle" hidden>
+              <div class="section-heading compact-heading"><div><p class="eyebrow">Your account</p><h2 id="homeOrderUpdatesTitle">Order updates</h2></div><button class="text-button" type="button" data-view="orders">View all orders</button></div>
+              <div id="homeOrderActions"></div>
+            </section>
             <section class="home-hero" aria-labelledby="homeTitle">
               <div class="home-hero-content">
                 <p class="hero-kicker">Online Portal</p>
@@ -187,6 +192,26 @@
                 </div>
                 <button id="refreshCatalog" class="secondary" type="button">Refresh</button>
               </div>
+              <div class="shop-toolbar">
+                <div class="shop-controls">
+                  <label class="search-field" for="catalogSearch"><span>Search</span><input id="catalogSearch" type="search" autocomplete="off" placeholder="Search products, brands or SKU"></label>
+                  <label class="catalog-sort" for="catalogSort"><span class="visually-hidden">Sort products</span><select id="catalogSort"><option value="recommended">Recommended</option><option value="availability">In stock first</option><option value="price-asc">Price: low to high</option><option value="price-desc">Price: high to low</option><option value="name">Name: A-Z</option><option value="brand">Brand: A-Z</option></select></label>
+                  <details id="filterMenu" class="filter-menu">
+                    <summary>Filter</summary>
+                    <div class="filter-panel">
+                      <section><h3>Type</h3><div class="check-list">
+                        <label class="check-option"><input type="checkbox" data-type-filter="vial"> Vials</label>
+                        <label class="check-option"><input type="checkbox" data-type-filter="oral"> Orals</label>
+                        <label class="check-option"><input type="checkbox" data-type-filter="pen"> Pens</label>
+                        <label class="check-option"><input type="checkbox" data-type-filter="nasal"> Nasal</label>
+                      </div></section>
+                      <section><h3>Availability</h3><div class="check-list"><label class="check-option"><input id="inStockFilter" type="checkbox"> In stock</label></div></section>
+                      <button id="clearProductFilters" class="text-button" type="button">Clear filters</button>
+                    </div>
+                  </details>
+                </div>
+                <div id="activeFilters" class="active-filters" aria-label="Active filters"></div>
+              </div>
               <section id="featuredSection" class="featured-section" aria-labelledby="featuredTitle" hidden>
                 <div class="section-heading compact-heading">
                   <div>
@@ -208,33 +233,6 @@
                 </div>
                 <div id="brandCollections" class="brand-collections"></div>
               </section>
-              <div class="shop-controls">
-                <label class="search-field" for="catalogSearch">
-                  <span>Search</span>
-                  <input id="catalogSearch" type="search" autocomplete="off" placeholder="Search products">
-                </label>
-                <details id="filterMenu" class="filter-menu">
-                  <summary>Filter</summary>
-                  <div class="filter-panel">
-                    <section>
-                      <h3>Type</h3>
-                      <div class="check-list">
-                        <label class="check-option"><input type="checkbox" data-type-filter="vial"> Vials</label>
-                        <label class="check-option"><input type="checkbox" data-type-filter="oral"> Orals</label>
-                        <label class="check-option"><input type="checkbox" data-type-filter="pen"> Pens</label>
-                        <label class="check-option"><input type="checkbox" data-type-filter="nasal"> Nasal</label>
-                      </div>
-                    </section>
-                    <section>
-                      <h3>Availability</h3>
-                      <div class="check-list">
-                        <label class="check-option"><input id="inStockFilter" type="checkbox"> In stock</label>
-                      </div>
-                    </section>
-                    <button id="clearProductFilters" class="text-button" type="button">Clear filters</button>
-                  </div>
-                </details>
-              </div>
               <div id="catalogSummary" class="catalog-summary"></div>
               <div id="productsTopPager" class="product-pager"></div>
               <div id="products" class="products"></div>
@@ -297,6 +295,7 @@
                 <span id="cartCount" class="pill">0 items</span>
               </div>
               <div id="cartItems" class="cart-items empty">No products selected.</div>
+              <p id="cartNotice" class="cart-notice" role="status" hidden></p>
               <div class="total-row">
                 <span>Total</span>
                 <strong id="cartTotal">R0.00</strong>
@@ -362,6 +361,7 @@
               <button class="admin-view-tab" type="button" data-admin-view="ready">Ready to pack</button>
               <button class="admin-view-tab" type="button" data-admin-view="completed">Completed</button>
               <button class="admin-view-tab" type="button" data-admin-view="accounts">Accounts</button>
+              <button class="admin-view-tab" type="button" data-admin-view="customer-care">Customer support</button>
               <button class="admin-view-tab" type="button" data-admin-view="system-status">System status</button>
               <button class="admin-view-tab" type="button" data-admin-view="shop-settings">Shop settings</button>
             </div>
@@ -373,6 +373,27 @@
     </main>
 
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <dialog id="researchNotice" class="research-notice" closedby="none" aria-labelledby="researchNoticeTitle" aria-describedby="researchNoticeText researchNoticeRestriction">
+      <div class="research-notice-body">
+        <p class="eyebrow">Please read before continuing</p>
+        <h2 id="researchNoticeTitle">Research Use Notice</h2>
+        <p id="researchNoticeText" class="research-notice-lead">All products are research chemicals intended for laboratory research use only.</p>
+        <p id="researchNoticeRestriction">Not intended for human or veterinary use.</p>
+        <button id="acknowledgeResearchNotice" class="primary" type="button" disabled>Continue in 3s</button>
+      </div>
+    </dialog>
+    <dialog id="customerSupportDialog" class="customer-support-dialog" aria-labelledby="customerSupportTitle">
+      <div class="section-heading compact-heading"><h2 id="customerSupportTitle">Customer support</h2><button class="support-close" type="button" data-close-support aria-label="Close support" title="Close support" autofocus>&times;</button></div>
+      <div id="supportContacts" class="support-contacts"></div>
+      <form id="customerSupportForm" class="form-stack">
+        <label>Order<select id="supportOrderId" name="orderId"><option value="">General enquiry</option></select></label>
+        <label>Topic<select name="topic"><option>Order enquiry</option><option>Payment</option><option>Delivery</option><option>Other</option></select></label>
+        <label>Message<textarea name="message" rows="3" minlength="5" maxlength="1500" required placeholder="How can we help?"></textarea></label>
+        <p id="supportFormFeedback" role="status" class="muted small"></p>
+        <button class="primary" type="submit">Send message</button>
+      </form>
+      <section class="support-history-section" aria-labelledby="supportHistoryTitle"><h3 id="supportHistoryTitle">Your conversations</h3><div id="supportHistory"></div></section>
+    </dialog>
     <div id="termsModal" class="modal-backdrop" hidden>
       <div class="confirm-modal wide-modal terms-modal" role="dialog" aria-modal="true" aria-labelledby="termsTitle">
         <div class="modal-shell">
@@ -450,6 +471,27 @@
     <dialog id="productQuickView" class="product-quick-view" aria-labelledby="quickViewTitle">
       <button class="quick-view-close" type="button" data-close-product aria-label="Close product" title="Close product" autofocus>&times;</button>
       <div id="quickViewContent" class="quick-view-content"></div>
+    </dialog>
+    <dialog id="productImageViewer" class="product-image-viewer" aria-labelledby="imageViewerTitle">
+      <header class="image-viewer-toolbar">
+        <h2 id="imageViewerTitle">Product image</h2>
+        <div class="image-viewer-controls" role="group" aria-label="Image zoom">
+          <button type="button" id="imageZoomOut" aria-label="Zoom out" title="Zoom out" disabled>&minus;</button>
+          <output id="imageZoomLevel" aria-live="polite" aria-label="Zoom level">100%</output>
+          <button type="button" id="imageZoomIn" aria-label="Zoom in" title="Zoom in" disabled>+</button>
+          <button type="button" id="imageZoomFit" title="Fit image" disabled>Fit</button>
+        </div>
+        <button class="image-viewer-close" type="button" data-close-image aria-label="Close image" title="Close image" autofocus>&times;</button>
+      </header>
+      <div id="imageViewerStage" class="image-viewer-stage">
+        <div id="imageZoomCanvas" class="image-zoom-canvas"><img id="imageViewerImage" alt="" draggable="false"></div>
+        <div id="imageViewerStatus" class="image-viewer-message"><p id="imageViewerMessage" role="status"></p><button id="retryProductImage" class="secondary" type="button" hidden>Retry</button></div>
+      </div>
+      <footer id="imageGalleryControls" class="image-gallery-controls" aria-label="Image navigation" hidden>
+        <button id="imagePhotoPrevious" type="button" aria-label="Previous image" title="Previous image">&larr;</button>
+        <span id="imagePhotoCount">1 / 1</span>
+        <button id="imagePhotoNext" type="button" aria-label="Next image" title="Next image">&rarr;</button>
+      </footer>
     </dialog>
     <div id="orderFlowModal" class="modal-backdrop" hidden>
       <div class="confirm-modal wide-modal" role="dialog" aria-modal="true" aria-labelledby="orderFlowTitle">
@@ -579,6 +621,6 @@
         </form>
       </div>
     </div>
-    <script src="/app.js?v=20261014-fulfillment-rules-1" type="module"></script>
+    <script src="/app.js?v=20261029-customer-experience-1" type="module"></script>
   </body>
 </html>

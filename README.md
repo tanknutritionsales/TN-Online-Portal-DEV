@@ -17,6 +17,31 @@ Read `AGENTS.md` and `memory/online-portal-app.md` before changing this app.
 - Admin verifies payment. Shopify order creation can only run after that confirmation and only when `SHOPIFY_ORDER_SYNC_ENABLED=true`.
 - Retail Shark reads confirmed, Shopify-ready orders through protected internal APIs and writes tracking/back-order/shipped updates back to Online Portal.
 
+## Customer Experience and Support
+
+- The research-use notice appears on every page load, with a three-second acknowledgment delay. Registration retains its separate terms and age confirmation.
+- Shop search supports multiple words, sorting and removable filter chips. Mobile shows two product cards per row and a sticky search/filter toolbar.
+- Customer baskets are saved per account on the current browser for 30 days. Only variant IDs and quantities are saved. Signing in is still required after a reload; current catalog prices and server-side stock checks apply before checkout. This is not cross-device cart storage.
+- Product quick view shows Shopify images (up to eight), zoom controls, and strength/format/pack size when present. Admin > Shop settings > Product details can supply missing facts or override labels; leave fields blank to use explicit catalog labels. The portal does not invent dosage instructions.
+- Home shows the next action for active orders. Signed-in visible tabs refresh order status and support replies once per minute.
+- Help and each order's Need help button open a private support conversation. Staff reply in Admin > Customer support. Customers read replies in Help; email and WhatsApp contact links appear once configured under Shop settings > Customer communication.
+- Account recovery is not included in this patch.
+
+## Optional Order Emails
+
+Order emails use the Resend API. Delivery is off by default. To configure after deploying:
+
+1. Verify a sender domain with Resend and create a sending API key.
+2. Set server-side Netlify variables `RESEND_API_KEY` (secret), `EMAIL_FROM` (the verified email address without a display name) and `PORTAL_PUBLIC_URL` (the public HTTPS portal address). Redeploy after changing environment variables. Never put the service key in public files.
+3. In Admin > Shop settings > Customer communication, enter support contacts/display name, select notification events, enable Send order emails and save.
+4. Check Admin > Customer support > Email delivery for setup status and results. Sent to email service means accepted by the provider, not confirmed inbox delivery. Delivery/bounce webhooks are not implemented.
+
+Events cover order received, payment details ready, payment confirmed and shipment updates. Emails include the reference, total and a sign-in link to the order; product names and payment URLs stay in the portal. The admin payment-verification and Shopify mutation gates are unchanged.
+
+The Postgres `op_customer_messages` table stores support conversations and email delivery records. It is created automatically using the existing database connection. The `customer-notifications` scheduled Netlify Function retries eligible messages every five minutes on published production deploys. Delivery uses short database row locks, a two-minute claim lease, provider idempotency keys and five automatic attempts. Retries expire after 23 hours to stay within the provider's 24-hour deduplication window. Obsolete payment prompts are skipped. Events from before emails were enabled are not backfilled automatically; interrupted recent queue inserts can be recovered from saved order events.
+
+Local and deploy-preview runs never send email. Local messaging uses ignored `data/customer-messages.json`; hosted messaging requires Postgres. No email credentials or support contact values are bundled.
+
 ## Local Start
 
 ```powershell
@@ -41,6 +66,10 @@ To stop the local server, double-click `Stop Online Portal.cmd`.
 ```powershell
 npm run check:all
 ```
+
+This includes a disposable credential-free server test for customer isolation, support replies, message concurrency, email retries, product facts and the existing order flow. It does not load this checkout's `.env`, call Shopify, or touch hosted Retail Shark data.
+
+For a disposable browser preview, run `npm run preview:isolated` and use the URL it prints. Stop it with Ctrl+C to remove its temporary data. Its gallery photos are QA fixtures, not changes to Shopify.
 
 With the local server running:
 

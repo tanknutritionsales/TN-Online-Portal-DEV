@@ -1,6 +1,6 @@
 # Online Portal App Memory
 
-Last updated: 2026-10-20
+Last updated: 2026-10-29
 
 ## Purpose
 
@@ -33,7 +33,7 @@ Retail Shark remains the internal staff operations app. Online Portal owns custo
 1. Customer starts on the login screen.
 2. Customer logs in or creates an account with required contact and delivery fields.
 3. New customer registration is blocked behind a required terms/disclaimer modal. The customer must scroll to the bottom, confirm they are 18 years or older, and accept the research-use-only disclaimer before the account is created. The accepted terms version/timestamp is stored on the customer account.
-4. Customer lands on Home, with a branded hero, Shop by Goal (`goal-*` Shopify tags), and Shop by Brand (Shopify vendors). The four goal groups are Lean muscle & Cutting, Mass & Strength, Recovery & Longevity, and Fat loss & Metabolic. Shop retains the featured slider, search, type and availability filters, and 30-product pagination. Protocol Manuals has a separate placeholder page; the two PDFs are not integrated yet.
+4. Customer lands on Home, with a branded hero, Shop by Goal (`goal-*` Shopify tags), and Shop by Brand (Shopify vendors). The four goal groups are Lean muscle & Cutting, Mass & Strength, Recovery & Longevity, and Fat loss & Metabolic. Shop retains the featured slider, search, type and availability filters, and 30-product pagination. Protocol Manuals integrates Volume 1 Peptides and Volume 2 Performance using a compact page viewer with PDF open/download links.
 5. Customer adds normal in-stock products to cart. The user nav shows a cart quantity bubble.
 6. Customer can add/manage multiple delivery addresses from My account or checkout.
 7. Customer submits the cart as an order request.
@@ -96,7 +96,7 @@ Customer-facing status:
 - `Payment pending` for newly submitted orders without payment details.
 - `Awaiting payment link` after review is needed but details are not attached.
 - `Payment required` after payment details are attached.
-- `Marked as paid, processing` after customer marks paid or admin confirms payment.
+- `Marked as paid, processing` after the customer marks paid; `Processing` after admin verifies payment.
 - `Shipped` after Retail Shark marks shipped.
 - Special orders show review/declined/countered labels as appropriate.
 
@@ -186,6 +186,15 @@ Office flow:
 - Multiple hosted sessions are supported through signed stateless cookies and database-backed storage.
 
 ## Current Testing Notes
+
+- 2026-10-29 UX batch approved by the user for the production repository. Account recovery was explicitly deferred.
+- Image zoom uses vendored Panzoom with thumbnail gallery/next/previous photos (up to eight Shopify images). Product quick view shows explicit strength/format/pack size, with admin overrides in Shop settings > Product details.
+- Mandatory Research Use Notice appears before login on every page load, enforces a three-second timer, and cannot be dismissed with Escape/outside click. Existing registration terms/18+ gate remains separate. Header dropdowns are mutually exclusive and close on outside click/Escape.
+- Shop search sits first, supports multiword matches, sorting and removable chips; mobile has a compact header, sticky controls and two product cards per row. Cart quantities can be edited with stock validation. Per-account browser baskets retain only variant IDs/quantities for 30 days and refresh catalog prices after login; not cross-device persistence. Reload still requires login.
+- Home shows active order next actions and new support replies. Visible signed-in customer tabs poll orders/support once per minute. Customer Help and per-order Need help open private support threads; admin has Customer support with open/all requests and reply forms. Contacts/hours are admin-configurable and still await the user's preferred values.
+- Optional Resend order emails are implemented but off/unconfigured until a verified sender/API key is supplied and admin enables them. New variables: RESEND_API_KEY, EMAIL_FROM, PORTAL_PUBLIC_URL. No real emails or Netlify environment changes were made in this batch.
+- Support/email records use Postgres op_customer_messages (lazy schema creation); local JSON data/customer-messages.json remains ignored. Sending is production/Postgres only. Email records have atomic claims, deterministic provider idempotency, five retries, 23-hour expiry, and a five-minute scheduled retry/reconciliation function. Admin Email delivery view reports acceptance/errors and offers eligible retries; inbox delivery/bounce webhooks are not implemented.
+- npm run check:all now includes isolated customer-experience tests (basket isolation, product facts, concurrent message updates/claims, support ownership/replies, safe email failures, settings preservation and paid-order flow). npm run smoke:local was also run against disposable local data with Shopify sync false and no external credentials. Gallery, stock-limit rejection, restored cart, support replies, admin settings and phone layout were checked in the browser.
 
 - Hosted flow has been tested end-to-end with Postgres storage.
 - Online Portal to Retail Shark hosted integration has been tested successfully.
