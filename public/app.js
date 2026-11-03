@@ -1,5 +1,7 @@
 import { cartStorageKey, readSavedCart, saveCart } from "/cart-storage.js";
 import { productFacts } from "/product-content.js";
+import { createCatalogSearch, normalizeSearchSettings, anonymousSearchTerm } from "/catalog-search.js";
+import { mountAdminSearch } from "/admin-search.js";
 
 const money = new Intl.NumberFormat("en-ZA", { style: "currency", currency: "ZAR" });
 
@@ -60,6 +62,13 @@ const state = {
   adminOrderFilter: "all",
   manualId: "peptides",
   manualPage: 1,
+  searchIndex: null,
+  searchSource: null,
+  searchSettingsSource: null,
+  searchMatches: new Map(),
+  receiptSeen: new Set(),
+  receiptOrderId: "",
+  receiptAutoPrompted: false,
 };
 
 const productTypes = [
@@ -105,6 +114,8 @@ let productImageLoadId = 0;
 let customerPollTimer = null;
 let lastCustomerPoll = 0;
 let supportRequestKey = "";
+let searchMissTimer = null;
+const recordedSearchMisses = new Set();
 
 const qs = (selector, root = document) => root.querySelector(selector);
 const qsa = (selector, root = document) => [...root.querySelectorAll(selector)];
@@ -190,6 +201,8 @@ function defaultShopSettings() {
       specialFormat: "SO-{YYYY}{MM}{DD}-{RAND4}",
     },
     productContent: {},
+    search: normalizeSearchSettings(),
+    deliveryConfirmation: { enabled: true, delayDays: 3, snoozeHours: 24 },
     customerCare: { supportEmail: "", whatsappNumber: "", supportHours: "", emailEnabled: false, senderName: "Tank Nutrition", events: { order_received: true, payment_ready: true, payment_confirmed: true, shipped: true } },
   };
 }
@@ -228,16 +241,31 @@ function showScreen(screen) {
 }
 
 function showAuth() {
+  state.searchAdminCleanup?.();
+  state.searchAdminCleanup = null;
   closeProductQuickView();
   closeOrderFlowModal();
   if (qs("#customerSupportDialog").open) qs("#customerSupportDialog").close();
   clearInterval(customerPollTimer);
   state.user = null;
   state.admin = null;
+  clearInterval(researchNoticeTimer);
+  researchNoticeTimer = null;
+  researchNoticeAcknowledged = false;
+  researchNoticeDeadline = 0;
+  if (qs("#researchNotice").open) qs("#researchNotice").close();
+  document.body.classList.remove("research-notice-open");
+  qs("#portalMain").inert = false;
   state.cartRestoredFor = "";
   state.cartWarning = "";
   state.catalogReady = false;
   state.customerOrders = [];
+  state.receiptSeen.clear();
+  state.receiptAutoPrompted = false;
+  state.receiptOrderId = "";
+  if (qs("#deliveryReceiptDialog").open) qs("#deliveryReceiptDialog").close();
+  clearTimeout(searchMissTimer);
+  recordedSearchMisses.clear();
   state.customerSupport = [];
   state.customerSupportLoaded = false;
   state.customerSupportError = "";
@@ -257,6 +285,7 @@ async function showApp(session) {
   qs("#themeToggle").hidden = false;
   qs("#accountName").textContent = state.admin ? state.admin.name || state.admin.username || "Admin" : state.user.name;
   applyTheme(state.admin?.preferences?.theme || state.user?.preferences?.theme || "light");
+  showResearchNotice();
   switchView(state.admin ? "admin" : "home", { refreshAdmin: false });
   if (state.admin) {
     await Promise.all([loadAdminOrders(), loadCatalog()]);
@@ -300,6 +329,7 @@ function renderManual() {
 }
 
 function switchView(view, { refreshAdmin = true } = {}) {
+  if (view !== "home") state.receiptAutoPrompted = false;
   if (state.admin && !["home", "order", "manuals", "admin"].includes(view)) return;
   qsa(".tab").forEach((tab) => tab.classList.toggle("is-active", tab.dataset.view === view));
   qsa(".view").forEach((panel) => panel.classList.toggle("is-active", panel.id === `view-${view}`));
@@ -321,6 +351,7 @@ function switchView(view, { refreshAdmin = true } = {}) {
   if (view === "orders" && state.user) loadCustomerOrders();
   if (view === "account" && state.user) renderAccount();
   if (view === "admin" && state.admin && refreshAdmin) loadAdminOrders();
+  if (view === "home") maybePromptDeliveryReceipt();
 }
 
 async function initSession() {
@@ -331,11 +362,15 @@ async function initSession() {
 }
 
 function showResearchNotice() {
+  if (!state.user || state.admin) return;
   const notice = qs("#researchNotice");
+  clearInterval(researchNoticeTimer);
+  researchNoticeAcknowledged = false;
   researchNoticeDeadline = performance.now() + 3000;
   qs("#acknowledgeResearchNotice").disabled = true;
+  qs("#portalMain").inert = true;
   document.body.classList.add("research-notice-open");
-  notice.showModal();
+  if (!notice.open) notice.showModal();
   const updateCountdown = () => {
     const remaining = Math.max(0, Math.ceil((researchNoticeDeadline - performance.now()) / 1000));
     const button = qs("#acknowledgeResearchNotice");
@@ -352,12 +387,15 @@ function showResearchNotice() {
 }
 
 function acknowledgeResearchNotice() {
-  if (performance.now() < researchNoticeDeadline) return;
+  if ((!state.user && !state.admin) || performance.now() < researchNoticeDeadline) return;
   researchNoticeAcknowledged = true;
   qs("#portalMain").inert = false;
   qs("#researchNotice").close();
   document.body.classList.remove("research-notice-open");
-  qs('#loginForm input[name="login"]').focus();
+  const heading = qs("#screenTitle");
+  heading.setAttribute("tabindex", "-1");
+  heading.focus({ preventScroll: true });
+  maybePromptDeliveryReceipt();
 }
 
 async function login(event) {
@@ -632,6 +670,8 @@ function mergeShopSettings(settings = {}) {
     fulfillment: mergeFulfillmentSettings(settings.fulfillment || {}, defaults.fulfillment),
     references: { ...defaults.references, ...(settings.references || {}) },
     customerCare: { ...defaults.customerCare, ...(settings.customerCare || {}), events: { ...defaults.customerCare.events, ...(settings.customerCare?.events || {}) } },
+    search: settings.search || defaults.search,
+    deliveryConfirmation: { ...defaults.deliveryConfirmation, ...(settings.deliveryConfirmation || {}) },
   };
 }
 
@@ -747,6 +787,10 @@ function renderProducts() {
   qs(".brand-section").hidden = focused;
   updateFilterControls();
   renderCatalogSummary(products.length);
+  const suggestionBox = qs("#searchSuggestions");
+  const suggestions = !products.length ? catalogSearch().suggest(state.search) : [];
+  suggestionBox.hidden = !suggestions.length;
+  suggestionBox.innerHTML = suggestions.length ? `<span>Did you mean</span> ${suggestions.map((query) => `<button type="button" class="secondary" data-search-suggestion="${escapeHtml(query)}" data-search-context="shop">${escapeHtml(query)}</button>`).join("")}` : "";
   if (!products.length) {
     renderProductPager("productsTopPager", 0);
     renderProductPager("productsBottomPager", 0);
@@ -790,6 +834,7 @@ function renderProductCard(product, extraClass = "") {
       <div class="product-body">
         <p class="eyebrow">${escapeHtml(product.vendor)}</p>
         <h3>${escapeHtml(product.title)}</h3>
+        ${state.searchMatches.get(product.id)?.reason && state.search ? `<small class="search-match-note">${escapeHtml(state.searchMatches.get(product.id).reason)}</small>` : ""}
         <div class="product-facts">
           <span>${money.format(variant?.price || 0)}</span>
           <span class="availability ${available ? "in-stock" : "out-stock"}">${availabilityLabel}</span>
@@ -993,19 +1038,18 @@ function featuredProducts(settings) {
   }
   const query = normalizeSearch(settings?.collectionQuery || "Dex");
   if (!query) return state.products.filter((product) => product.variant?.inStock).slice(0, 10);
-  return state.products.filter((product) => searchableProductText(product).includes(query));
+  return catalogSearch().search(query).map((match) => match.product);
 }
 
 function filteredProducts() {
-  const query = normalizeSearch(state.search);
-  const products = state.products.filter((product) => {
+  const matches = catalogSearch().search(state.search);
+  state.searchMatches = new Map(matches.map((match) => [match.product.id, match]));
+  const products = matches.map((match) => match.product).filter((product) => {
     if (state.selectedBrand && normalizeSearch(product.vendor) !== normalizeSearch(state.selectedBrand)) return false;
     if (state.selectedGoal && !productMatchesGoal(product, shopGoals.find((goal) => goal.id === state.selectedGoal))) return false;
     if (state.inStockOnly && !product.variant?.inStock) return false;
     if (state.selectedTypes.size && !matchesSelectedTypes(product)) return false;
-    if (!query) return true;
-    const text = searchableProductText(product);
-    return query.split(" ").every((term) => text.includes(term));
+    return true;
   });
   const byName = (a, b) => a.title.localeCompare(b.title, "en", { numeric: true, sensitivity: "base" });
   if (state.sort === "price-asc") products.sort((a, b) => Number(a.variant?.price || 0) - Number(b.variant?.price || 0) || byName(a, b));
@@ -1501,8 +1545,7 @@ function renderSpecialProductOptions() {
     return;
   }
   const query = normalizeSearch(state.specialProductSearch);
-  const products = state.products
-    .filter((product) => productMatchesSearch(product, query));
+  const products = catalogSearch().search(state.specialProductSearch).map((match) => match.product);
   results.innerHTML = products.length
     ? products
         .map((product) => {
@@ -1517,7 +1560,8 @@ function renderSpecialProductOptions() {
           `;
         })
         .join("")
-    : `<p class="muted">No products match that search.</p>`;
+    : `<p class="muted">No products match that search.</p>${catalogSearch().suggest(state.specialProductSearch).map((query) => `<button type="button" class="secondary" data-search-suggestion="${escapeHtml(query)}" data-search-context="special">Did you mean ${escapeHtml(query)}?</button>`).join("")}`;
+  scheduleSearchMiss(state.specialProductSearch);
 }
 
 function renderSpecialAddressOptions() {
@@ -1783,6 +1827,7 @@ async function loadCustomerOrders() {
     state.customerOrdersLoaded = true;
     container.innerHTML = state.customerOrders.length ? state.customerOrders.map(renderCustomerOrder).join("") : `<p class="muted">No orders yet.</p>`;
     renderHomeOrderUpdates();
+    maybePromptDeliveryReceipt();
     if (!qs("#orderFlowModal").hidden && ["payment", "submitted"].includes(state.orderFlowView)) {
       const updated = changed.find((order) => order.id === state.activePaymentOrder?.id);
       if (updated) showPaymentModal(updated);
@@ -1804,7 +1849,7 @@ function renderHomeOrderUpdates() {
   const section = qs("#homeOrderUpdates");
   if (!state.user) { section.hidden = true; return; }
   const priority = (order) => order.canPay && order.paymentIssue?.type !== "paid_pending" ? 0 : order.paymentIssue?.type === "paid_pending" ? 1 : order.fulfillmentStatus === "shipped" ? 4 : order.paymentStatus === "confirmed" ? 3 : 2;
-  const orders = state.customerOrders.filter((order) => order.specialOrder?.status !== "declined" && (order.fulfillmentStatus !== "shipped" || Date.now() - Date.parse(order.updatedAt) < 7 * 24 * 60 * 60 * 1000)).sort((a, b) => priority(a) - priority(b) || Date.parse(b.updatedAt) - Date.parse(a.updatedAt)).slice(0, 3);
+  const orders = state.customerOrders.filter((order) => order.specialOrder?.status !== "declined" && !order.deliveryReceipt?.receivedAt).sort((a, b) => priority(a) - priority(b) || Date.parse(b.updatedAt) - Date.parse(a.updatedAt)).slice(0, 3);
   const unreadReplies = supportUnreadCount();
   section.hidden = !orders.length && !unreadReplies;
   qs("#homeOrderActions").innerHTML = orders.map((order) => {
@@ -1814,6 +1859,49 @@ function renderHomeOrderUpdates() {
     const status = order.paymentStatus === "confirmed" && !track ? "Processing" : order.customerStatus;
     return `<article class="home-order-row"><div><strong>${escapeHtml(order.reference)}</strong><span>${escapeHtml(status)}${payable ? ` &middot; ${money.format(order.total)}` : ""}</span></div><button type="button" class="${payable ? "primary" : "secondary"}" data-view-order-${track ? "tracking" : "payment"}="${escapeHtml(order.id)}">${label}</button></article>`;
   }).join("") + (unreadReplies ? `<div class="home-order-row"><span>${unreadReplies} new support ${unreadReplies === 1 ? "reply" : "replies"}</span><button class="secondary" type="button" data-open-support>Read reply</button></div>` : "");
+}
+
+function maybePromptDeliveryReceipt() {
+  if (state.receiptAutoPrompted || !state.user || !state.customerOrdersLoaded || !qs("#view-home").classList.contains("is-active") || !qs("#specialOrderModal").hidden || !qs("#orderFlowModal").hidden || qs("dialog[open]")) return;
+  const order = state.customerOrders.filter((order) => order.deliveryReceipt?.promptDue && !state.receiptSeen.has(order.id)).sort((a, b) => Date.parse(a.deliveryReceipt.promptAfter) - Date.parse(b.deliveryReceipt.promptAfter))[0];
+  if (order) { state.receiptAutoPrompted = true; openDeliveryReceipt(order.id); }
+}
+
+function openDeliveryReceipt(orderId) {
+  const order = state.customerOrders.find((entry) => entry.id === orderId);
+  if (!order?.deliveryReceipt?.canConfirm || !state.user) return;
+  state.receiptOrderId = orderId;
+  state.receiptSeen.add(orderId);
+  const shipments = customerShipments(order);
+  qs("#deliveryReceiptContent").innerHTML = `<div class="receipt-reference"><strong>${escapeHtml(order.reference)}</strong><span class="muted small">Shipped${order.deliveryReceipt.fullyShippedAt ? ` ${new Date(order.deliveryReceipt.fullyShippedAt).toLocaleDateString("en-ZA")}` : ""}${shipments.length > 1 ? ` · ${shipments.length} parcels` : ""}</span></div><ul class="receipt-products">${order.items.map((item) => {
+    const product = state.products.find((product) => product.variant?.id === item.variantId);
+    return `<li>${product?.image ? `<img src="${escapeHtml(product.image)}" alt="" loading="lazy">` : `<span class="receipt-image-placeholder" aria-hidden="true">TN</span>`}<span>${escapeHtml(item.productTitle)}</span><strong>× ${item.quantity}</strong></li>`;
+  }).join("")}</ul>${shipments.length ? `<div class="receipt-tracking">${shipments.map((shipment, index) => `<p><strong>${shipments.length > 1 ? `Part ${index + 1}` : "Tracking"}</strong> · ${escapeHtml(shipment.courier || "Courier")} · ${escapeHtml(shipment.number)}</p>`).join("")}</div>` : ""}`;
+  qs("#deliveryReceiptFeedback").textContent = "";
+  document.body.classList.add("delivery-receipt-open");
+  qs("#deliveryReceiptDialog").showModal();
+}
+
+async function respondToDeliveryReceipt(action, { reportProblem = false } = {}) {
+  const dialog = qs("#deliveryReceiptDialog");
+  if (!state.receiptOrderId || dialog.dataset.busy === "true") return;
+  const orderId = state.receiptOrderId, userId = state.user?.id;
+  dialog.dataset.busy = "true";
+  qsa("button", dialog).forEach((button) => { button.disabled = true; });
+  qs("#deliveryReceiptFeedback").textContent = "";
+  try {
+    await api(`/api/orders/${encodeURIComponent(orderId)}/delivery-confirmation`, { method: "POST", body: JSON.stringify({ action }) });
+    if (state.user?.id !== userId) return;
+    dialog.close(); state.receiptOrderId = "";
+    await loadCustomerOrders();
+    if (reportProblem) await openCustomerSupport(orderId, { topic: "Delivery" });
+    else toast(action === "received" ? "Thank you. Your order is completed and saved in My orders." : "No problem. Your order and tracking are still available in My orders.");
+  } catch (error) {
+    if (state.user?.id === userId) qs("#deliveryReceiptFeedback").textContent = error.message;
+  } finally {
+    dialog.dataset.busy = "false";
+    qsa("button", dialog).forEach((button) => { button.disabled = false; });
+  }
 }
 
 function startCustomerPolling() {
@@ -1855,11 +1943,12 @@ async function loadCustomerSupport() {
   }
 }
 
-async function openCustomerSupport(orderId = "") {
+async function openCustomerSupport(orderId = "", { topic = "" } = {}) {
   if (!state.user || state.admin) return;
   closeOrderFlowModal();
   supportRequestKey = newIdempotencyKey("support");
   qs("#customerSupportForm").reset();
+  if (topic) qs('#customerSupportForm select[name="topic"]').value = topic;
   qs("#supportFormFeedback").textContent = "Replies will appear in your conversations below.";
   qs("#supportOrderId").innerHTML = `<option value="">General enquiry</option>${state.customerOrders.map((order) => `<option value="${escapeHtml(order.id)}" ${order.id === orderId ? "selected" : ""}>${escapeHtml(order.reference)}</option>`).join("")}`;
   renderSupportContacts();
@@ -1943,6 +2032,7 @@ function renderCustomerOrder(order) {
       <div class="order-actions">
         <button type="button" data-view-order-payment="${escapeHtml(order.id)}">${paymentActionLabel}</button>
         ${trackButton}
+        ${order.deliveryReceipt?.canConfirm ? `<button type="button" class="secondary" data-confirm-receipt="${escapeHtml(order.id)}">Mark as received</button>` : ""}
         <button class="order-help-button" type="button" data-order-support="${escapeHtml(order.id)}">Need help?</button>
       </div>
     </article>
@@ -1977,7 +2067,7 @@ function orderProgressSteps(order) {
     { label: "Payment link sent", done: hasPaymentInstructions || markedPaid || confirmed || shipped, active: hasPaymentInstructions && !markedPaid && !confirmed },
     { label: "Marked as paid", done: markedPaid || confirmed || shipped, active: markedPaid && !confirmed },
     { label: "Processing", done: confirmed || shipped, active: confirmed && !shipped },
-    { label: "Shipped", done: shipped, active: shipped },
+    { label: order.deliveryReceipt?.receivedAt ? "Received" : "Shipped", done: shipped, active: shipped },
   ];
 }
 
@@ -2167,6 +2257,7 @@ function renderAdminOrders() {
     renderAdminShopSettings();
     return;
   }
+  if (state.adminView === "search") { loadAdminSearch(); return; }
   if (state.adminView === "customer-care") {
     if (state.adminCustomerCare) renderAdminCustomerCare();
     else loadAdminCustomerCare();
@@ -2284,6 +2375,7 @@ function emptyAdminMessage(view) {
 }
 
 async function loadAdminShopSettings() {
+  state.searchAdminCleanup?.();
   qs("#adminOrdersSummary").innerHTML = `<span>Shop settings</span>`;
   qs("#adminOrders").innerHTML = `<p class="muted">Loading shop settings...</p>`;
   try {
@@ -2294,6 +2386,21 @@ async function loadAdminShopSettings() {
   } catch (error) {
     qs("#adminOrders").innerHTML = `<p class="muted">${escapeHtml(error.message)}</p>`;
   }
+}
+
+async function loadAdminSearch() {
+  state.searchAdminCleanup?.();
+  const container = qs("#adminOrders");
+  qs("#adminOrdersSummary").innerHTML = `<span>Product search</span>`;
+  container.innerHTML = `<p class="muted">Loading search settings...</p>`;
+  try {
+    const [settingsPayload, catalog, feedback] = await Promise.all([api("/api/shop-settings"), api("/api/catalog"), api("/api/admin/search")]);
+    if (!state.admin || state.adminView !== "search") return;
+    state.products = catalog.products || [];
+    state.shopSettings = mergeShopSettings(settingsPayload.settings);
+    qsa("[data-admin-view]").forEach((button) => button.classList.toggle("is-active", button.dataset.adminView === "search"));
+    state.searchAdminCleanup = mountAdminSearch({ container, products: state.products, settings: state.shopSettings.search, misses: feedback.misses, api, escapeHtml, toast, onSave: (settings) => { state.shopSettings = mergeShopSettings(settings); } });
+  } catch (error) { if (state.adminView === "search") container.innerHTML = renderLoadError("Search settings could not load.", error.message, "Retry", "retry-admin-search"); }
 }
 
 async function loadAdminAccounts() {
@@ -2751,7 +2858,10 @@ async function retryCustomerEmail(id, button) {
   } catch (error) { toast(error.message); button.disabled = false; }
 }
 
-function renderAdminShopSettings() {
+function renderAdminShopSettings({ preserveDraft = false } = {}) {
+  const existingForm = qs(".shop-settings-form");
+  const openSections = preserveDraft && existingForm ? qsa(":scope > details", existingForm).map((details) => details.open) : [];
+  const draftFields = preserveDraft && existingForm ? qsa("input[name], select[name], textarea[name]", existingForm).filter((field) => field.name !== "customProductIds").map((field) => ({ name: field.name, type: field.type, value: field.value, checked: field.checked })) : [];
   qsa("[data-admin-view]").forEach((button) => button.classList.toggle("is-active", button.dataset.adminView === state.adminView));
   const allSettings = currentShopSettings();
   const settings = allSettings.featured;
@@ -2762,8 +2872,7 @@ function renderAdminShopSettings() {
   const care = allSettings.customerCare;
   const selected = new Set(settings.customProductIds || []);
   const productSearch = normalizeSearch(state.adminProductSearch);
-  const customProducts = state.products
-    .filter((product) => !productSearch || searchableProductText(product).includes(productSearch))
+  const customProducts = catalogSearch().search(state.adminProductSearch).map((match) => match.product)
     .slice(0, 80);
   qs("#adminOrdersSummary").innerHTML = `<span>Shop settings</span>`;
   qs("#adminOrders").innerHTML = `
@@ -2863,6 +2972,15 @@ function renderAdminShopSettings() {
         </section>
       </details>
       <details class="settings-accordion">
+        <summary><span>Delivery confirmation</span><small>Customer receipt and homepage order updates</small></summary>
+        <section class="settings-grid">
+          <label class="check-option wide"><input name="deliveryConfirmationEnabled" type="checkbox" ${allSettings.deliveryConfirmation.enabled ? "checked" : ""}> Ask customers to confirm receipt</label>
+          <label>Days after the final parcel ships<input name="receiptDelayDays" type="number" min="1" max="30" step="1" value="${allSettings.deliveryConfirmation.delayDays}" required></label>
+          <label>Hours before asking again after Not yet<input name="receiptSnoozeHours" type="number" min="1" max="168" step="1" value="${allSettings.deliveryConfirmation.snoozeHours}" required></label>
+          <p class="muted small wide">Customers can also mark a fully shipped order as received in My orders. Orders remain on Home until receipt is confirmed.</p>
+        </section>
+      </details>
+      <details class="settings-accordion">
         <summary><span>References</span><small>Standard and special order formats</small></summary>
         <section class="settings-grid">
           <label>Standard order format
@@ -2880,11 +2998,20 @@ function renderAdminShopSettings() {
     </form>
   `;
   renderProductFactsEditor();
+  const newForm = qs(".shop-settings-form");
+  qsa(":scope > details", newForm).forEach((details, i) => { details.open = Boolean(openSections[i]); });
+  for (const saved of draftFields) {
+    const field = qsa("input[name], select[name], textarea[name]", newForm).find((field) => field.name === saved.name && field.type === saved.type && (!["radio", "checkbox"].includes(field.type) || field.value === saved.value));
+    if (!field) continue;
+    if (["radio", "checkbox"].includes(field.type)) field.checked = saved.checked;
+    else field.value = saved.value;
+  }
+  if (preserveDraft) newForm.dataset.mode = qs('input[name="mode"]:checked', newForm)?.value || "collection";
 }
 
 function renderProductFactsEditor() {
   const query = normalizeSearch(state.adminFactsSearch);
-  const products = state.products.filter((product) => !query || searchableProductText(product).includes(query)).slice(0, 150);
+  const products = catalogSearch().search(state.adminFactsSearch).map((match) => match.product);
   if (!products.some((product) => product.id === state.adminFactsProductId)) state.adminFactsProductId = products[0]?.id || "";
   qs("#adminFactsProduct").innerHTML = products.length ? products.map((product) => `<option value="${escapeHtml(product.id)}" ${product.id === state.adminFactsProductId ? "selected" : ""}>${escapeHtml(product.title)}</option>`).join("") : `<option value="">No matching products</option>`;
   loadProductFactsFields();
@@ -2946,6 +3073,7 @@ async function submitShopSettings(event) {
         },
         fulfillment: collectFulfillmentSettings(formData),
         productContent: state.shopSettings?.productContent || {},
+        deliveryConfirmation: { enabled: formData.get("deliveryConfirmationEnabled") === "on", delayDays: Number(formData.get("receiptDelayDays")), snoozeHours: Number(formData.get("receiptSnoozeHours")) },
         customerCare: {
           supportEmail: formData.get("supportEmail"), whatsappNumber: formData.get("whatsappNumber"), supportHours: formData.get("supportHours"), senderName: formData.get("senderName"), emailEnabled: formData.get("emailEnabled") === "on",
           events: Object.fromEntries(["order_received", "payment_ready", "payment_confirmed", "shipped"].map((key) => [key, formData.get(`emailEvent-${key}`) === "on"])),
@@ -2965,6 +3093,7 @@ async function submitShopSettings(event) {
 }
 
 function adminOrderStatusLabel(order) {
+  if (order.deliveryReceipt?.receivedAt) return "Received by customer";
   if (order.fulfillmentStatus === "shipped") return "Completed";
   if (order.specialOrder?.status === "declined") return "Declined";
   if (order.paymentStatus === "confirmed") {
@@ -3024,6 +3153,7 @@ function renderAdminOrder(order) {
         ${Number(order.deliveryFee || 0) ? `<p><strong>${escapeHtml(courierSettings().title || "Courier")}:</strong> ${money.format(order.deliveryFee)}</p>` : ""}
         <p><strong>Total:</strong> ${money.format(order.total)}</p>
         ${workflowNote}
+        ${order.deliveryReceipt?.receivedAt ? `<p class="muted"><strong>Customer confirmed receipt:</strong> ${new Date(order.deliveryReceipt.receivedAt).toLocaleString("en-ZA")}</p>` : ""}
         ${storageTransferNote}
         ${stockCheck}
         ${specialReview}
@@ -3601,10 +3731,28 @@ function searchableProductText(product) {
   return normalizeSearch([product.title, product.vendor, product.productType, product.variant?.sku, ...(product.tags || [])].join(" "));
 }
 
-function productMatchesSearch(product, query) {
-  if (!query) return true;
-  const text = searchableProductText(product);
-  return query.split(" ").filter(Boolean).every((token) => text.includes(token));
+function catalogSearch() {
+  const settings = state.shopSettings?.search;
+  if (!state.searchIndex || state.searchSource !== state.products || state.searchSettingsSource !== settings) {
+    state.searchIndex = createCatalogSearch(state.products, settings);
+    state.searchSource = state.products;
+    state.searchSettingsSource = settings;
+  }
+  return state.searchIndex;
+}
+
+function scheduleSearchMiss(query) {
+  clearTimeout(searchMissTimer);
+  if (!state.user || !state.catalogReady || !state.shopSettings?.search?.recordMisses) return;
+  const term = anonymousSearchTerm(query);
+  if (!term || recordedSearchMisses.has(term) || catalogSearch().search(query).length) return;
+  const userId = state.user.id;
+  searchMissTimer = setTimeout(async () => {
+    if (state.user?.id !== userId) return;
+    recordedSearchMisses.add(term);
+    try { await api("/api/search/misses", { method: "POST", body: JSON.stringify({ query: term }) }); }
+    catch { recordedSearchMisses.delete(term); }
+  }, 1200);
 }
 
 function typeLabel(typeId) {
@@ -3647,6 +3795,15 @@ async function copyText(value, label = "text") {
 }
 
 document.addEventListener("click", (event) => {
+  if (event.target.closest("[data-retry-admin-search]")) loadAdminSearch();
+  const suggestion = event.target.closest("[data-search-suggestion]");
+  if (suggestion) {
+    const query = suggestion.dataset.searchSuggestion;
+    if (suggestion.dataset.searchContext === "special") { state.specialProductSearch = query; state.selectedSpecialProductId = ""; renderSpecialProductOptions(); qs("#specialProductSearch").focus(); }
+    else { state.search = query; state.productPage = 1; qs("#catalogSearch").value = query; renderProducts(); qs("#catalogSearch").focus(); }
+  }
+  const receipt = event.target.closest("[data-confirm-receipt]");
+  if (receipt) openDeliveryReceipt(receipt.dataset.confirmReceipt);
   if (!event.target.closest(".nav-dropdown")) qsa(".nav-dropdown[open]").forEach((menu) => { menu.open = false; });
   if (event.target.closest("[data-open-support]")) openCustomerSupport();
   const orderSupport = event.target.closest("[data-order-support]");
@@ -3797,10 +3954,12 @@ document.addEventListener("click", (event) => {
 
   const adminTab = event.target.closest("[data-admin-view]");
   if (adminTab) {
+    state.searchAdminCleanup?.();
     state.adminView = adminTab.dataset.adminView;
     state.adminOrderFilter = "all";
     state.adminOrderSearch = "";
     if (state.adminView === "shop-settings") loadAdminShopSettings();
+    else if (state.adminView === "search") loadAdminSearch();
     else if (state.adminView === "customer-care") loadAdminCustomerCare();
     else if (state.adminView === "accounts") loadAdminAccounts();
     else if (state.adminView === "system-status") loadSystemStatus();
@@ -3948,6 +4107,7 @@ qs("#catalogSearch").addEventListener("input", (event) => {
   state.search = event.target.value.trim();
   state.productPage = 1;
   renderProducts();
+  scheduleSearchMiss(state.search);
 });
 
 document.addEventListener("input", (event) => {
@@ -3973,7 +4133,7 @@ document.addEventListener("input", (event) => {
   if (event.target.matches("#adminProductPickSearch")) {
     syncDraftCustomSelections();
     state.adminProductSearch = event.target.value.trim();
-    renderAdminShopSettings();
+    renderAdminShopSettings({ preserveDraft: true });
     const input = qs("#adminProductPickSearch");
     if (input) {
       input.focus();
@@ -4016,6 +4176,11 @@ document.addEventListener("submit", (event) => {
 });
 
 qs("#logoutButton").addEventListener("click", logout);
+qs("#receiptReceived").addEventListener("click", () => respondToDeliveryReceipt("received"));
+qs("#receiptNotYet").addEventListener("click", () => respondToDeliveryReceipt("not_yet"));
+qs("#receiptProblem").addEventListener("click", () => respondToDeliveryReceipt("not_yet", { reportProblem: true }));
+qs("#deliveryReceiptDialog").addEventListener("cancel", (event) => { event.preventDefault(); respondToDeliveryReceipt("not_yet"); });
+qs("#deliveryReceiptDialog").addEventListener("close", () => document.body.classList.remove("delivery-receipt-open"));
 document.addEventListener("visibilitychange", refreshCustomerUpdates);
 qs("#customerSupportDialog").addEventListener("click", (event) => {
   if (event.target !== event.currentTarget) return;
@@ -4028,7 +4193,7 @@ qs("#researchNotice").addEventListener("keydown", (event) => {
   if (event.key === "Escape") event.preventDefault();
 });
 qs("#researchNotice").addEventListener("close", () => {
-  if (!researchNoticeAcknowledged) qs("#researchNotice").showModal();
+  if (state.user && !state.admin && !researchNoticeAcknowledged && !qs("#researchNotice").open) qs("#researchNotice").showModal();
 });
 qs("#acknowledgeResearchNotice").addEventListener("click", acknowledgeResearchNotice);
 qs("#productImageViewer").addEventListener("close", () => {
@@ -4082,6 +4247,7 @@ qs("#refreshOrders").addEventListener("click", loadCustomerOrders);
 qs("#termsScrollBody").addEventListener("scroll", updateTermsGate);
 qs("#refreshAdminPanel").addEventListener("click", () => {
   if (state.adminView === "shop-settings") loadAdminShopSettings();
+  else if (state.adminView === "search") loadAdminSearch();
   else if (state.adminView === "customer-care") loadAdminCustomerCare();
   else if (state.adminView === "accounts") loadAdminAccounts();
   else if (state.adminView === "system-status") loadSystemStatus();
@@ -4090,5 +4256,4 @@ qs("#refreshAdminPanel").addEventListener("click", () => {
 
 installInputMasks();
 renderCart();
-showResearchNotice();
 initSession();

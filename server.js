@@ -8,6 +8,9 @@ import { findOfficeShortfalls } from "./lib/fulfillment-stock.mjs";
 import { normalizeProductContent, productFacts } from "./public/product-content.js";
 import { createCustomerMessageStore } from "./lib/customer-message-store.mjs";
 import { normalizeCustomerCare, emailSetupStatus, createOrderEmail, deliverQueuedEmail } from "./lib/customer-notifications.mjs";
+import { normalizeSearchSettings, anonymousSearchTerm } from "./public/catalog-search.js";
+import { normalizeDeliverySettings, deliveryReceiptView, recordDeliveryResponse } from "./lib/order-receipts.mjs";
+import { createSettingsUpdater } from "./lib/shop-settings-store.mjs";
 
 const moduleUrl = import.meta.url || "";
 const modulePath = moduleUrl ? fileURLToPath(moduleUrl) : "";
@@ -57,6 +60,7 @@ let shopifyClientCredentialsToken = null;
 let databasePool = null;
 let databaseReady = false;
 const rateLimitBuckets = new Map();
+const updateShopSettings = createSettingsUpdater({ useDatabase: dataStorageUsesDatabase, database: async () => { await ensureDatabaseSchema(); return database(); }, read: readShopSettingsData, write: writeShopSettingsData, normalize: normalizeShopSettings, defaults: defaultShopSettings });
 
 validateRuntimeConfig();
 
@@ -527,6 +531,8 @@ function applyRouteRateLimit(req, url) {
   if (url.pathname === "/api/auth/register") return rateLimit(req, "register", 5, 60 * 60 * 1000);
   if (url.pathname === "/api/orders") return rateLimit(req, "orders", 20, 10 * 60 * 1000);
   if (url.pathname === "/api/support") return rateLimit(req, "support", 10, 10 * 60 * 1000);
+  if (url.pathname === "/api/search/misses") return rateLimit(req, "search-feedback", 30, 10 * 60 * 1000);
+  if (url.pathname.endsWith("/delivery-confirmation")) return rateLimit(req, "delivery-confirmation", 40, 10 * 60 * 1000);
   if (url.pathname.includes("/payment") || url.pathname.includes("/proof")) return rateLimit(req, "payment", 40, 10 * 60 * 1000);
 }
 
@@ -707,6 +713,8 @@ function defaultShopSettings() {
     },
     productContent: {},
     customerCare: normalizeCustomerCare(),
+    search: normalizeSearchSettings(),
+    deliveryConfirmation: normalizeDeliverySettings(),
   };
 }
 
@@ -735,6 +743,8 @@ function normalizeShopSettings(input = {}) {
     fulfillment: normalizeFulfillmentSettings(fulfillment, defaults.fulfillment),
     productContent: normalizeProductContent(input.productContent),
     customerCare: normalizeCustomerCare(input.customerCare),
+    search: normalizeSearchSettings(input.search),
+    deliveryConfirmation: normalizeDeliverySettings(input.deliveryConfirmation),
     references: {
       standardFormat: normalizeReferenceFormat(references.standardFormat || defaults.references.standardFormat, defaults.references.standardFormat),
       specialFormat: normalizeReferenceFormat(references.specialFormat || defaults.references.specialFormat, defaults.references.specialFormat),
@@ -1365,6 +1375,20 @@ function formatAddress(address) {
   return [address.line1, address.line2, address.suburb, address.city, address.province, address.postalCode, address.country].filter(Boolean).join(", ");
 }
 
+function orderShippingRequirements(order) {
+  return { officeRequired: officeFulfillmentItems(order).length > 0, externalRequired: externalFulfillmentItems(order).length > 0 };
+}
+
+async function withDeliveryReceipts(orders) {
+  if (!orders.length) return [];
+  const [records, data] = await Promise.all([customerMessages.getMany(orders.map((order) => `receipt:${order.id}`)), readShopSettingsData()]);
+  const byId = new Map(records.map((record) => [record.orderId, record]));
+  return orders.map((order) => {
+    const record = byId.get(order.id);
+    return { ...order, updatedAt: record && Date.parse(record.updatedAt) > Date.parse(order.updatedAt) ? record.updatedAt : order.updatedAt, deliveryReceipt: deliveryReceiptView(order, record, data.settings.deliveryConfirmation, orderShippingRequirements(order)) };
+  });
+}
+
 function publicOrder(order) {
   const readyForPayment = specialOrderReadyForPayment(order);
   return {
@@ -1383,6 +1407,7 @@ function publicOrder(order) {
     fulfillmentReview: publicFulfillmentReview(order.fulfillmentReview),
     specialOrder: publicSpecialOrder(order.specialOrder),
     customerStatus: customerStatus(order),
+    deliveryReceipt: order.deliveryReceipt || null,
     proof: order.proof ? { filename: order.proof.filename, uploadedAt: order.proof.uploadedAt } : null,
     canUploadProof: false,
     canPay: order.paymentStatus !== "confirmed" && readyForPayment && Boolean(order.paymentLink),
@@ -1522,6 +1547,7 @@ function retailSharkOrder(order) {
 }
 
 function customerStatus(order) {
+  if (order.deliveryReceipt?.receivedAt) return "Completed";
   if (order.specialOrder?.status === "pending") return "Special order review";
   if (order.specialOrder?.status === "declined") return "Special order declined";
   if (order.fulfillmentStatus === "shipped") return "Shipped";
@@ -2152,9 +2178,10 @@ async function updateExternalTracking(orderId, input, admin) {
     addedBy: cleanText(admin?.username || "admin", 120),
   };
   if (!order.externalTracking.number) throw new Error("Tracking number is required.");
-  if (!officeFulfillmentItems(order).length || order.officeShippedAt || order.tracking?.number) {
+  if (!officeFulfillmentItems(order).length || order.officeShippedAt) {
+    const alreadyShipped = order.fulfillmentStatus === "shipped";
     order.fulfillmentStatus = "shipped";
-    order.shippedAt = now;
+    if (!alreadyShipped || !order.shippedAt) order.shippedAt = now;
   }
   order.updatedAt = now;
   order.statusEvents.push({ at: now, actor: "admin", type: "external_tracking_added", label: "External shipment tracking added" });
@@ -3251,6 +3278,32 @@ async function handleApi(req, res, url) {
     const data = await readShopSettingsData();
     return json(res, 200, { ok: true, settings: data.settings });
   }
+  if (req.method === "POST" && url.pathname === "/api/search/misses") {
+    await requireCustomer(req);
+    const { query } = await bodyJson(req);
+    const term = anonymousSearchTerm(query);
+    const settings = (await readShopSettingsData()).settings.search;
+    if (term && settings.recordMisses && settings.enabled) {
+      const now = new Date().toISOString();
+      const id = `search:${createHash("sha256").update(now.slice(0, 10) + ":" + term).digest("hex")}`;
+      const result = await customerMessages.insert({ id, kind: "search_miss", customerId: "catalog", status: "open", query: term, count: 1, createdAt: now, updatedAt: now });
+      if (!result.created) await customerMessages.update(id, (entry) => ({ ...entry, count: Math.min(10000, (entry.count || 0) + 1), updatedAt: now }));
+      await customerMessages.pruneSearchMisses(new Date(Date.now() - 30 * 86400000).toISOString());
+    }
+    return json(res, 200, { ok: true });
+  }
+  if (req.method === "GET" && url.pathname === "/api/admin/search") {
+    requireAdmin(req);
+    await customerMessages.pruneSearchMisses(new Date(Date.now() - 30 * 86400000).toISOString());
+    const misses = await customerMessages.list({ kind: "search_miss", limit: 300 });
+    return json(res, 200, { ok: true, misses: misses.map(({ id, query, count, status, updatedAt }) => ({ id, query, count, status, updatedAt })) });
+  }
+  const searchMissMatch = url.pathname.match(/^\/api\/admin\/search\/([^/]+)\/resolve$/);
+  if (req.method === "POST" && searchMissMatch) {
+    requireAdmin(req);
+    await customerMessages.update(decodeURIComponent(searchMissMatch[1]), (entry) => entry.kind === "search_miss" ? { ...entry, status: "resolved", updatedAt: new Date().toISOString() } : null);
+    return json(res, 200, { ok: true });
+  }
   if (req.method === "GET" && url.pathname === "/api/support") {
     const user = await requireCustomer(req);
     const messages = await customerMessages.list({ customerId: user.id, kind: "support", limit: 100 });
@@ -3363,8 +3416,19 @@ async function handleApi(req, res, url) {
   if (req.method === "GET" && url.pathname === "/api/orders") {
     const user = await requireCustomer(req);
     const data = await readOrdersData();
-    const orders = data.orders.filter((order) => order.customer?.id === user.id).map(publicOrder);
+    const orders = (await withDeliveryReceipts(data.orders.filter((order) => order.customer?.id === user.id))).map(publicOrder);
     return json(res, 200, { ok: true, orders });
+  }
+  const deliveryConfirmationMatch = url.pathname.match(/^\/api\/orders\/([^/]+)\/delivery-confirmation$/);
+  if (req.method === "POST" && deliveryConfirmationMatch) {
+    const user = await requireCustomer(req);
+    const orderId = decodeURIComponent(deliveryConfirmationMatch[1]);
+    const order = (await readOrdersData()).orders.find((entry) => entry.id === orderId && entry.customer?.id === user.id);
+    if (!order) throw Object.assign(new Error("Order not found."), { status: 404 });
+    const input = await bodyJson(req);
+    const settings = (await readShopSettingsData()).settings.deliveryConfirmation;
+    await recordDeliveryResponse(customerMessages, order, user.id, input.action, settings, orderShippingRequirements(order));
+    return json(res, 200, { ok: true, order: publicOrder((await withDeliveryReceipts([order]))[0]) });
   }
   const proofMatch = url.pathname.match(/^\/api\/orders\/([^/]+)\/proof$/);
   if (req.method === "POST" && proofMatch) {
@@ -3443,7 +3507,7 @@ async function handleApi(req, res, url) {
   if (req.method === "GET" && url.pathname === "/api/admin/orders") {
     requireAdmin(req);
     const data = await readOrdersData();
-    return json(res, 200, { ok: true, orders: data.orders.map(staffOrder) });
+    return json(res, 200, { ok: true, orders: (await withDeliveryReceipts(data.orders)).map(staffOrder) });
   }
   if (req.method === "GET" && url.pathname === "/api/admin/accounts") {
     requireAdmin(req);
@@ -3471,14 +3535,16 @@ async function handleApi(req, res, url) {
   }
   if (req.method === "POST" && url.pathname === "/api/admin/shop-settings") {
     requireAdmin(req);
-    const existing = (await readShopSettingsData()).settings;
     const input = await bodyJson(req);
-    if (input.customerCare) {
-      const care = normalizeCustomerCare({ ...existing.customerCare, ...input.customerCare, events: { ...existing.customerCare.events, ...input.customerCare.events } });
-      care.emailEnabledAt = care.emailEnabled && (!existing.customerCare.emailEnabled || !existing.customerCare.emailEnabledAt) ? new Date().toISOString() : existing.customerCare.emailEnabledAt;
-      input.customerCare = care;
-    }
-    const data = await writeShopSettingsData({ ...existing, ...input });
+    const data = await updateShopSettings((existing) => {
+      const patch = { ...input };
+      if (patch.customerCare) {
+        const care = normalizeCustomerCare({ ...existing.customerCare, ...patch.customerCare, events: { ...existing.customerCare.events, ...patch.customerCare.events } });
+        care.emailEnabledAt = care.emailEnabled && (!existing.customerCare.emailEnabled || !existing.customerCare.emailEnabledAt) ? new Date().toISOString() : existing.customerCare.emailEnabledAt;
+        patch.customerCare = care;
+      }
+      return { ...existing, ...patch };
+    });
     return json(res, 200, { ok: true, settings: data.settings });
   }
   const adminProofMatch = url.pathname.match(/^\/api\/admin\/orders\/([^/]+)\/proof$/);

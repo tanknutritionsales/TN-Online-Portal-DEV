@@ -1,5 +1,11 @@
 # Online Portal
 
+Product search supports approved compound names, brand aliases, umbrella categories, strict strength/code matching and optional spelling suggestions. Manage vocabulary, product classification and anonymous unmatched searches under **Admin → Product search**. Existing Shopify goal/form tags are preserved.
+
+Customers can confirm receipt of fully shipped orders. The default Home check-in appears three days after final dispatch; **Received** removes the order from Home and marks it Completed in My orders. Timing is configurable in **Shop settings → Delivery confirmation**. Customer receipt is stored separately from Shark dispatch/payment data.
+
+Use [the search and delivery QA checklist](docs/search-and-delivery-qa.md) for manual testing. `npm run preview:receipts` provides disposable aged orders for checking the prompt without waiting. `npm run smoke:local` now uses a credential-free disposable preview by default.
+
 Customer-facing order portal for Tank Nutrition.
 
 Read `AGENTS.md` and `memory/online-portal-app.md` before changing this app.
@@ -19,7 +25,7 @@ Read `AGENTS.md` and `memory/online-portal-app.md` before changing this app.
 
 ## Customer Experience and Support
 
-- The research-use notice appears on every page load, with a three-second acknowledgment delay. Registration retains its separate terms and age confirmation.
+- The research-use notice appears immediately after each successful customer sign-in, with a three-second acknowledgment delay before browsing. Admins go directly to their dashboard. Registration retains its separate terms and age confirmation.
 - Shop search supports multiple words, sorting and removable filter chips. Mobile shows two product cards per row and a sticky search/filter toolbar.
 - Customer baskets are saved per account on the current browser for 30 days. Only variant IDs and quantities are saved. Signing in is still required after a reload; current catalog prices and server-side stock checks apply before checkout. This is not cross-device cart storage.
 - Product quick view shows Shopify images (up to eight), zoom controls, and strength/format/pack size when present. Admin > Shop settings > Product details can supply missing facts or override labels; leave fields blank to use explicit catalog labels. The portal does not invent dosage instructions.

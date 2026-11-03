@@ -7,7 +7,7 @@ import { spawn } from "node:child_process";
 import net from "node:net";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-export async function startIsolatedPortal({ photos = false } = {}) {
+export async function startIsolatedPortal({ photos = false, catalog = null } = {}) {
   const directory = await mkdtemp(path.join(tmpdir(), "op-experience-"));
   const publicLink = path.join(directory, "public");
   const listener = net.createServer();
@@ -34,15 +34,18 @@ export async function startIsolatedPortal({ photos = false } = {}) {
     await cp(path.join(root, "package.json"), path.join(directory, "package.json"));
     await cp(path.join(root, "lib"), path.join(directory, "lib"), { recursive: true });
     await symlink(path.join(root, "public"), publicLink, process.platform === "win32" ? "junction" : "dir");
+    if (catalog) await writeFile(path.join(directory, "preview-catalog.json"), JSON.stringify(catalog));
     await writeFile(path.join(directory, "preview.mjs"), `
       import http from 'node:http';
+      import { readFileSync } from 'node:fs';
       import { handleRequest } from './server.js';
       http.createServer((req,res) => {
-        if (${Boolean(photos)} && req.url === '/api/catalog') {
+        if (${Boolean(photos || catalog)} && req.url === '/api/catalog') {
           const end = res.end.bind(res);
           res.end = (body,...args) => {
             try {
               const payload = JSON.parse(body);
+              if (${Boolean(catalog)} && payload.ok) payload.products = JSON.parse(readFileSync('./preview-catalog.json','utf8'));
               for (const product of payload.products || []) {
                 if (product.id === 'mock-hd-reta') {
                   product.image = '/product-images/hd-5001.png';

@@ -1,6 +1,6 @@
 # Online Portal App Memory
 
-Last updated: 2026-10-29
+Last updated: 2026-11-03
 
 ## Purpose
 
@@ -33,7 +33,7 @@ Retail Shark remains the internal staff operations app. Online Portal owns custo
 1. Customer starts on the login screen.
 2. Customer logs in or creates an account with required contact and delivery fields.
 3. New customer registration is blocked behind a required terms/disclaimer modal. The customer must scroll to the bottom, confirm they are 18 years or older, and accept the research-use-only disclaimer before the account is created. The accepted terms version/timestamp is stored on the customer account.
-4. Customer lands on Home, with a branded hero, Shop by Goal (`goal-*` Shopify tags), and Shop by Brand (Shopify vendors). The four goal groups are Lean muscle & Cutting, Mass & Strength, Recovery & Longevity, and Fat loss & Metabolic. Shop retains the featured slider, search, type and availability filters, and 30-product pagination. Protocol Manuals integrates Volume 1 Peptides and Volume 2 Performance using a compact page viewer with PDF open/download links.
+4. Immediately after successful sign-in (including registration's automatic sign-in), the Research Use Notice blocks browsing until its three-second acknowledgment delay completes. The login screen itself has no notice. Customer then lands on Home, with a branded hero, Shop by Goal (`goal-*` Shopify tags), and Shop by Brand (Shopify vendors). The four goal groups are Lean muscle & Cutting, Mass & Strength, Recovery & Longevity, and Fat loss & Metabolic. Shop retains the featured slider, search, type and availability filters, and 30-product pagination. Protocol Manuals integrates Volume 1 Peptides and Volume 2 Performance using a compact page viewer with PDF open/download links.
 5. Customer adds normal in-stock products to cart. The user nav shows a cart quantity bubble.
 6. Customer can add/manage multiple delivery addresses from My account or checkout.
 7. Customer submits the cart as an order request.
@@ -49,7 +49,7 @@ Retail Shark remains the internal staff operations app. Online Portal owns custo
 
 ## Current Admin Flow
 
-- Admin logs in through the same login screen.
+- Admin logs in through the same login screen and goes directly to the dashboard without the customer Research Use Notice.
 - Admin order panels are collapsed by default and show reference, customer name/email, and status tag.
 - Admin can filter orders by payment/details state, payment to verify, special review, and payment support.
 - Admin can review special orders, split approved quantities between Retail Shark/Shopify allocation and external fulfillment, decline, or counter.
@@ -98,6 +98,7 @@ Customer-facing status:
 - `Payment required` after payment details are attached.
 - `Marked as paid, processing` after the customer marks paid; `Processing` after admin verifies payment.
 - `Shipped` after Retail Shark marks shipped.
+- `Completed` after the customer explicitly confirms receipt; staff `fulfillmentStatus` remains `shipped`.
 - Special orders show review/declined/countered labels as appropriate.
 
 ## Storage
@@ -187,9 +188,21 @@ Office flow:
 
 ## Current Testing Notes
 
+- 2026-11-03: User approved the Phase 1 catalog mappings and authorized Phases 2–5. Phase 2 is live in Shopify: the refreshed catalog had 430 records (422 active, 7 draft, 1 unlisted Courier); 394 products received additive compound/blend/search/class tags. A complete reread verified all expected tags and preservation of every pre-existing tag. Prices, titles, publication and inventory were not changed.
+- Search vocabulary is seeded in `public/search-defaults.js` (102 groups) and normalized/shared by `public/catalog-search.js`. Shop, Special Orders, featured selection and Product details use the same search. Empty-query Recommended keeps catalog order; searches rank direct names/compound matches before aliases, prefixes and ingredient-containing blends, with stock only a tie-breaker. Codes, units, numeric strengths, brands and forms are constraints. GLP umbrella searches cover the verified Sema/Tirz/Reta/hybrid family; specific compound searches stay specific. True SARM classification is separate from MK-677/Cardarine/SR9009. Legacy broad `sarms`/`peptides` tags are retained but do not define the new search classes.
+- The user requested alias-prefix matching on 2026-11-03: `oxan`/`anav` find the VAR/oxandrolone family and `diana` finds Dianabol/DB. Shared matching now checks approved alias words as well as product text, including verified blend ingredients at lower relevance. Numeric strengths, units and chemical codes remain exact constraints. Spelling suggestions handle single first-letter typos and rank by edit distance; valid named identities are not rewritten. Added regression coverage for prefixes, brand/strength combinations and spelling corrections.
+- User-confirmed mappings: Sibutralean = sibutramine; HD 5 AMINO = 5-amino-1MQ; KF IVENOM belongs to KF ECYA (formula still deferred); KF GHK pack is GHK-Cu, with the catalogue ML/mg pack discrepancy left untouched; Oraltec Dynabolan is injectable Dianabol/DBol acetate as supplied by the user; Lipolax has merchant-supplied search alias Botox, kept as a named group without inferring a toxin ingredient; HU/Clinic Melanotan = MT2; KH Deca 100 = NPP; UPA kisspeptin = kisspeptin-10; KF/UPA HGH fragments = 176–191.
+- Confirmed blends: Wolverine = BPC-157 + TB-500; GLOW = GHK-Cu + BPC-157 + TB-500; KLOW adds KPV; Clinic Deadpool = BPC-157 + TB-500 + KPV; CTI = CJC + tesamorelin + ipamorelin. CJC DAC state remains unspecified unless explicit in the title. Anabolicum = LGD4033, UPA Anadrine = Andarine/S4, UPA Stenabolic = SR9009, M1 Tesbol/M1T = methyl-1-testosterone, Ratigra = tadalafil + dapoxetine, from the prior product-label audit.
+- Limitless remains name-only. User deferred DEX Tirzeta, IDUN cagrilintide, Relislim and unspecified oil/ECA/Helios/additional formulas. The newly added active DEX `CAGRILINITIDE` listing stays pending until confirmed. Do not silently alter the UPA M1 T 10mg title versus 15mg photo discrepancy. New single compounds can inherit unambiguous approved names; new blends do not inherit ingredient formulas. Admin can leave entries name-only or assign verified groups.
+- Phases 3–5 and the subsequent search/notice refinements were accepted by the user on 2026-11-03, with publication authorized to both Online Portal GitHub repos. Admin > Product search edits groups, aliases, classes, ingredients, brand/category aliases and portal-only product assignments, with unsaved previews and a classification queue. Settings live in the existing Postgres settings record (local JSON remains supported). Anonymous unmatched catalog terms use kind `search_miss` in `op_customer_messages`, with no user/account identity, rejection of contact details/URLs and 30-day expiry.
+- Settings module patches now serialize locally and use a Postgres transaction/advisory lock plus row lock, preventing separate admins' module changes from erasing each other. The featured picker preserves open sections and unsaved form fields during search. Full checks, isolated smoke and browser QA passed; all 422 active catalog records were findable by their exact names. The normal local server was restarted with Shopify order sync explicitly false.
+- Customer receipt uses kind `delivery_receipt` in the same transactional store, keyed per order. It never writes an orders snapshot and therefore cannot overwrite concurrent payment, fulfillment or Shark changes. GET customer/admin orders decorate the result with receipt state. Customer status becomes Completed while fulfillmentStatus stays shipped. Home no longer drops shipped orders after seven days; it removes them only after receipt. My orders/tracking/history remain available. Default prompt delay is 3 days after final dispatch, Not yet snoozes 24 hours, and admin can configure/disable it. One automatic prompt per Home visit; manual confirmation is available for fully shipped orders even before the delay. Legacy shipped records with no trustworthy timestamp allow manual confirmation but no invented automatic timer.
+- Split-shipment chronological fix: external tracking alone cannot complete an order when Office has only entered tracking but has not dispatched. Office dispatch is required for final shipped state/receipt. Tracking corrections preserve an existing final shipped timestamp. Receipt confirmation is owner-checked and concurrent/idempotent; another tab's Not yet cannot undo Received.
+- `docs/search-and-delivery-qa.md` contains the manual checklist. `scripts/test-search-and-receipts.mjs` covers identities/strengths/codes, aliases, classes, DAC, suggestions, single-compound inheritance, deferred blends, settings preservation, anonymous feedback, the timer boundary/snooze, ownership and concurrent receipts. `npm run preview:receipts` seeds disposable dated orders. Smoke tests default to a credential-free isolated preview and reject hosted URLs. No Netlify environment settings or Shopify order-sync switch were changed by this patch.
+
 - 2026-10-29 UX batch approved by the user for the production repository. Account recovery was explicitly deferred.
 - Image zoom uses vendored Panzoom with thumbnail gallery/next/previous photos (up to eight Shopify images). Product quick view shows explicit strength/format/pack size, with admin overrides in Shop settings > Product details.
-- Mandatory Research Use Notice appears before login on every page load, enforces a three-second timer, and cannot be dismissed with Escape/outside click. Existing registration terms/18+ gate remains separate. Header dropdowns are mutually exclusive and close on outside click/Escape.
+- On 2026-11-03 the user moved the mandatory Research Use Notice to immediately after successful customer sign-in and explicitly exempted admin logins. Customers start a fresh three-second timer on every sign-in; admins go directly to the dashboard. Failed login and the logged-out screen have no notice. Customer browsing stays blocked until acknowledgment; Escape/outside click cannot dismiss it. Any due delivery receipt prompt follows the research notice. Existing registration terms/18+ gate remains separate. Header dropdowns are mutually exclusive and close on outside click/Escape.
 - Shop search sits first, supports multiword matches, sorting and removable chips; mobile has a compact header, sticky controls and two product cards per row. Cart quantities can be edited with stock validation. Per-account browser baskets retain only variant IDs/quantities for 30 days and refresh catalog prices after login; not cross-device persistence. Reload still requires login.
 - Home shows active order next actions and new support replies. Visible signed-in customer tabs poll orders/support once per minute. Customer Help and per-order Need help open private support threads; admin has Customer support with open/all requests and reply forms. Contacts/hours are admin-configurable and still await the user's preferred values.
 - Optional Resend order emails are implemented but off/unconfigured until a verified sender/API key is supplied and admin enables them. New variables: RESEND_API_KEY, EMAIL_FROM, PORTAL_PUBLIC_URL. No real emails or Netlify environment changes were made in this batch.

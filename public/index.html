@@ -234,6 +234,7 @@
                 <div id="brandCollections" class="brand-collections"></div>
               </section>
               <div id="catalogSummary" class="catalog-summary"></div>
+              <div id="searchSuggestions" class="search-suggestions" role="status" aria-live="polite" hidden></div>
               <div id="productsTopPager" class="product-pager"></div>
               <div id="products" class="products"></div>
               <div id="productsBottomPager" class="product-pager bottom"></div>
@@ -362,6 +363,7 @@
               <button class="admin-view-tab" type="button" data-admin-view="completed">Completed</button>
               <button class="admin-view-tab" type="button" data-admin-view="accounts">Accounts</button>
               <button class="admin-view-tab" type="button" data-admin-view="customer-care">Customer support</button>
+              <button class="admin-view-tab" type="button" data-admin-view="search">Product search</button>
               <button class="admin-view-tab" type="button" data-admin-view="system-status">System status</button>
               <button class="admin-view-tab" type="button" data-admin-view="shop-settings">Shop settings</button>
             </div>
@@ -371,6 +373,18 @@
         </section>
       </section>
     </main>
+    <dialog id="deliveryReceiptDialog" class="delivery-receipt-dialog" aria-labelledby="deliveryReceiptTitle" aria-describedby="deliveryReceiptDescription">
+      <p class="eyebrow">Delivery check-in</p>
+      <h2 id="deliveryReceiptTitle">Have you received this order?</h2>
+      <p id="deliveryReceiptDescription" class="muted">Confirm once all products and parcels have arrived.</p>
+      <div id="deliveryReceiptContent"></div>
+      <p id="deliveryReceiptFeedback" class="form-feedback" role="alert"></p>
+      <div class="receipt-actions">
+        <button id="receiptReceived" type="button" class="primary">Received</button>
+        <button id="receiptNotYet" type="button" class="secondary" autofocus>Not yet</button>
+      </div>
+      <button id="receiptProblem" type="button" class="text-button">Report a delivery problem</button>
+    </dialog>
 
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
     <dialog id="researchNotice" class="research-notice" closedby="none" aria-labelledby="researchNoticeTitle" aria-describedby="researchNoticeText researchNoticeRestriction">

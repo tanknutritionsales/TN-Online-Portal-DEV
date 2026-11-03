@@ -1,4 +1,8 @@
-const baseUrl = process.env.ONLINE_PORTAL_URL || "http://127.0.0.1:3141";
+import { startIsolatedPortal } from "./isolated-portal.mjs";
+
+const ownedPreview = process.env.ONLINE_PORTAL_URL ? null : await startIsolatedPortal();
+const baseUrl = process.env.ONLINE_PORTAL_URL || ownedPreview.url;
+if (!["127.0.0.1", "localhost", "[::1]"].includes(new URL(baseUrl).hostname)) throw new Error("Smoke tests require a disposable local portal.");
 
 class Session {
   cookie = "";
@@ -21,6 +25,7 @@ class Session {
   }
 }
 
+try {
 const customer = new Session();
 const login = await customer.request("/api/auth/login", {
   method: "POST",
@@ -118,3 +123,4 @@ console.log(
     2,
   ),
 );
+} finally { await ownedPreview?.close(); }
