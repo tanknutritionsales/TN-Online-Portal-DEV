@@ -38,6 +38,10 @@ const state = {
   adminSupportFilter: "open",
   handledOrderLink: false,
   adminView: "pending",
+  portalControl: null,
+  portalPaused: false,
+  adminLoginOnly: false,
+  pauseConfirmation: null,
   adminAccounts: [],
   adminAccountFilter: "all",
   specialOrderItems: [],
@@ -113,6 +117,9 @@ let productImagePanzoom = null;
 let productImageLoadId = 0;
 let customerPollTimer = null;
 let lastCustomerPoll = 0;
+let customerUpdateInFlight = null;
+let lastCustomerActivityAt = Date.now();
+const customerIdleMs = 5 * 60 * 1000;
 let supportRequestKey = "";
 let searchMissTimer = null;
 const recordedSearchMisses = new Set();
@@ -218,7 +225,10 @@ async function api(path, options = {}) {
     },
   });
   const payload = await response.json();
-  if (!response.ok || !payload.ok) throw new Error(payload.error || "Request failed.");
+  if (!response.ok || !payload.ok) {
+    if (["PORTAL_PAUSED", "PORTAL_CONTROL_UNAVAILABLE"].includes(payload.code) && !state.admin) showPortalPaused();
+    throw Object.assign(new Error(payload.error || "Request failed."), { code: payload.code, status: response.status });
+  }
   return payload;
 }
 
@@ -235,6 +245,7 @@ function newIdempotencyKey(prefix = "op") {
 }
 
 function showScreen(screen) {
+  qs("#pausedScreen").hidden = screen !== "paused";
   qs("#loginScreen").hidden = screen !== "login";
   qs("#createAccountScreen").hidden = screen !== "create";
   qs("#appScreen").hidden = screen !== "app";
@@ -272,8 +283,131 @@ function showAuth() {
   qs("#supportReplyBadge").hidden = true;
   state.customerOrdersLoaded = false;
   qs("#loginForm").reset();
+  qs("#showCreateAccount").hidden = state.portalPaused || state.adminLoginOnly;
   applyTheme("light");
   showScreen("login");
+}
+
+function showPortalPaused(message = "The portal is temporarily unavailable. Please check back shortly.") {
+  state.portalPaused = true;
+  showAuth();
+  qs("#pausedMessage").textContent = message;
+  showScreen("paused");
+}
+
+async function checkPortalStatus() {
+  try {
+    const status = await api("/api/portal-status");
+    state.portalPaused = status.paused;
+    state.adminLoginOnly = false;
+    if (status.paused) showPortalPaused(status.message);
+    else showAuth();
+  } catch { showPortalPaused("Availability could not be checked. Please try again shortly."); }
+}
+
+async function loadPortalControl() {
+  try {
+    const payload = await api("/api/admin/portal-control");
+    state.portalControl = payload.control;
+    state.portalPaused = payload.control.paused;
+    const banner = qs("#adminAvailabilityBanner");
+    banner.hidden = !payload.control.paused;
+    banner.textContent = "Portal paused. Customer access and automatic notifications are off. Admin remains available.";
+    if (state.adminView === "portal-control") renderPortalControl();
+  } catch (error) {
+    const banner = qs("#adminAvailabilityBanner");
+    banner.hidden = false;
+    banner.textContent = error.message;
+    if (state.adminView === "portal-control") qs("#adminOrders").innerHTML = `<p class="muted">${escapeHtml(error.message)}</p>`;
+    throw error;
+  }
+}
+
+function renderPortalControl() {
+  const control = state.portalControl;
+  if (!control) return;
+  qsa("[data-admin-view]").forEach((button) => button.classList.toggle("is-active", button.dataset.adminView === "portal-control"));
+  qs("#adminOrdersSummary").textContent = "Portal availability";
+  qs("#adminOrders").innerHTML = `<section class="portal-control-card">
+    <h3>${control.paused ? "Portal paused" : "Portal open"}</h3>
+    <p>${control.paused ? "Customers see a temporary availability message. Admin access remains available." : "Customers can sign in, browse and place order requests."}</p>
+    <p class="muted">Pausing stops customer access and automatic email work. Accounts, orders and settings remain saved.</p>
+    ${control.changedAt ? `<p class="muted small">Last changed ${escapeHtml(new Date(control.changedAt).toLocaleString("en-ZA"))} by ${escapeHtml(control.changedBy?.username || "Admin")}</p>` : ""}
+    <button class="${control.paused ? "primary" : "secondary"}" type="button" data-portal-toggle>${control.paused ? "Open Portal" : "Pause Portal"}</button>
+    ${control.history.length ? `<details><summary>Recent changes</summary>${control.history.slice(-10).reverse().map((event) => `<p class="small">${escapeHtml(new Date(event.at).toLocaleString("en-ZA"))} · ${event.paused ? "Paused" : "Opened"} by ${escapeHtml(event.by?.username || "Admin")}</p>`).join("")}</details>` : ""}
+  </section>`;
+}
+
+function renderPauseConfirmation() {
+  const flow = state.pauseConfirmation;
+  if (!flow) return;
+  qs("#portalPauseTitle").textContent = flow.resume ? "Open Portal" : "Pause Portal";
+  qs("#portalPauseStep").textContent = flow.resume ? "Confirm availability" : `Step ${flow.step} of 3`;
+  qs("#portalPauseBody").innerHTML = flow.resume
+    ? "<p>Reopen customer access? Customers will be able to sign in and place order requests again.</p>"
+    : flow.step === 1 ? "<p>Customers will be unable to sign in, browse or place orders. Automatic email work will pause. You can still sign in as admin and reopen the portal.</p><p>Existing accounts, orders and settings remain saved.</p>"
+    : flow.step === 2 ? '<label>Confirm your admin password<input id="portalPausePassword" type="password" autocomplete="current-password" required></label>'
+    : '<p>Type <strong>PAUSE PORTAL</strong> to confirm.</p><label>Confirmation<input id="portalPausePhrase" autocomplete="off" spellcheck="false" required></label>';
+  qs("#portalPauseContinue").textContent = flow.resume ? "Confirm open" : flow.step === 1 ? "I understand, continue" : flow.step === 2 ? "Verify password" : "Confirm pause";
+  qs("#portalPauseError").hidden = true;
+  qs("#portalPauseBody input")?.focus();
+}
+
+async function openPauseConfirmation() {
+  try {
+    await loadPortalControl();
+    state.pauseConfirmation = { step: 1, resume: state.portalControl.paused, revision: state.portalControl.revision, token: "" };
+    renderPauseConfirmation();
+    qs("#portalPauseDialog").showModal();
+  } catch (error) { toast(error.message); }
+}
+
+async function submitPauseConfirmation(event) {
+  event.preventDefault();
+  const flow = state.pauseConfirmation;
+  if (!flow || flow.busy) return;
+  flow.busy = true;
+  qs("#portalPauseContinue").disabled = true;
+  try {
+    if (!flow.resume && flow.step < 3) {
+      const payload = await api(`/api/admin/portal-control/${flow.step === 1 ? "review" : "verify"}`, {
+        method: "POST", body: JSON.stringify(flow.step === 1 ? { acknowledged: true, revision: flow.revision } : { token: flow.token, password: qs("#portalPausePassword").value }),
+      });
+      if (state.pauseConfirmation !== flow) return;
+      flow.token = payload.token;
+      flow.step++;
+      renderPauseConfirmation();
+    } else {
+      const payload = await api("/api/admin/portal-control", { method: "POST", body: JSON.stringify(flow.resume
+        ? { action: "resume", confirm: true, revision: flow.revision }
+        : { action: "pause", token: flow.token, revision: flow.revision, confirmation: qs("#portalPausePhrase").value }) });
+      qs("#portalPauseDialog").close();
+      state.portalControl = payload.control;
+      await loadPortalControl();
+      renderPortalControl();
+      toast(payload.control.paused ? "Portal paused." : "Portal open.");
+    }
+  } catch (error) {
+    if (qs("#portalPausePassword")) qs("#portalPausePassword").value = "";
+    qs("#portalPauseError").textContent = error.message;
+    qs("#portalPauseError").hidden = false;
+    if (error.status === 409) {
+      qs("#portalPauseDialog").close();
+      await loadPortalControl().catch(() => {});
+      toast(error.message);
+    }
+  } finally { flow.busy = false; qs("#portalPauseContinue").disabled = false; }
+}
+
+function refreshAdminView() {
+  if (!state.admin) return;
+  if (state.adminView === "portal-control") return loadPortalControl();
+  if (state.adminView === "shop-settings") return loadAdminShopSettings();
+  if (state.adminView === "search") return loadAdminSearch();
+  if (state.adminView === "customer-care") return loadAdminCustomerCare();
+  if (state.adminView === "accounts") return loadAdminAccounts();
+  if (state.adminView === "system-status") return loadSystemStatus();
+  return loadAdminOrders();
 }
 
 async function showApp(session) {
@@ -288,7 +422,10 @@ async function showApp(session) {
   showResearchNotice();
   switchView(state.admin ? "admin" : "home", { refreshAdmin: false });
   if (state.admin) {
-    await Promise.all([loadAdminOrders(), loadCatalog()]);
+    clearInterval(customerPollTimer);
+    await loadPortalControl();
+    if (state.portalControl?.paused) { state.adminView = "portal-control"; renderPortalControl(); }
+    else await loadAdminOrders();
     return;
   }
   state.selectedAddressId = defaultUserAddress()?.id || "";
@@ -350,7 +487,8 @@ function switchView(view, { refreshAdmin = true } = {}) {
   if (view === "manuals") renderManual();
   if (view === "orders" && state.user) loadCustomerOrders();
   if (view === "account" && state.user) renderAccount();
-  if (view === "admin" && state.admin && refreshAdmin) loadAdminOrders();
+  if (view === "admin" && state.admin && refreshAdmin) refreshAdminView();
+  if (state.admin && ["home", "order"].includes(view) && !state.catalogReady) loadCatalog();
   if (view === "home") maybePromptDeliveryReceipt();
 }
 
@@ -358,7 +496,7 @@ async function initSession() {
   await api("/api/auth/logout", { method: "POST", body: "{}" }).catch(() => null);
   state.cart.clear();
   renderCart();
-  showAuth();
+  await checkPortalStatus();
 }
 
 function showResearchNotice() {
@@ -404,7 +542,7 @@ async function login(event) {
   const loginValue = String(form.get("login") || "").trim();
   const password = String(form.get("password") || "");
   try {
-    if (loginValue.toLowerCase() === "admin") {
+    if (state.adminLoginOnly || state.portalPaused || loginValue.toLowerCase() === "admin") {
       const payload = await api("/api/auth/admin-login", {
         method: "POST",
         body: JSON.stringify({ username: loginValue, password }),
@@ -1906,14 +2044,14 @@ async function respondToDeliveryReceipt(action, { reportProblem = false } = {}) 
 
 function startCustomerPolling() {
   clearInterval(customerPollTimer);
+  lastCustomerActivityAt = Date.now();
   customerPollTimer = setInterval(refreshCustomerUpdates, 60_000);
 }
 
 function refreshCustomerUpdates() {
-  if (!state.user || document.visibilityState !== "visible" || Date.now() - lastCustomerPoll < 15_000) return;
+  if (!state.user || state.admin || state.portalPaused || document.visibilityState !== "visible" || Date.now() - lastCustomerActivityAt >= customerIdleMs || Date.now() - lastCustomerPoll < 15_000 || customerUpdateInFlight) return;
   lastCustomerPoll = Date.now();
-  loadCustomerOrders();
-  loadCustomerSupport();
+  customerUpdateInFlight = Promise.allSettled([loadCustomerOrders(), loadCustomerSupport()]).finally(() => { customerUpdateInFlight = null; });
 }
 
 function supportUnreadCount() {
@@ -2239,13 +2377,14 @@ async function reportPaidNotice(orderId) {
 }
 
 async function loadAdminOrders() {
+  const requestedView = state.adminView;
   const container = qs("#adminOrders");
   container.innerHTML = `<p class="muted">Loading orders...</p>`;
   try {
     const [payload, settingsPayload] = await Promise.all([api("/api/admin/orders"), loadShopSettings()]);
     state.shopSettings = mergeShopSettings(settingsPayload.settings || defaultShopSettings());
     state.adminOrders = payload.orders || [];
-    renderAdminOrders();
+    if (state.adminView === requestedView) renderAdminOrders();
   } catch (error) {
     container.innerHTML = `<p class="muted">${escapeHtml(error.message)}</p>`;
   }
@@ -2253,6 +2392,7 @@ async function loadAdminOrders() {
 
 function renderAdminOrders() {
   qsa("[data-admin-view]").forEach((button) => button.classList.toggle("is-active", button.dataset.adminView === state.adminView));
+  if (state.adminView === "portal-control") { renderPortalControl(); return; }
   if (state.adminView === "shop-settings") {
     renderAdminShopSettings();
     return;
@@ -3958,13 +4098,9 @@ document.addEventListener("click", (event) => {
     state.adminView = adminTab.dataset.adminView;
     state.adminOrderFilter = "all";
     state.adminOrderSearch = "";
-    if (state.adminView === "shop-settings") loadAdminShopSettings();
-    else if (state.adminView === "search") loadAdminSearch();
-    else if (state.adminView === "customer-care") loadAdminCustomerCare();
-    else if (state.adminView === "accounts") loadAdminAccounts();
-    else if (state.adminView === "system-status") loadSystemStatus();
-    else renderAdminOrders();
+    refreshAdminView()?.catch((error) => toast(error.message));
   }
+  if (event.target.closest("[data-portal-toggle]")) openPauseConfirmation();
 
   const adminOrderFilter = event.target.closest("[data-admin-order-filter]");
   if (adminOrderFilter) {
@@ -4176,12 +4312,22 @@ document.addEventListener("submit", (event) => {
 });
 
 qs("#logoutButton").addEventListener("click", logout);
+qs("#checkPortalAgain").addEventListener("click", checkPortalStatus);
+qs("#pausedAdminLogin").addEventListener("click", () => { state.adminLoginOnly = true; showAuth(); });
+qs("#portalPauseForm").addEventListener("submit", submitPauseConfirmation);
+qs("#portalPauseCancel").addEventListener("click", () => qs("#portalPauseDialog").close());
+qs("#portalPauseDialog").addEventListener("close", () => { state.pauseConfirmation = null; qs("#portalPauseBody").replaceChildren(); });
 qs("#receiptReceived").addEventListener("click", () => respondToDeliveryReceipt("received"));
 qs("#receiptNotYet").addEventListener("click", () => respondToDeliveryReceipt("not_yet"));
 qs("#receiptProblem").addEventListener("click", () => respondToDeliveryReceipt("not_yet", { reportProblem: true }));
 qs("#deliveryReceiptDialog").addEventListener("cancel", (event) => { event.preventDefault(); respondToDeliveryReceipt("not_yet"); });
 qs("#deliveryReceiptDialog").addEventListener("close", () => document.body.classList.remove("delivery-receipt-open"));
-document.addEventListener("visibilitychange", refreshCustomerUpdates);
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") { lastCustomerActivityAt = Date.now(); refreshCustomerUpdates(); } });
+for (const eventName of ["pointerdown", "keydown", "touchstart"]) window.addEventListener(eventName, () => {
+  const wasIdle = Date.now() - lastCustomerActivityAt >= customerIdleMs;
+  lastCustomerActivityAt = Date.now();
+  if (wasIdle) refreshCustomerUpdates();
+}, { passive: true });
 qs("#customerSupportDialog").addEventListener("click", (event) => {
   if (event.target !== event.currentTarget) return;
   const bounds = event.currentTarget.getBoundingClientRect();
@@ -4246,12 +4392,7 @@ qs("#refreshCatalog").addEventListener("click", loadCatalog);
 qs("#refreshOrders").addEventListener("click", loadCustomerOrders);
 qs("#termsScrollBody").addEventListener("scroll", updateTermsGate);
 qs("#refreshAdminPanel").addEventListener("click", () => {
-  if (state.adminView === "shop-settings") loadAdminShopSettings();
-  else if (state.adminView === "search") loadAdminSearch();
-  else if (state.adminView === "customer-care") loadAdminCustomerCare();
-  else if (state.adminView === "accounts") loadAdminAccounts();
-  else if (state.adminView === "system-status") loadSystemStatus();
-  else loadAdminOrders();
+  refreshAdminView()?.catch((error) => toast(error.message));
 });
 
 installInputMasks();

@@ -7,7 +7,7 @@ import { spawn } from "node:child_process";
 import net from "node:net";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-export async function startIsolatedPortal({ photos = false, catalog = null } = {}) {
+export async function startIsolatedPortal({ photos = false, catalog = null, requestLog = false } = {}) {
   const directory = await mkdtemp(path.join(tmpdir(), "op-experience-"));
   const publicLink = path.join(directory, "public");
   const listener = net.createServer();
@@ -37,9 +37,10 @@ export async function startIsolatedPortal({ photos = false, catalog = null } = {
     if (catalog) await writeFile(path.join(directory, "preview-catalog.json"), JSON.stringify(catalog));
     await writeFile(path.join(directory, "preview.mjs"), `
       import http from 'node:http';
-      import { readFileSync } from 'node:fs';
+      import { readFileSync, appendFileSync } from 'node:fs';
       import { handleRequest } from './server.js';
       http.createServer((req,res) => {
+        if (${Boolean(requestLog)} && req.url.startsWith('/api/')) appendFileSync('./requests.log', req.method + ' ' + req.url + '\\n');
         if (${Boolean(photos || catalog)} && req.url === '/api/catalog') {
           const end = res.end.bind(res);
           res.end = (body,...args) => {
@@ -60,7 +61,7 @@ export async function startIsolatedPortal({ photos = false, catalog = null } = {
         handleRequest(req,res);
       }).listen(${port},'127.0.0.1',() => console.log('READY'));
     `);
-    const environment = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(SHOPIFY_|RETAIL_SHARK_|NETLIFY|DATABASE|RESEND|EMAIL_|PORTAL_PUBLIC_URL|ADMIN_|SESSION_|INTERNAL_API|DATA_|PROOF_|NODE_ENV|CONTEXT|URL$)/i.test(key)));
+    const environment = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(SHOPIFY_|RETAIL_SHARK_|NETLIFY|OP_RUNTIME_|DATABASE|RESEND|EMAIL_|PORTAL_PUBLIC_URL|ADMIN_|SESSION_|INTERNAL_API|DATA_|PROOF_|NODE_ENV|CONTEXT|URL$)/i.test(key)));
     Object.assign(environment, { NODE_ENV: "test", PORT: String(port), DATA_STORAGE_MODE: "local", PROOF_STORAGE_MODE: "local", SHOPIFY_ORDER_SYNC_ENABLED: "false", INTERNAL_API_TOKEN: "dev-internal-token", SESSION_SECRET: "isolated-local-session", ADMIN_USERNAME: "admin", ADMIN_PASSWORD: "admin" });
     child = spawn(process.execPath, ["preview.mjs"], { cwd: directory, env: environment, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
     await new Promise((resolve, reject) => {

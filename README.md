@@ -29,7 +29,7 @@ Read `AGENTS.md` and `memory/online-portal-app.md` before changing this app.
 - Shop search supports multiple words, sorting and removable filter chips. Mobile shows two product cards per row and a sticky search/filter toolbar.
 - Customer baskets are saved per account on the current browser for 30 days. Only variant IDs and quantities are saved. Signing in is still required after a reload; current catalog prices and server-side stock checks apply before checkout. This is not cross-device cart storage.
 - Product quick view shows Shopify images (up to eight), zoom controls, and strength/format/pack size when present. Admin > Shop settings > Product details can supply missing facts or override labels; leave fields blank to use explicit catalog labels. The portal does not invent dosage instructions.
-- Home shows the next action for active orders. Signed-in visible tabs refresh order status and support replies once per minute.
+- Home shows the next action for active orders. Active, visible customer tabs refresh order status and support replies once per minute; polling stops after five minutes without interaction or while the tab is hidden. Admin panels refresh when opened or through Refresh.
 - Help and each order's Need help button open a private support conversation. Staff reply in Admin > Customer support. Customers read replies in Help; email and WhatsApp contact links appear once configured under Shop settings > Customer communication.
 - Account recovery is not included in this patch.
 
@@ -44,9 +44,19 @@ Order emails use the Resend API. Delivery is off by default. To configure after 
 
 Events cover order received, payment details ready, payment confirmed and shipment updates. Emails include the reference, total and a sign-in link to the order; product names and payment URLs stay in the portal. The admin payment-verification and Shopify mutation gates are unchanged.
 
-The Postgres `op_customer_messages` table stores support conversations and email delivery records. It is created automatically using the existing database connection. The `customer-notifications` scheduled Netlify Function retries eligible messages every five minutes on published production deploys. Delivery uses short database row locks, a two-minute claim lease, provider idempotency keys and five automatic attempts. Retries expire after 23 hours to stay within the provider's 24-hour deduplication window. Obsolete payment prompts are skipped. Events from before emails were enabled are not backfilled automatically; interrupted recent queue inserts can be recovered from saved order events.
+The Postgres `op_customer_messages` table stores support conversations and email delivery records. It is created automatically using the existing database connection. New notifications are queued and attempted during the relevant order action. The `customer-notifications` scheduled Netlify Function checks every five minutes on production deploys, using lightweight retry hints outside Postgres. Paused, unconfigured, disabled and idle runs make no database queries. It reads message/order records only when a retry is due. Delivery uses short database row locks, a two-minute claim lease, provider idempotency keys and five automatic attempts. Retries expire after 23 hours to stay within the provider's 24-hour deduplication window. Obsolete payment prompts are skipped. Events from before emails were enabled are not backfilled automatically. Opening Customer support refreshes retry hints for pending records already included in that view, recovering older or interrupted hint writes. Admins can also retry delivery explicitly. The worker no longer scans saved order history to rebuild the queue.
 
 Local and deploy-preview runs never send email. Local messaging uses ignored `data/customer-messages.json`; hosted messaging requires Postgres. No email credentials or support contact values are bundled.
+
+## Portal Availability and Database Inactivity
+
+Use **Admin → Portal availability** to pause the development portal. Pausing requires reviewing the effects, re-entering the current admin password and typing `PAUSE PORTAL`. Only an active admin can complete the change. Resume stays accessible through admin sign-in while paused. Each change records the admin and time.
+
+While paused, customers see a temporary-unavailability page. Customer and Shark internal APIs return `503 PORTAL_PAUSED` before accessing Postgres. Requests already running when Pause is confirmed may finish. Admins retain access to their tools, and deliberate admin actions can still wake the database. Pausing preserves accounts, orders and settings.
+
+Hosted availability, email-enabled checks and retry hints use the strongly consistent `op-runtime-control` Netlify Blobs store. Production shares one namespace across redeploys; previews use separate deployment namespaces. Both Netlify entry points initialize storage from the handler's trusted deployment context before importing the server. No new environment variables or database migration are required. Local equivalents live in ignored `data/portal-control.json`, `data/notification-settings.json` and `data/notification-retries.json`.
+
+Retail Shark loads Portal orders on opening the Orders/Portal views or explicit Refresh. Home initially leaves Portal totals unchecked; Reload checks them explicitly. Unsaved tracking edits prevent a refresh from replacing the draft. This allows Postgres to sleep during inactivity; actual savings depend on customer traffic, deliberate admin use and queued retries.
 
 ## Local Start
 

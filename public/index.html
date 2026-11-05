@@ -11,6 +11,15 @@
   </head>
   <body>
     <main id="portalMain" inert>
+      <section id="pausedScreen" class="login-screen" hidden>
+        <div class="login-card panel">
+          <img class="login-logo" src="/assets/tank-nutrition-logo.png" alt="Tank Nutrition">
+          <p class="eyebrow">Online Portal</p><h1>Temporarily unavailable</h1>
+          <p id="pausedMessage" class="muted">Please check back shortly.</p>
+          <button id="checkPortalAgain" class="primary" type="button">Check again</button>
+          <button id="pausedAdminLogin" class="ghost" type="button">Admin sign in</button>
+        </div>
+      </section>
       <section id="loginScreen" class="login-screen">
         <div class="login-card panel">
           <img class="login-logo" src="/assets/tank-nutrition-logo.png" alt="Tank Nutrition">
@@ -356,6 +365,7 @@
               </div>
               <button id="refreshAdminPanel" class="secondary" type="button">Refresh</button>
             </div>
+            <div id="adminAvailabilityBanner" class="portal-availability-banner" hidden></div>
             <div class="admin-tabs" aria-label="Admin order views">
               <button class="admin-view-tab is-active" type="button" data-admin-view="pending">Awaiting confirmation</button>
               <button class="admin-view-tab" type="button" data-admin-view="external">External fulfillment</button>
@@ -365,6 +375,7 @@
               <button class="admin-view-tab" type="button" data-admin-view="customer-care">Customer support</button>
               <button class="admin-view-tab" type="button" data-admin-view="search">Product search</button>
               <button class="admin-view-tab" type="button" data-admin-view="system-status">System status</button>
+              <button class="admin-view-tab" type="button" data-admin-view="portal-control">Portal availability</button>
               <button class="admin-view-tab" type="button" data-admin-view="shop-settings">Shop settings</button>
             </div>
             <div id="adminOrdersSummary" class="catalog-summary"></div>
@@ -373,6 +384,13 @@
         </section>
       </section>
     </main>
+    <dialog id="portalPauseDialog" class="portal-pause-dialog" aria-labelledby="portalPauseTitle">
+      <form id="portalPauseForm" class="form-stack">
+        <p id="portalPauseStep" class="eyebrow"></p><h2 id="portalPauseTitle">Pause Portal</h2>
+        <div id="portalPauseBody"></div><p id="portalPauseError" class="form-error" role="alert" hidden></p>
+        <div class="portal-control-actions"><button id="portalPauseContinue" class="primary" type="submit">Continue</button><button id="portalPauseCancel" class="secondary" type="button">Cancel</button></div>
+      </form>
+    </dialog>
     <dialog id="deliveryReceiptDialog" class="delivery-receipt-dialog" aria-labelledby="deliveryReceiptTitle" aria-describedby="deliveryReceiptDescription">
       <p class="eyebrow">Delivery check-in</p>
       <h2 id="deliveryReceiptTitle">Have you received this order?</h2>

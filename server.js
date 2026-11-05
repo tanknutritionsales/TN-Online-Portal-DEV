@@ -11,6 +11,9 @@ import { normalizeCustomerCare, emailSetupStatus, createOrderEmail, deliverQueue
 import { normalizeSearchSettings, anonymousSearchTerm } from "./public/catalog-search.js";
 import { normalizeDeliverySettings, deliveryReceiptView, recordDeliveryResponse } from "./lib/order-receipts.mjs";
 import { createSettingsUpdater } from "./lib/shop-settings-store.mjs";
+import { createPortalControlStore, publicPortalStatus } from "./lib/portal-control.mjs";
+import { createNotificationWorker } from "./lib/notification-worker.mjs";
+import { portalRuntimeConfig } from "./lib/netlify-runtime.mjs";
 
 const moduleUrl = import.meta.url || "";
 const modulePath = moduleUrl ? fileURLToPath(moduleUrl) : "";
@@ -25,7 +28,8 @@ const shopSettingsPath = path.join(dataDir, "shop-settings.json");
 
 const env = loadDotEnv(path.join(appRootDir, ".env"));
 const port = Number(process.env.PORT || env.PORT || 3141);
-const isProduction = process.env.NETLIFY || process.env.NODE_ENV === "production";
+const runtime = portalRuntimeConfig();
+const isProduction = runtime.netlify || process.env.NODE_ENV === "production";
 const shopifyStoreSubdomain = process.env.SHOPIFY_STORE_SUBDOMAIN || env.SHOPIFY_STORE_SUBDOMAIN || "";
 const shopifyApiVersion = process.env.SHOPIFY_ADMIN_API_VERSION || env.SHOPIFY_ADMIN_API_VERSION || "2026-07";
 const shopifyToken = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN || env.SHOPIFY_ADMIN_ACCESS_TOKEN || "";
@@ -61,6 +65,15 @@ let databasePool = null;
 let databaseReady = false;
 const rateLimitBuckets = new Map();
 const updateShopSettings = createSettingsUpdater({ useDatabase: dataStorageUsesDatabase, database: async () => { await ensureDatabaseSchema(); return database(); }, read: readShopSettingsData, write: writeShopSettingsData, normalize: normalizeShopSettings, defaults: defaultShopSettings });
+const portalControl = createPortalControlStore({
+  filePath: path.join(dataDir, "portal-control.json"),
+  namespace: runtime.namespace,
+  blobStore: runtime.netlify ? async () => {
+    const { getStore } = await import("@netlify/blobs");
+    return getStore({ name: "op-runtime-control", consistency: "strong" });
+  } : null,
+  withWriteLock: withPortalControlLock,
+});
 
 validateRuntimeConfig();
 
@@ -236,6 +249,21 @@ async function database() {
   const Pool = pg.Pool || pg.default?.Pool;
   databasePool = new Pool({ connectionString, max: 4, idleTimeoutMillis: 10_000 });
   return databasePool;
+}
+
+async function withPortalControlLock(work) {
+  if (!dataStorageUsesDatabase()) return work();
+  const client = await (await database()).connect();
+  try {
+    await client.query("BEGIN");
+    await client.query("SELECT pg_advisory_xact_lock(hashtext('op_runtime_controls'))");
+    const result = await work();
+    await client.query("COMMIT");
+    return result;
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally { client.release(); }
 }
 
 async function ensureDatabaseSchema() {
@@ -1183,6 +1211,42 @@ function requireAdmin(req) {
   const session = sessionFromRequest(req);
   if (!session || session.kind !== "admin") throw Object.assign(new Error("Admin login is required."), { status: 401 });
   return { username: session.username, userId: session.userId };
+}
+
+function portalControlIntent(req, admin, control, phase, previous = {}) {
+  const payload = { phase, revision: control.revision, userId: admin.userId, username: admin.username,
+    session: createHash("sha256").update(cookies(req)[sessionCookieName] || "").digest("hex"),
+    expiresAt: previous.expiresAt || Date.now() + 5 * 60 * 1000, nonce: randomUUID() };
+  const body = Buffer.from(JSON.stringify(payload)).toString("base64url");
+  return `${body}.${createHmac("sha256", sessionSecret).update(`portal-control:${body}`).digest("base64url")}`;
+}
+
+function verifyPortalControlIntent(req, admin, token, control, phase) {
+  try {
+    const [body, signature, extra] = String(token || "").split(".");
+    const expected = createHmac("sha256", sessionSecret).update(`portal-control:${body}`).digest("base64url");
+    if (extra || !signature || !secureTextEqual(signature, expected)) throw new Error();
+    const value = JSON.parse(Buffer.from(body, "base64url").toString("utf8"));
+    const session = createHash("sha256").update(cookies(req)[sessionCookieName] || "").digest("hex");
+    if (value.phase !== phase || value.userId !== admin.userId || value.username !== admin.username || value.session !== session || !(value.expiresAt > Date.now())) throw new Error();
+    if (value.revision !== control.revision) throw Object.assign(new Error("Portal availability changed. Start the confirmation again."), { status: 409 });
+    return value;
+  } catch (error) {
+    if (error.status === 409) throw error;
+    throw Object.assign(new Error("Complete the pause confirmation again. It may have expired."), { status: 403 });
+  }
+}
+
+async function portalAdminAccount(admin) {
+  const data = await readUsersData();
+  const account = data.users.find((entry) => entry.role === "admin" && entry.id === admin.userId && entry.username === admin.username);
+  if (!account) throw Object.assign(new Error("An active admin account is required."), { status: 403 });
+  return account;
+}
+
+async function verifyPortalAdminPassword(admin, password) {
+  const account = await portalAdminAccount(admin);
+  if (!verifyPassword(password, account.passwordHash)) throw Object.assign(new Error("Admin password is incorrect."), { status: 403 });
 }
 
 async function listAccounts() {
@@ -2225,14 +2289,14 @@ async function markShipped(orderId) {
   return order;
 }
 
-function emailRuntimeConfig(care) {
+function emailRuntimeConfig(care = {}) {
   return {
     apiKey: process.env.RESEND_API_KEY || env.RESEND_API_KEY || "",
     from: String(process.env.EMAIL_FROM || env.EMAIL_FROM || "").trim(),
     portalUrl: process.env.PORTAL_PUBLIC_URL || env.PORTAL_PUBLIC_URL || process.env.URL || "https://online-portal-tn.netlify.app/",
     senderName: care.senderName,
     replyTo: care.supportEmail,
-    allowed: Boolean(isProduction && dataStorageUsesDatabase() && (!process.env.NETLIFY || process.env.CONTEXT === "production")),
+    allowed: Boolean(isProduction && dataStorageUsesDatabase() && (!runtime.netlify || runtime.productionDeploy)),
   };
 }
 
@@ -2245,46 +2309,25 @@ async function queueOrderEmail(order, kind, eventId, { send = true, care: suppli
     const message = createOrderEmail(order, kind, { portalUrl: config.portalUrl, care, eventId });
     message.status = !care.emailEnabled ? "disabled" : !setup.configured ? "setup_required" : "pending";
     const inserted = await customerMessages.insert(message);
-    if (send && inserted.created && message.status === "pending") await deliverQueuedEmail(customerMessages, message.id, config);
+    if (inserted.created && message.status === "pending") {
+      // Persist the retry hint before delivery so an interrupted invocation can recover.
+      await portalControl.syncRetry(message).catch(() => console.warn("The email retry hint could not be saved; the notification remains recorded."));
+      if (send && !(await portalControl.read()).paused) {
+        await portalControl.syncRetry(await deliverQueuedEmail(customerMessages, message.id, config));
+      }
+    }
   } catch {
     console.warn("Customer notification could not be queued; the order was saved.");
   }
 }
 
 export async function flushCustomerNotifications() {
-  const care = (await readShopSettingsData()).settings.customerCare;
-  const config = emailRuntimeConfig(care);
-  const setup = emailSetupStatus(config);
-  if (!care.emailEnabled || !setup.configured) return { sent: 0, paused: true };
-  const orders = (await readOrdersData()).orders;
-  const cutoff = Math.max(Date.now() - 23 * 60 * 60 * 1000, Date.parse(care.emailEnabledAt || new Date().toISOString()));
-  const candidates = [];
-  for (const order of orders) {
-    for (const event of order.statusEvents || []) {
-      if (!Number.isFinite(Date.parse(event.at)) || Date.parse(event.at) < cutoff) continue;
-      const kind = { submitted: "order_received", payment_link_attached: "payment_ready", payment_confirmed: "payment_confirmed", shipped: "shipped", external_tracking_added: "shipped" }[event.type];
-      if (!kind || !care.events[kind] || (kind === "payment_ready" && (order.paymentStatus === "confirmed" || order.specialOrder?.status === "declined"))) continue;
-      const eventId = event.type === "shipped" ? `office:${event.at}` : event.type === "external_tracking_added" ? `external:${event.at}` : event.at;
-      const { id } = createOrderEmail(order, kind, { portalUrl: config.portalUrl, care, eventId });
-      candidates.push({ order, kind, eventId, id });
-    }
-  }
-  // One lookup avoids re-inserting every historical event on each short scheduled run.
-  const existing = await customerMessages.existingIds(candidates.map((entry) => entry.id));
-  for (const { order, kind, eventId } of candidates.filter((entry) => !existing.has(entry.id)).slice(0, 10)) {
-    await queueOrderEmail(order, kind, eventId, { send: false, care });
-  }
-  const pending = (await customerMessages.list({ kind: "email", statuses: ["pending", "failed", "sending"], limit: 100 }))
-    .filter((message) => message.attempts < 5 && (!message.nextAttemptAt || Date.parse(message.nextAttemptAt) <= Date.now()) && (message.status !== "sending" || Date.parse(message.lockedUntil || 0) <= Date.now()))
-    .sort((a, b) => a.createdAt.localeCompare(b.createdAt)).slice(0, 2);
-  const results = await Promise.all(pending.map(async (message) => {
-    const order = orders.find((entry) => entry.id === message.orderId);
-    if (!order || !care.events[message.event] || (message.event === "payment_ready" && (order.paymentStatus === "confirmed" || order.specialOrder?.status === "declined"))) {
-      return customerMessages.update(message.id, (entry) => ({ ...entry, status: "superseded", updatedAt: new Date().toISOString() }));
-    }
-    return deliverQueuedEmail(customerMessages, message.id, config);
-  }));
-  return { sent: results.filter((message) => message?.status === "sent").length, processed: results.length };
+  return createNotificationWorker({
+    control: portalControl, runtimeConfig: emailRuntimeConfig,
+    readCare: async () => (await readShopSettingsData()).settings.customerCare,
+    messages: customerMessages, readOrders: async () => (await readOrdersData()).orders,
+    deliver: (id, config) => deliverQueuedEmail(customerMessages, id, config),
+  })();
 }
 
 function publicSupportRequest(message) {
@@ -3268,6 +3311,43 @@ function requireInternal(req) {
 async function handleApi(req, res, url) {
   applyRouteRateLimit(req, url);
   requirePortalClientHeader(req, url);
+  if (req.method === "GET" && url.pathname === "/api/portal-status") {
+    return json(res, 200, { ok: true, ...publicPortalStatus(await portalControl.read()) });
+  }
+  if (url.pathname.startsWith("/api/admin/portal-control")) {
+    const admin = requireAdmin(req);
+    const control = await portalControl.read();
+    if (req.method === "GET" && url.pathname === "/api/admin/portal-control") return json(res, 200, { ok: true, control });
+    if (req.method === "POST") {
+      rateLimit(req, "portal-control", 12, 10 * 60 * 1000);
+      const body = await bodyJson(req);
+      if (url.pathname === "/api/admin/portal-control/review") {
+        if (body.acknowledged !== true || body.revision !== control.revision || control.paused) throw Object.assign(new Error("Review the current portal availability before continuing."), { status: 409 });
+        return json(res, 200, { ok: true, token: portalControlIntent(req, admin, control, "reviewed") });
+      }
+      if (url.pathname === "/api/admin/portal-control/verify") {
+        const intent = verifyPortalControlIntent(req, admin, body.token, control, "reviewed");
+        await verifyPortalAdminPassword(admin, body.password);
+        return json(res, 200, { ok: true, token: portalControlIntent(req, admin, control, "verified", intent) });
+      }
+      if (url.pathname === "/api/admin/portal-control") {
+        if (body.action === "pause") {
+          verifyPortalControlIntent(req, admin, body.token, control, "verified");
+          if (body.confirmation !== "PAUSE PORTAL") throw Object.assign(new Error("Type PAUSE PORTAL to confirm."), { status: 400 });
+        } else if (body.action !== "resume" || body.confirm !== true) throw Object.assign(new Error("Confirm before reopening the portal."), { status: 400 });
+        await portalAdminAccount(admin);
+        const result = await portalControl.setPaused({ paused: body.action === "pause", revision: body.revision, actor: admin });
+        return json(res, 200, { ok: true, control: result });
+      }
+    }
+    return json(res, 404, { ok: false, error: "Control action not found." });
+  }
+  const adminSession = sessionFromRequest(req)?.kind === "admin";
+  const adminRoute = url.pathname.startsWith("/api/admin/") || url.pathname === "/api/auth/admin-login" || url.pathname === "/api/auth/logout";
+  if (!adminRoute && !adminSession) {
+    if (url.pathname.startsWith("/api/internal/")) requireInternal(req);
+    if ((await portalControl.read()).paused) throw Object.assign(new Error("Portal paused. Customer access and background updates are temporarily unavailable."), { status: 503, code: "PORTAL_PAUSED" });
+  }
   if (req.method === "GET" && url.pathname === "/api/catalog") {
     await requirePortalAccess(req);
     const settings = (await readShopSettingsData()).settings;
@@ -3318,6 +3398,10 @@ async function handleApi(req, res, url) {
     requireAdmin(req);
     const care = (await readShopSettingsData()).settings.customerCare;
     const [requests, emails] = await Promise.all([customerMessages.list({ kind: "support", limit: 200 }), customerMessages.list({ kind: "email", limit: 80 })]);
+    // Recover existing pending records during this deliberate admin read, never
+    // through an idle database scan. Also repairs an interrupted hint write.
+    await Promise.all(emails.filter((message) => ["pending", "failed", "sending"].includes(message.status)).map((message) => portalControl.syncRetry(message)))
+      .catch(() => console.warn("Email retry hints could not be refreshed; delivery records remain available."));
     return json(res, 200, { ok: true, requests, emails: emails.map(({ id, reference, event, to, subject, status, attempts, lastError, sentAt, createdAt }) => ({ id, reference, event, to, subject, status, attempts, lastError, sentAt, createdAt })), emailSetup: { ...emailSetupStatus(emailRuntimeConfig(care)), enabled: care.emailEnabled } });
   }
   const supportReplyMatch = url.pathname.match(/^\/api\/admin\/support\/([^/]+)\/reply$/);
@@ -3329,6 +3413,7 @@ async function handleApi(req, res, url) {
   const emailRetryMatch = url.pathname.match(/^\/api\/admin\/notifications\/([^/]+)\/retry$/);
   if (req.method === "POST" && emailRetryMatch) {
     requireAdmin(req);
+    if ((await portalControl.read()).paused) throw Object.assign(new Error("Open the portal before retrying email delivery."), { status: 409 });
     const care = (await readShopSettingsData()).settings.customerCare;
     const config = emailRuntimeConfig(care);
     if (!care.emailEnabled || !emailSetupStatus(config).configured) throw Object.assign(new Error("Configure and enable email delivery first."), { status: 409 });
@@ -3341,7 +3426,9 @@ async function handleApi(req, res, url) {
       return { ...entry, status: "pending", attempts: 0, nextAttemptAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
     });
     if (!message) throw Object.assign(new Error("This notification is not available for retry."), { status: 409 });
+    await portalControl.syncRetry(message);
     const updated = await deliverQueuedEmail(customerMessages, id, config);
+    await portalControl.syncRetry(updated);
     return json(res, 200, { ok: true, status: updated?.status || "pending" });
   }
   if (req.method === "POST" && url.pathname === "/api/cart/check") {
@@ -3536,15 +3623,20 @@ async function handleApi(req, res, url) {
   if (req.method === "POST" && url.pathname === "/api/admin/shop-settings") {
     requireAdmin(req);
     const input = await bodyJson(req);
-    const data = await updateShopSettings((existing) => {
-      const patch = { ...input };
-      if (patch.customerCare) {
-        const care = normalizeCustomerCare({ ...existing.customerCare, ...patch.customerCare, events: { ...existing.customerCare.events, ...patch.customerCare.events } });
-        care.emailEnabledAt = care.emailEnabled && (!existing.customerCare.emailEnabled || !existing.customerCare.emailEnabledAt) ? new Date().toISOString() : existing.customerCare.emailEnabledAt;
-        patch.customerCare = care;
-      }
-      return { ...existing, ...patch };
-    });
+    const save = async () => {
+      const data = await updateShopSettings((existing) => {
+        const patch = { ...input };
+        if (patch.customerCare) {
+          const care = normalizeCustomerCare({ ...existing.customerCare, ...patch.customerCare, events: { ...existing.customerCare.events, ...patch.customerCare.events } });
+          care.emailEnabledAt = care.emailEnabled && (!existing.customerCare.emailEnabled || !existing.customerCare.emailEnabledAt) ? new Date().toISOString() : existing.customerCare.emailEnabledAt;
+          patch.customerCare = care;
+        }
+        return { ...existing, ...patch };
+      });
+      if (input.customerCare) await portalControl.setEmailEnabled(data.settings.customerCare.emailEnabled);
+      return data;
+    };
+    const data = await (input.customerCare ? withPortalControlLock(save) : save());
     return json(res, 200, { ok: true, settings: data.settings });
   }
   const adminProofMatch = url.pathname.match(/^\/api\/admin\/orders\/([^/]+)\/proof$/);
@@ -3619,11 +3711,11 @@ export async function handleRequest(req, res) {
     return await serveStatic(res, url.pathname);
   } catch (error) {
     if (url.pathname === "/api/support" && !error.status) return json(res, 503, { ok: false, error: "Customer support is temporarily unavailable. Please try again shortly." });
-    json(res, error.status || 500, { ok: false, error: error.message || "Something went wrong." });
+    json(res, error.status || 500, { ok: false, error: error.message || "Something went wrong.", ...(error.code ? { code: error.code } : {}) });
   }
 }
 
-if (modulePath && process.argv[1] && path.resolve(process.argv[1]) === path.resolve(modulePath) && !process.env.NETLIFY) {
+if (modulePath && process.argv[1] && path.resolve(process.argv[1]) === path.resolve(modulePath) && !runtime.netlify) {
   const server = http.createServer(handleRequest);
   server.listen(port, "127.0.0.1", () => {
     console.log(`Online Portal running at http://127.0.0.1:${port}`);

@@ -1,5 +1,7 @@
 import { Readable } from "node:stream";
-import { handleRequest } from "../../server.js";
+import { createPortalRuntimeLoader } from "../../lib/netlify-runtime.mjs";
+
+const loadPortal = createPortalRuntimeLoader();
 
 class FunctionResponse {
   statusCode = 200;
@@ -40,7 +42,8 @@ function requestUrl(request) {
   return `${path}${url.search}`;
 }
 
-export default async function handler(request) {
+export default async function handler(request, context) {
+  const { handleRequest } = await loadPortal(context);
   const body = Buffer.from(await request.arrayBuffer());
   const req = Readable.from(body.length ? [body] : []);
   req.method = request.method || "GET";
