@@ -1,5 +1,15 @@
 # Online Portal
 
+The infrastructure reliability patch adds shared catalogue caching, record-level
+transactions, duplicate-safe submission/sync claims, current-account session
+checks and paginated account/order views. See
+[infrastructure readiness and release checks](docs/infrastructure-readiness.md).
+Local changes do not open the hosted Portal or enable Shopify mutations.
+
+The local [admin dashboard redesign](docs/admin-dashboard.md) adds date-filtered
+order counts/values, all-date attention queues, system health and direct order
+drilldowns while retaining the existing payment and fulfilment controls.
+
 Product search supports approved compound names, brand aliases, umbrella categories, strict strength/code matching and optional spelling suggestions. Manage vocabulary, product classification and anonymous unmatched searches under **Admin → Product search**. Existing Shopify goal/form tags are preserved.
 
 Customers can confirm receipt of fully shipped orders. The default Home check-in appears three days after final dispatch; **Received** removes the order from Home and marks it Completed in My orders. Timing is configurable in **Shop settings → Delivery confirmation**. Customer receipt is stored separately from Shark dispatch/payment data.
@@ -8,14 +18,16 @@ Use [the search and delivery QA checklist](docs/search-and-delivery-qa.md) for m
 
 Customer-facing order portal for Tank Nutrition.
 
-Read `AGENTS.md` and `memory/online-portal-app.md` before changing this app.
+Read `AGENTS.md` and the local/dev `memory/online-portal-app.md` before changing
+this app. Durable memory is retained in the dev repository; production excludes
+memory, secrets and runtime data.
 
 ## Current Flow
 
 - Customers log in or create an account.
 - Account creation requires a scroll-to-bottom research-use-only terms disclaimer and 18+ confirmation before the account is saved.
 - Customers browse Shopify-backed products with brand tiles, search, type filters, availability, featured products, and 30-product pagination.
-- Normal cart orders are capped by Shopify availability without exposing exact SOH.
+- Normal cart orders check current Office/storage availability and configured external-vendor rules without exposing exact SOH.
 - Special orders can request larger quantities or out-of-stock products.
 - Admin reviews each order before payment details are released.
 - The active payment module is currently Yoco payment links. Admin attaches the link after review.
@@ -31,20 +43,36 @@ Read `AGENTS.md` and `memory/online-portal-app.md` before changing this app.
 - Product quick view shows Shopify images (up to eight), zoom controls, and strength/format/pack size when present. Admin > Shop settings > Product details can supply missing facts or override labels; leave fields blank to use explicit catalog labels. The portal does not invent dosage instructions.
 - Home shows the next action for active orders. Active, visible customer tabs refresh order status and support replies once per minute; polling stops after five minutes without interaction or while the tab is hidden. Admin panels refresh when opened or through Refresh.
 - Help and each order's Need help button open a private support conversation. Staff reply in Admin > Customer support. Customers read replies in Help; email and WhatsApp contact links appear once configured under Shop settings > Customer communication.
-- Account recovery is not included in this patch.
+- Account email verification and password recovery are included in the local email patch. Customers can browse before verifying; submitting an order requires verification by default. Admins need a real verified recovery email. See [email rollout and QA](docs/email-launch-checklist.md).
 
-## Optional Order Emails
+## Account and Order Emails
 
 Order emails use the Resend API. Delivery is off by default. To configure after deploying:
 
 1. Verify a sender domain with Resend and create a sending API key.
 2. Set server-side Netlify variables `RESEND_API_KEY` (secret), `EMAIL_FROM` (the verified email address without a display name) and `PORTAL_PUBLIC_URL` (the public HTTPS portal address). Redeploy after changing environment variables. Never put the service key in public files.
 3. In Admin > Shop settings > Customer communication, enter support contacts/display name, select notification events, enable Send order emails and save.
-4. Check Admin > Customer support > Email delivery for setup status and results. Sent to email service means accepted by the provider, not confirmed inbox delivery. Delivery/bounce webhooks are not implemented.
+4. Check Admin > Customer support > Email delivery for setup status, searchable/paginated history and safe retries. Sent to email service means provider acceptance; Delivered means receiving-server acceptance, not proof of reading.
+5. Register `/api/webhooks/resend` with Resend and set Production `RESEND_WEBHOOK_SECRET` (secret) when deployment is authorized. Delivery, delay, bounce, complaint and failure feedback uses signed, duplicate-safe events. See the [email launch checklist](docs/email-launch-checklist.md) for exact setup and the already-saved sender variables.
+
+Account emails have a separate setting from order notifications. Verification and
+recovery links are single-use, expire after 24 hours / 15 minutes respectively,
+and stay out of browser history and admin responses. Password resets revoke old
+sessions and require normal sign-in afterward. Their encrypted private outbox and
+account updates share the Postgres transaction. Netlify `context.waitUntil` keeps
+delivery work alive after generic recovery responses; separate private hints
+recover interrupted attempts. The worker does not scan account history.
+
+Set the monitored support inbox in Customer communication for Reply-To.
+`EMAIL_REPLY_TO` is an optional server-side fallback. Local and preview tests
+never send email. No Resend key or webhook secret belongs in public files.
 
 Events cover order received, payment details ready, payment confirmed and shipment updates. Emails include the reference, total and a sign-in link to the order; product names and payment URLs stay in the portal. The admin payment-verification and Shopify mutation gates are unchanged.
 
-The Postgres `op_customer_messages` table stores support conversations and email delivery records. It is created automatically using the existing database connection. New notifications are queued and attempted during the relevant order action. The `customer-notifications` scheduled Netlify Function checks every five minutes on production deploys, using lightweight retry hints outside Postgres. Paused, unconfigured, disabled and idle runs make no database queries. It reads message/order records only when a retry is due. Delivery uses short database row locks, a two-minute claim lease, provider idempotency keys and five automatic attempts. Retries expire after 23 hours to stay within the provider's 24-hour deduplication window. Obsolete payment prompts are skipped. Events from before emails were enabled are not backfilled automatically. Opening Customer support refreshes retry hints for pending records already included in that view, recovering older or interrupted hint writes. Admins can also retry delivery explicitly. The worker no longer scans saved order history to rebuild the queue.
+The Postgres `op_customer_messages` table stores support conversations and email delivery records. Order events and deterministic email records commit together. Delayed private hints recover interrupted delivery without scanning order history. The production notification worker checks once per minute with a shared execution budget. Paused, unconfigured, disabled and idle runs issue no SQL; scheduled invocations and Blob reads still cost resources. Delivery uses short row locks, claims and provider idempotency. A shared four-per-second sending gate queues bursts; provider throttling respects Retry-After without exhausting delivery attempts. Ordinary failures have five attempts and a 23-hour lifetime; security links retain their shorter expiry. Obsolete payment prompts are skipped. Email delivery, rather than the support inbox, refreshes pending hints on deliberate admin reads. Support requests have separate pagination.
+
+See the [capacity and launch audit](docs/capacity-and-launch-audit.md) for local
+burst-test results, remaining hosted checks and provider quota requirements.
 
 Local and deploy-preview runs never send email. Local messaging uses ignored `data/customer-messages.json`; hosted messaging requires Postgres. No email credentials or support contact values are bundled.
 
@@ -59,6 +87,8 @@ Hosted availability, email-enabled checks and retry hints use the strongly consi
 Retail Shark loads Portal orders on opening the Orders/Portal views or explicit Refresh. Home initially leaves Portal totals unchecked; Reload checks them explicitly. Unsaved tracking edits prevent a refresh from replacing the draft. This allows Postgres to sleep during inactivity; actual savings depend on customer traffic, deliberate admin use and queued retries.
 
 ## Local Start
+
+Use Node.js 22.12 or newer.
 
 ```powershell
 npm start
@@ -81,6 +111,8 @@ To stop the local server, double-click `Stop Online Portal.cmd`.
 
 ```powershell
 npm run check:all
+npm run check:database
+npm run check:bundle
 ```
 
 This includes a disposable credential-free server test for customer isolation, support replies, message concurrency, email retries, product facts and the existing order flow. It does not load this checkout's `.env`, call Shopify, or touch hosted Retail Shark data.
@@ -93,7 +125,7 @@ With the local server running:
 npm run smoke:local
 ```
 
-The smoke test creates a temporary local order, attaches a Yoco test link, confirms payment as admin, and verifies the Retail Shark internal endpoint. Run `npm run reset:local` afterward when you want clean local test data.
+The smoke test creates a disposable local order, attaches a Yoco test link, confirms payment as admin, and verifies the local Retail Shark internal endpoint. Its temporary data is removed automatically; it does not need a reset of your normal local data.
 
 ## Storage
 

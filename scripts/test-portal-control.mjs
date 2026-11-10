@@ -146,7 +146,7 @@ try {
   revoked.users = revoked.users.map((user) => user.role === "admin" ? { ...user, role: "customer" } : user);
   revoked.users.push(recoveryAdmin); // Preserve one admin so normal account recovery does not restore the revoked account.
   await writeFile(usersPath, JSON.stringify(revoked));
-  await admin("/api/admin/portal-control", { action: "pause", token: verified.token, revision, confirmation: "PAUSE PORTAL" }, 403);
+  await admin("/api/admin/portal-control", { action: "pause", token: verified.token, revision, confirmation: "PAUSE PORTAL" }, 401);
   await writeFile(usersPath, activeUsers);
   const paused = await admin("/api/admin/portal-control", { action: "pause", token: verified.token, revision, confirmation: "PAUSE PORTAL" });
   assert.equal(paused.control.paused, true);
@@ -164,7 +164,7 @@ try {
   const adminAgain = client();
   await adminAgain("/api/auth/admin-login", { username: "admin", password: "admin" });
   await writeFile(usersPath, JSON.stringify(revoked));
-  await admin("/api/admin/portal-control", { action: "resume", confirm: true, revision: paused.control.revision }, 403);
+  await admin("/api/admin/portal-control", { action: "resume", confirm: true, revision: paused.control.revision }, 401);
   await writeFile(usersPath, activeUsers);
   await admin("/api/admin/portal-control", { action: "resume", confirm: true, revision: paused.control.revision });
   assert.equal((await anonymous("/api/portal-status")).paused, false);
@@ -172,8 +172,8 @@ try {
   await admin("/api/admin/portal-control", { action: "pause", token: verified.token, revision, confirmation: "PAUSE PORTAL" }, 409);
   const legacyMessage = createOrderEmail({ id: "legacy-order", reference: "LEGACY", customer: { id: "customer", email: "test@example.com" }, total: 1 }, "order_received", { portalUrl: "https://example.com", care: normalizeCustomerCare({}), eventId: "event" });
   await writeFile(path.join(portal.directory, "data/customer-messages.json"), JSON.stringify({ version: 1, messages: [legacyMessage] }));
-  await admin("/api/admin/customer-care");
+  await admin("/api/admin/notifications");
   const retryHints = JSON.parse(await readFile(path.join(portal.directory, "data/notification-retries.json"), "utf8"));
-  assert.ok(retryHints[legacyMessage.id], "Opening Customer support recovers pending delivery hints without an idle history scan.");
+  assert.ok(retryHints[legacyMessage.id], "Opening Email delivery recovers pending delivery hints without an idle history scan.");
   console.log("Portal control tests passed: enforced three-step confirmation, stale-token rejection, customer/internal gates, admin recovery, isolated storage, and zero-SQL idle workers.");
 } finally { await portal.close(); }

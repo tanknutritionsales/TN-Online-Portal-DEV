@@ -1,8 +1,7 @@
 node_modules/
 .env
-data/*.json
+data/*
 !data/*.example.json
-data/proofs/
 public/product-images/
 memory/
 *.log

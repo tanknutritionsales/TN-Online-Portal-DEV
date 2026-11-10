@@ -2,6 +2,9 @@ import { cartStorageKey, readSavedCart, saveCart } from "/cart-storage.js";
 import { productFacts } from "/product-content.js";
 import { createCatalogSearch, normalizeSearchSettings, anonymousSearchTerm } from "/catalog-search.js";
 import { mountAdminSearch } from "/admin-search.js";
+import { mountAccountEmail } from "/account-email.js";
+import { mountAdminEmail } from "/admin-email.js";
+import { mountAdminDashboard, reportingControls, readReportingControls, toggleCustomDates, periodParams, adminQueueLabels } from "/admin-dashboard.js";
 
 const money = new Intl.NumberFormat("en-ZA", { style: "currency", currency: "ZAR" });
 
@@ -21,14 +24,24 @@ const state = {
   cartRestoredFor: "",
   cartBusy: false,
   cartWarning: "",
+  cartQuote: null,
   theme: "light",
   productPage: 1,
   productsPerPage: 30,
   shopSettings: null,
   adminProductSearch: "",
   adminOrders: [],
+  adminOrdersOffset: 0,
+  adminOrdersPage: { offset: 0, limit: 50, hasMore: false },
+  adminOrdersLoading: false,
+  adminOrdersError: "",
   adminStock: new Map(),
   customerOrders: [],
+  customerHomeOrders: [],
+  customerLinkedOrder: null,
+  customerOrdersPage: { offset: 0, limit: 50, hasMore: false },
+  customerOrdersNextOffset: 0,
+  customerOrdersLoading: false,
   customerSupport: [],
   customerSupportLoaded: false,
   customerSupportError: "",
@@ -36,13 +49,23 @@ const state = {
   adminCustomerCare: null,
   adminCareView: "support",
   adminSupportFilter: "open",
+  adminSupportOffset: 0,
   handledOrderLink: false,
-  adminView: "pending",
+  adminView: "dashboard",
+  adminReportingPeriod: { period: "30d" },
+  adminOrderPeriod: { period: "all" },
+  adminOrderQueue: "",
+  adminOrdersTotal: null,
   portalControl: null,
   portalPaused: false,
   adminLoginOnly: false,
   pauseConfirmation: null,
   adminAccounts: [],
+  adminAccountsOffset: 0,
+  adminAccountsPage: { offset: 0, limit: 50, hasMore: false },
+  adminAccountsCounts: null,
+  adminAccountsLoading: false,
+  adminAccountsError: "",
   adminAccountFilter: "all",
   specialOrderItems: [],
   specialProductSearch: "",
@@ -122,6 +145,12 @@ let lastCustomerActivityAt = Date.now();
 const customerIdleMs = 5 * 60 * 1000;
 let supportRequestKey = "";
 let searchMissTimer = null;
+let adminOrderSearchTimer = null;
+let adminOrdersRequest = 0;
+let adminAccountsRequest = 0;
+let customerOrdersRequest = null;
+let receiptPromptRequest = null;
+let sessionRevision = 0;
 const recordedSearchMisses = new Set();
 
 const qs = (selector, root = document) => root.querySelector(selector);
@@ -215,19 +244,35 @@ function defaultShopSettings() {
 }
 
 async function api(path, options = {}) {
-  const response = await fetch(path, {
-    cache: "no-store",
-    ...options,
-    headers: {
-      "content-type": "application/json",
-      "x-op-client": "portal",
-      ...(options.headers || {}),
-    },
-  });
-  const payload = await response.json();
-  if (!response.ok || !payload.ok) {
+  const revision = sessionRevision;
+  let response, payload;
+  try {
+    const timeout = AbortSignal.timeout(30000);
+    response = await fetch(path, {
+      cache: "no-store",
+      ...options,
+      signal: options.signal ? AbortSignal.any([options.signal, timeout]) : timeout,
+      headers: {
+        "content-type": "application/json",
+        "x-op-client": "portal",
+        ...(options.headers || {}),
+      },
+    });
+    payload = await response.json().catch(() => null);
+  } catch (error) {
+    throw new Error(error.name === "TimeoutError" ? "This is taking longer than expected. Please try again." : "Could not connect. Please check your connection and try again.");
+  }
+  if (revision !== sessionRevision) throw Object.assign(new Error("Please sign in again to continue."), { code: "SESSION_CHANGED" });
+  const loginRequest = ["/api/auth/login", "/api/auth/admin-login"].includes(path);
+  if (response.status === 401 && !loginRequest && (state.user || state.admin)) {
+    showAuth();
+    toast("Your session has expired. Please sign in again.");
+    throw Object.assign(new Error("Your session has expired. Please sign in again."), { status: 401 });
+  }
+  if (!response.ok || !payload?.ok) {
+    payload ||= {};
     if (["PORTAL_PAUSED", "PORTAL_CONTROL_UNAVAILABLE"].includes(payload.code) && !state.admin) showPortalPaused();
-    throw Object.assign(new Error(payload.error || "Request failed."), { code: payload.code, status: response.status });
+    throw Object.assign(new Error(typeof payload.error === "string" ? payload.error : "The request could not be completed. Please try again shortly."), { code: payload.code, status: response.status });
   }
   return payload;
 }
@@ -245,6 +290,8 @@ function newIdempotencyKey(prefix = "op") {
 }
 
 function showScreen(screen) {
+  qs("#forgotPasswordScreen").hidden = screen !== "forgot";
+  qs("#emailActionScreen").hidden = screen !== "email";
   qs("#pausedScreen").hidden = screen !== "paused";
   qs("#loginScreen").hidden = screen !== "login";
   qs("#createAccountScreen").hidden = screen !== "create";
@@ -252,6 +299,18 @@ function showScreen(screen) {
 }
 
 function showAuth() {
+  state.adminDashboardUi?.destroy(); state.adminDashboardUi = null;
+  if (qs("#correctEmailDialog").open) qs("#correctEmailDialog").close();
+  state.adminEmailCleanup?.();
+  state.adminCareRequest = (state.adminCareRequest || 0) + 1;
+  sessionRevision++;
+  adminOrdersRequest++;
+  adminAccountsRequest++;
+  clearTimeout(adminOrderSearchTimer);
+  customerOrdersRequest = null;
+  receiptPromptRequest = null;
+  customerUpdateInFlight = null;
+  lastCustomerPoll = 0;
   state.searchAdminCleanup?.();
   state.searchAdminCleanup = null;
   closeProductQuickView();
@@ -269,8 +328,49 @@ function showAuth() {
   qs("#portalMain").inert = false;
   state.cartRestoredFor = "";
   state.cartWarning = "";
+  state.cartQuote = null;
+  state.cartBusy = false;
   state.catalogReady = false;
+  state.products = [];
+  state.brandCollections = [];
+  state.shopSettings = null;
+  state.cart.clear();
+  state.adminOrders = [];
+  state.adminStock.clear();
+  state.adminOrdersOffset = 0;
+  state.adminOrdersPage = { offset: 0, limit: 50, hasMore: false };
+  state.adminOrdersLoading = false;
+  state.adminOrdersError = "";
+  state.adminOrderSearch = "";
+  state.adminOrderFilter = "all";
+  state.adminView = "dashboard";
+  state.adminReportingPeriod = { period: "30d" }; state.adminOrderPeriod = { period: "all" }; state.adminOrderQueue = "";
+  state.adminOrdersTotal = null;
+  state.adminAccounts = [];
+  state.adminAccountsOffset = 0;
+  state.adminAccountsPage = { offset: 0, limit: 50, hasMore: false };
+  state.adminAccountsCounts = null;
+  state.adminAccountsLoading = false;
+  state.adminAccountsError = "";
+  state.adminAccountFilter = "all";
+  state.adminCustomerCare = null;
+  state.systemStatus = null;
+  state.portalControl = null;
+  state.pauseConfirmation = null;
+  state.pendingAccountRemoval = null;
+  state.pendingAddressRemoval = null;
+  state.editingAddressId = null;
+  state.pendingOrderDraft = null;
+  state.editingAdminAccountId = "";
+  state.specialOrderItems = [];
+  state.selectedAddressId = "";
   state.customerOrders = [];
+  state.customerHomeOrders = [];
+  state.customerLinkedOrder = null;
+  state.customerOrdersPage = { offset: 0, limit: 50, hasMore: false };
+  state.customerOrdersNextOffset = 0;
+  state.customerOrdersLoading = false;
+  state.handledOrderLink = false;
   state.receiptSeen.clear();
   state.receiptAutoPrompted = false;
   state.receiptOrderId = "";
@@ -282,6 +382,18 @@ function showAuth() {
   state.customerSupportError = "";
   qs("#supportReplyBadge").hidden = true;
   state.customerOrdersLoaded = false;
+  qsa("dialog[open]").forEach((dialog) => dialog.close());
+  qsa(".modal-backdrop").forEach((modal) => { modal.hidden = true; });
+  document.body.classList.remove("delivery-receipt-open", "customer-support-open");
+  pendingRegistrationPayload = null;
+  ["#adminOrders", "#adminOrdersSummary", "#statusOrders", "#accountDetails", "#homeOrderActions", "#supportHistory", "#supportContacts", "#supportOrderId", "#deliveryReceiptContent", "#products", "#orderFlowContent", "#orderFlowActions", "#checkoutAddressPanel", "#portalPauseBody"].forEach((selector) => { qs(selector).replaceChildren(); });
+  ["#registerForm", "#adminAccountForm", "#removeAccountForm", "#addressForm", "#customerSupportForm", "#specialOrderForm", "#orderForm"].forEach((selector) => qs(selector).reset());
+  qs("#accountName").textContent = "";
+  qs("#homeOrderUpdates").hidden = true;
+  qs("#loadOlderOrders").hidden = true;
+  qs("#customerOrdersFeedback").textContent = "";
+  hideAdminPagination();
+  renderCart();
   qs("#loginForm").reset();
   qs("#showCreateAccount").hidden = state.portalPaused || state.adminLoginOnly;
   applyTheme("light");
@@ -401,6 +513,12 @@ async function submitPauseConfirmation(event) {
 
 function refreshAdminView() {
   if (!state.admin) return;
+  const titles = { dashboard: "Dashboard", all: "All orders", pending: "Awaiting confirmation", ready: "Ready to pack", external: "External fulfilment", completed: "Order history", accounts: "Accounts", "customer-care": "Customer support", "system-status": "System status", "portal-control": "Portal availability", "shop-settings": "Shop settings", search: "Product search" };
+  qs("#adminPageTitle").textContent = titles[state.adminView] || "Admin";
+  qs("#adminMobileNav").value = state.adminView;
+  qsa("[data-admin-view]").forEach(button => { const selected = button.dataset.adminView === state.adminView; button.classList.toggle("is-active", selected); if (selected) button.setAttribute("aria-current", "page"); else button.removeAttribute("aria-current"); });
+  hideAdminPagination();
+  if (state.adminView === "dashboard") return loadAdminDashboard();
   if (state.adminView === "portal-control") return loadPortalControl();
   if (state.adminView === "shop-settings") return loadAdminShopSettings();
   if (state.adminView === "search") return loadAdminSearch();
@@ -414,6 +532,7 @@ async function showApp(session) {
   state.user = session.user || null;
   state.admin = session.admin || null;
   showScreen("app");
+  accountEmailUi.render();
   qsa(".customer-only").forEach((group) => { group.hidden = Boolean(state.admin) || group.id === "homeOrderUpdates"; });
   qs(".admin-tab").hidden = !state.admin;
   qs("#themeToggle").hidden = false;
@@ -423,9 +542,8 @@ async function showApp(session) {
   switchView(state.admin ? "admin" : "home", { refreshAdmin: false });
   if (state.admin) {
     clearInterval(customerPollTimer);
-    await loadPortalControl();
-    if (state.portalControl?.paused) { state.adminView = "portal-control"; renderPortalControl(); }
-    else await loadAdminOrders();
+    await loadPortalControl().catch(() => null);
+    await refreshAdminView();
     return;
   }
   state.selectedAddressId = defaultUserAddress()?.id || "";
@@ -434,6 +552,7 @@ async function showApp(session) {
   renderCheckoutAddresses();
   startCustomerPolling();
   await Promise.all([loadCatalog(), loadCustomerOrders(), loadCustomerSupport()]);
+  accountEmailUi.render();
 }
 
 function renderManual() {
@@ -497,6 +616,7 @@ async function initSession() {
   state.cart.clear();
   renderCart();
   await checkPortalStatus();
+  if (!state.portalPaused) accountEmailUi.openAction();
 }
 
 function showResearchNotice() {
@@ -775,11 +895,13 @@ async function loadCatalog() {
 }
 
 async function loadShopSettings() {
+  const revision = sessionRevision;
   try {
     const payload = await api("/api/shop-settings");
     state.shopSettings = mergeShopSettings(payload.settings);
     return payload;
-  } catch {
+  } catch (error) {
+    if (revision !== sessionRevision) throw error;
     return { settings: defaultShopSettings() };
   }
 }
@@ -831,6 +953,7 @@ function fulfillmentSettings() {
 }
 
 function courierAmountForDraft(draft = {}) {
+  if (Number.isFinite(draft.deliveryFee)) return draft.deliveryFee;
   const settings = courierSettings();
   if (settings.enabled === false) return 0;
   return draft.items?.length ? Number(settings.amount || 0) : 0;
@@ -1388,10 +1511,39 @@ async function changeCartQuantity(variantId, quantity) {
 }
 
 async function checkCart(items, specialOrder) {
-  return api("/api/cart/check", {
+  const payload = await api("/api/cart/check", {
     method: "POST",
     body: JSON.stringify({ items, specialOrder }),
   });
+  let pricesChanged = false;
+  const verified = new Map((payload.items || []).map((item) => [item.variantId, item]));
+  if (![payload.subtotal, payload.deliveryFee, payload.total].every((amount) => Number.isFinite(amount) && amount >= 0)
+    || items.some((item) => !Number.isFinite(verified.get(item.variantId)?.price) || verified.get(item.variantId).price < 0)) {
+    throw new Error("Current prices could not be checked. Please try again before placing your order.");
+  }
+  for (const item of items) {
+    const price = Number(verified.get(item.variantId)?.price);
+    if (!Number.isFinite(price) || price < 0) continue;
+    if (Number(item.price) !== price) pricesChanged = true;
+    item.price = price;
+    const product = state.products.find((entry) => entry.variant?.id === item.variantId);
+    if (product) product.variant.price = price;
+    const cartItem = state.cart.get(item.variantId);
+    if (cartItem) cartItem.price = price;
+    const specialItem = state.specialOrderItems.find((entry) => entry.variantId === item.variantId);
+    if (specialItem) specialItem.price = price;
+  }
+  if (!specialOrder && [payload.subtotal, payload.deliveryFee, payload.total].every(Number.isFinite)) {
+    state.cartQuote = { signature: cartQuoteSignature(items), subtotal: payload.subtotal, deliveryFee: payload.deliveryFee, total: payload.total };
+  }
+  persistCart();
+  renderCart();
+  if (pricesChanged) toast("Prices have been updated. Please review the current prices before placing your order.");
+  return { ...payload, pricesChanged };
+}
+
+function cartQuoteSignature(items) {
+  return JSON.stringify(items.map((item) => [item.variantId, item.quantity, Number(item.price)]).sort((a, b) => String(a[0]).localeCompare(String(b[0]))));
 }
 
 function renderCart() {
@@ -1400,8 +1552,9 @@ function renderCart() {
   const items = [...state.cart.values()];
   const totalQuantity = items.reduce((sum, item) => sum + item.quantity, 0);
   const subtotal = items.reduce((sum, item) => sum + item.price * item.quantity, 0);
-  const courierFee = totalQuantity ? Number(courierSettings().amount || 0) : 0;
-  const total = subtotal + courierFee;
+  const quote = state.cartQuote?.signature === cartQuoteSignature(items) ? state.cartQuote : null;
+  const courierFee = quote ? quote.deliveryFee : totalQuantity && courierSettings().enabled !== false ? Number(courierSettings().amount || 0) : 0;
+  const total = quote ? quote.total : subtotal + courierFee;
   const specialOrders = fulfillmentSettings().specialOrders || defaultShopSettings().fulfillment.specialOrders;
   const specialButton = qs("#openSpecialOrder");
   if (specialButton) {
@@ -1458,9 +1611,17 @@ function renderCart() {
       : "");
 }
 
+function checkoutEmailReady() {
+  if (state.user?.emailVerified !== false || currentShopSettings().customerCare.requireVerifiedEmailForOrders === false) return true;
+  toast("Verify your email before submitting an order. Your basket is saved.");
+  switchView("account"); accountEmailUi.render();
+  return false;
+}
+
 async function submitOrder(event) {
   event.preventDefault();
   if (state.admin || !state.user) return;
+  if (!checkoutEmailReady()) return;
   if (state.cartBusy) return toast("Please wait for your cart to finish updating.");
   const items = [...state.cart.values()];
   if (!items.length) return toast("Add at least one product first.");
@@ -1472,8 +1633,9 @@ async function submitOrder(event) {
   renderCart();
   reviewButton.disabled = true;
   reviewButton.textContent = "Checking availability...";
+  let verified;
   try {
-    await checkCart(items, false);
+    verified = await checkCart(items, false);
     if (state.user?.id !== customerId) return;
   } catch (error) {
     state.cartWarning = error.message;
@@ -1495,6 +1657,9 @@ async function submitOrder(event) {
       method: "Courier",
     },
     items,
+    expectedTotal: verified.total,
+    deliveryFee: verified.deliveryFee,
+    pricesUpdated: verified.pricesChanged,
     specialOrder: false,
   };
   openOrderSummaryModal(state.pendingOrderDraft);
@@ -1503,8 +1668,17 @@ async function submitOrder(event) {
 async function confirmPendingOrder() {
   if (state.admin || !state.user) return;
   const draft = state.pendingOrderDraft;
-  if (!draft) return;
+  if (!draft || draft.busy) return;
+  const customerId = state.user.id, revision = sessionRevision;
+  draft.busy = true;
+  const button = qs("[data-confirm-order]");
+  if (button) button.disabled = true;
   try {
+    if (draft.needsPriceCheck) {
+      await refreshDraftPrices(draft);
+      if (revision === sessionRevision && state.user?.id === customerId) openOrderSummaryModal(draft);
+      return;
+    }
     const payload = await api("/api/orders", {
       method: "POST",
       body: JSON.stringify({
@@ -1513,6 +1687,7 @@ async function confirmPendingOrder() {
         specialOrder: Boolean(draft.specialOrder),
         specialOrderNote: draft.specialOrderNote || "",
         idempotencyKey: draft.idempotencyKey,
+        expectedTotal: draft.expectedTotal,
       }),
     });
     if (!draft.specialOrder) {
@@ -1523,10 +1698,35 @@ async function confirmPendingOrder() {
     state.pendingOrderDraft = null;
     renderCart();
     await loadCustomerOrders();
+    if (revision !== sessionRevision || state.user?.id !== customerId) return;
     showOrderSubmittedModal(payload.order);
   } catch (error) {
-    toast(error.message);
+    if (revision !== sessionRevision || state.user?.id !== customerId) return;
+    if (error.status === 409 && (error.code === "PRICE_CHANGED" || /prices? (have |has )?changed/i.test(error.message))) {
+      draft.needsPriceCheck = true;
+      const basket = [...state.cart.values()].map((item) => ({ ...item }));
+      await loadCatalog();
+      if (revision !== sessionRevision || state.user?.id !== customerId) return;
+      if (!draft.specialOrder) state.cart = new Map(basket.map((item) => [item.variantId, item]));
+      try { await refreshDraftPrices(draft); }
+      catch { /* The customer can deliberately check prices again from the review. */ }
+      if (revision !== sessionRevision || state.user?.id !== customerId) return;
+      state.pendingOrderDraft = draft;
+      openOrderSummaryModal(draft);
+      toast(draft.needsPriceCheck ? "Your basket is saved. Check the latest prices before continuing." : "Prices have changed. Your basket is saved. Review the updated total before placing your order.");
+    } else toast(error.message);
+  } finally {
+    draft.busy = false;
+    if (button) button.disabled = false;
   }
+}
+
+async function refreshDraftPrices(draft) {
+  const verified = await checkCart(draft.items, Boolean(draft.specialOrder));
+  draft.expectedTotal = verified.total;
+  draft.deliveryFee = verified.deliveryFee;
+  draft.pricesUpdated = true;
+  draft.needsPriceCheck = false;
 }
 
 function openOrderSummaryModal(draft) {
@@ -1537,6 +1737,7 @@ function openOrderSummaryModal(draft) {
   qs("#orderFlowTitle").textContent = title;
   qs("#orderFlowContent").innerHTML = `
     <div class="checkout-review">
+      ${draft.needsPriceCheck ? `<p class="checkout-price-notice" role="status">Your basket is saved. Check the latest prices before placing your order.</p>` : draft.pricesUpdated ? `<p class="checkout-price-notice" role="status">Prices have been updated. Please review the current prices and total.</p>` : ""}
       <section class="review-section">
         <p class="eyebrow">Items</p>
         <ul class="summary-lines">${draft.items.map((item) => `<li><span>${item.quantity} x ${escapeHtml(item.productTitle)}</span><strong>${money.format(Number(item.price || 0) * Number(item.quantity || 0))}</strong></li>`).join("")}</ul>
@@ -1553,7 +1754,7 @@ function openOrderSummaryModal(draft) {
   `;
   qs("#orderFlowActions").innerHTML = `
     <button class="secondary" type="button" data-close-order-flow>${draft.specialOrder ? "Back" : "Back to cart"}</button>
-    <button class="primary" type="button" data-confirm-order>${draft.specialOrder ? "Send request" : "Place order"}</button>
+    <button class="primary" type="button" data-confirm-order>${draft.needsPriceCheck ? "Check updated total" : draft.specialOrder ? "Send request" : "Place order"}</button>
   `;
   modal.hidden = false;
 }
@@ -1638,6 +1839,7 @@ function closeOrderFlowModal() {
 }
 
 function orderDraftTotal(draft) {
+  if (Number.isFinite(draft.expectedTotal)) return draft.expectedTotal;
   return draft.items.reduce((sum, item) => sum + Number(item.price || 0) * Number(item.quantity || 0), 0) + courierAmountForDraft(draft);
 }
 
@@ -1775,11 +1977,23 @@ function renderSpecialOrderItems() {
 
 async function submitSpecialOrder(event) {
   event.preventDefault();
+  if (!state.user || state.admin) return;
+  if (!checkoutEmailReady()) { closeSpecialOrderModal(); return; }
   const form = event.target;
+  const button = qs('button[type="submit"]', form);
+  if (button.disabled) return;
   const address = userAddresses().find((entry) => entry.id === form.addressId.value);
   if (!address) return toast("Choose or add a delivery address.");
   const items = state.specialOrderItems.length ? state.specialOrderItems.map((item) => ({ ...item })) : [specialOrderItemFromForm(form)].filter(Boolean);
   if (!items.length) return;
+  const customerId = state.user.id;
+  button.disabled = true;
+  let verified;
+  try {
+    verified = await checkCart(items, true);
+    if (state.user?.id !== customerId) return;
+  } catch (error) { toast(error.message); return; }
+  finally { button.disabled = false; }
   state.pendingOrderDraft = {
     idempotencyKey: newIdempotencyKey("special"),
     kind: "special",
@@ -1790,6 +2004,9 @@ async function submitSpecialOrder(event) {
       method: "Courier",
     },
     items,
+    expectedTotal: verified.total,
+    deliveryFee: verified.deliveryFee,
+    pricesUpdated: verified.pricesChanged,
     specialOrder: true,
     specialOrderNote: form.specialOrderNote.value,
   };
@@ -1893,6 +2110,7 @@ async function submitAddressForm(event) {
     renderAccount();
     renderCheckoutAddresses();
     renderSpecialAddressOptions();
+    accountEmailUi.render();
     closeAddressModal();
     toast(editingId ? "Address updated." : "Address added.");
   } catch (error) {
@@ -1950,44 +2168,138 @@ async function confirmRemoveAddress(event) {
   }
 }
 
-async function loadCustomerOrders() {
-  const container = qs("#statusOrders");
+function responsePage(payload, offset = 0) {
+  const page = payload.page || {};
+  return {
+    offset: Number.isInteger(page.offset) && page.offset >= 0 ? page.offset : offset,
+    limit: Number.isInteger(page.limit) && page.limit > 0 ? page.limit : 50,
+    hasMore: page.hasMore === true,
+  };
+}
+
+function mergeOrders(...lists) {
+  const orders = new Map();
+  lists.forEach((list) => list.forEach((order) => orders.set(order.id, order)));
+  return [...orders.values()];
+}
+
+function customerOrderCandidates() {
+  return mergeOrders(state.customerLinkedOrder ? [state.customerLinkedOrder] : [], state.customerOrders, state.customerHomeOrders);
+}
+
+function customerOrderById(orderId) {
+  return customerOrderCandidates().find((order) => order.id === orderId);
+}
+
+function updateCustomerOrder(order) {
+  if (!order) return;
+  state.customerOrders = state.customerOrders.map((entry) => entry.id === order.id ? order : entry);
+  state.customerHomeOrders = state.customerHomeOrders.map((entry) => entry.id === order.id ? order : entry)
+    .filter((entry) => !entry.deliveryReceipt?.receivedAt && entry.specialOrder?.status !== "declined");
+  if (state.customerLinkedOrder?.id === order.id) state.customerLinkedOrder = order;
+}
+
+function renderCustomerOrders() {
+  qs("#statusOrders").innerHTML = state.customerOrders.length ? state.customerOrders.map(renderCustomerOrder).join("") : `<p class="muted">${state.customerOrdersLoading ? "Loading orders..." : "No orders yet."}</p>`;
+  const button = qs("#loadOlderOrders");
+  button.hidden = !state.customerOrdersPage.hasMore;
+  button.disabled = state.customerOrdersLoading;
+  button.textContent = state.customerOrdersLoading ? "Loading…" : "Load older orders";
+}
+
+async function loadCustomerOrders({ loadMore = false, quiet = false } = {}) {
   if (!state.user) return;
-  const customerId = state.user.id;
-  if (!state.customerOrdersLoaded) container.innerHTML = `<p class="muted">Loading orders...</p>`;
-  try {
-    const payload = await api("/api/orders");
-    if (state.user?.id !== customerId) return;
-    const previous = new Map(state.customerOrders.map((order) => [order.id, order]));
-    const changed = (payload.orders || []).filter((order) => previous.has(order.id) && previous.get(order.id).updatedAt !== order.updatedAt);
-    state.customerOrders = payload.orders || [];
-    const wasLoaded = state.customerOrdersLoaded;
-    state.customerOrdersLoaded = true;
-    container.innerHTML = state.customerOrders.length ? state.customerOrders.map(renderCustomerOrder).join("") : `<p class="muted">No orders yet.</p>`;
-    renderHomeOrderUpdates();
-    maybePromptDeliveryReceipt();
-    if (!qs("#orderFlowModal").hidden && ["payment", "submitted"].includes(state.orderFlowView)) {
-      const updated = changed.find((order) => order.id === state.activePaymentOrder?.id);
-      if (updated) showPaymentModal(updated);
-    }
-    if (wasLoaded && changed.length) toast(`Order ${changed[0].reference}: ${changed[0].customerStatus}`);
-    const linkedOrderId = new URLSearchParams(location.search).get("order");
-    if (linkedOrderId && !state.handledOrderLink) {
-      state.handledOrderLink = true;
-      const order = state.customerOrders.find((entry) => entry.id === linkedOrderId);
-      if (order) { await loadShopSettings(); if (state.user?.id === customerId) { switchView("orders"); showPaymentModal(order); } }
-      else toast("This order is not available in your account.");
-    }
-  } catch (error) {
-    if (!state.customerOrdersLoaded) container.innerHTML = `<p class="muted">${escapeHtml(error.message)}</p>`;
+  const customerId = state.user.id, revision = sessionRevision;
+  if (customerOrdersRequest) {
+    await customerOrdersRequest;
+    if (quiet || revision !== sessionRevision) return;
+    return loadCustomerOrders({ loadMore });
   }
+  if (loadMore && !state.customerOrdersPage.hasMore) return;
+  const offset = loadMore ? state.customerOrdersNextOffset : 0;
+  state.customerOrdersLoading = true;
+  if (!quiet || !state.customerOrdersLoaded) qs("#customerOrdersFeedback").textContent = "";
+  if (!state.customerOrdersLoaded) renderCustomerOrders();
+  qs("#loadOlderOrders").disabled = true;
+  const request = (async () => {
+    try {
+      const payload = await api(`/api/orders?limit=50&offset=${offset}`);
+      if (sessionRevision !== revision || state.user?.id !== customerId) return;
+      const previous = new Map(customerOrderCandidates().map((order) => [order.id, order]));
+      const rows = payload.orders || [];
+      const active = Array.isArray(payload.activeOrders) ? payload.activeOrders : mergeOrders(state.customerHomeOrders, rows).filter((order) => !order.deliveryReceipt?.receivedAt && order.specialOrder?.status !== "declined");
+      const changed = mergeOrders(rows, active).filter((order) => previous.has(order.id) && previous.get(order.id).updatedAt !== order.updatedAt);
+      const wasLoaded = state.customerOrdersLoaded;
+      const page = responsePage(payload, offset);
+      if (loadMore) {
+        // Append in server order without moving any rows already on screen.
+        state.customerOrders = mergeOrders(state.customerOrders, rows);
+      } else {
+        const oldHistory = state.customerOrders;
+        const oldIds = new Set(oldHistory.map((order) => order.id));
+        const newestIds = new Set(rows.map((order) => order.id));
+        state.customerOrders = mergeOrders(rows, oldHistory.filter((order) => !newestIds.has(order.id)));
+        if (wasLoaded) state.customerOrdersNextOffset += rows.filter((order) => !oldIds.has(order.id)).length;
+      }
+      state.customerHomeOrders = active;
+      const activeById = new Map(active.map((order) => [order.id, order]));
+      state.customerOrders = state.customerOrders.map((order) => activeById.get(order.id) || order);
+      if (!wasLoaded || loadMore) {
+        state.customerOrdersPage = page;
+        state.customerOrdersNextOffset = page.offset + page.limit;
+      }
+      state.customerOrdersLoaded = true;
+      renderCustomerOrders();
+      renderHomeOrderUpdates();
+      maybePromptDeliveryReceipt();
+      if (!qs("#orderFlowModal").hidden && ["payment", "submitted"].includes(state.orderFlowView)) {
+        const updated = changed.find((order) => order.id === state.activePaymentOrder?.id);
+        if (updated) showPaymentModal(updated);
+      }
+      if (!loadMore && wasLoaded && changed.length) toast(`Order ${changed[0].reference}: ${changed[0].customerStatus}`);
+      const linkedOrderId = new URLSearchParams(location.search).get("order");
+      if (linkedOrderId && !state.handledOrderLink) {
+        state.handledOrderLink = true;
+        let order = customerOrderById(linkedOrderId);
+        if (!order) {
+          try {
+            const linked = await api(`/api/orders/${encodeURIComponent(linkedOrderId)}`);
+            if (revision !== sessionRevision) return;
+            order = linked.order;
+            state.customerLinkedOrder = order || null;
+          } catch (error) {
+            if (revision !== sessionRevision) return;
+            toast(error.status === 404 ? "This order is not available in your account." : error.message);
+            return;
+          }
+        }
+        if (order) {
+          await loadShopSettings();
+          if (revision === sessionRevision) { switchView("orders"); showPaymentModal(order); }
+        } else toast("This order is not available in your account.");
+      }
+    } catch (error) {
+      if (revision !== sessionRevision) return;
+      qs("#customerOrdersFeedback").textContent = error.message;
+      if (!state.customerOrdersLoaded) qs("#statusOrders").innerHTML = `<p class="muted">Orders could not be loaded. Please try Refresh.</p>`;
+    } finally {
+      if (revision === sessionRevision) {
+        state.customerOrdersLoading = false;
+        qs("#loadOlderOrders").disabled = false;
+        qs("#loadOlderOrders").textContent = "Load older orders";
+      }
+    }
+  })();
+  customerOrdersRequest = request;
+  try { await request; }
+  finally { if (customerOrdersRequest === request) customerOrdersRequest = null; }
 }
 
 function renderHomeOrderUpdates() {
   const section = qs("#homeOrderUpdates");
   if (!state.user) { section.hidden = true; return; }
   const priority = (order) => order.canPay && order.paymentIssue?.type !== "paid_pending" ? 0 : order.paymentIssue?.type === "paid_pending" ? 1 : order.fulfillmentStatus === "shipped" ? 4 : order.paymentStatus === "confirmed" ? 3 : 2;
-  const orders = state.customerOrders.filter((order) => order.specialOrder?.status !== "declined" && !order.deliveryReceipt?.receivedAt).sort((a, b) => priority(a) - priority(b) || Date.parse(b.updatedAt) - Date.parse(a.updatedAt)).slice(0, 3);
+  const orders = state.customerHomeOrders.filter((order) => order.specialOrder?.status !== "declined" && !order.deliveryReceipt?.receivedAt).sort((a, b) => priority(a) - priority(b) || Date.parse(b.updatedAt) - Date.parse(a.updatedAt)).slice(0, 3);
   const unreadReplies = supportUnreadCount();
   section.hidden = !orders.length && !unreadReplies;
   qs("#homeOrderActions").innerHTML = orders.map((order) => {
@@ -1999,14 +2311,36 @@ function renderHomeOrderUpdates() {
   }).join("") + (unreadReplies ? `<div class="home-order-row"><span>${unreadReplies} new support ${unreadReplies === 1 ? "reply" : "replies"}</span><button class="secondary" type="button" data-open-support>Read reply</button></div>` : "");
 }
 
-function maybePromptDeliveryReceipt() {
-  if (state.receiptAutoPrompted || !state.user || !state.customerOrdersLoaded || !qs("#view-home").classList.contains("is-active") || !qs("#specialOrderModal").hidden || !qs("#orderFlowModal").hidden || qs("dialog[open]")) return;
-  const order = state.customerOrders.filter((order) => order.deliveryReceipt?.promptDue && !state.receiptSeen.has(order.id)).sort((a, b) => Date.parse(a.deliveryReceipt.promptAfter) - Date.parse(b.deliveryReceipt.promptAfter))[0];
-  if (order) { state.receiptAutoPrompted = true; openDeliveryReceipt(order.id); }
+function canPromptDeliveryReceipt() {
+  return !state.receiptAutoPrompted && state.user && state.customerOrdersLoaded && qs("#view-home").classList.contains("is-active") && qs("#specialOrderModal").hidden && qs("#orderFlowModal").hidden && !qs("dialog[open]");
+}
+
+async function maybePromptDeliveryReceipt() {
+  if (receiptPromptRequest || !canPromptDeliveryReceipt()) return;
+  const order = customerOrderCandidates().filter((order) => order.deliveryReceipt?.promptDue && !order.deliveryReceipt.receivedAt && !state.receiptSeen.has(order.id)).sort((a, b) => Date.parse(a.deliveryReceipt.promptAfter) - Date.parse(b.deliveryReceipt.promptAfter))[0];
+  if (!order) return;
+  const request = { revision: sessionRevision, customerId: state.user.id };
+  receiptPromptRequest = request;
+  try {
+    // Older history is retained between polls. Check this one candidate so a
+    // receipt confirmed in another session cannot reopen a stale prompt.
+    const payload = await api(`/api/orders/${encodeURIComponent(order.id)}`);
+    if (request.revision !== sessionRevision || state.user?.id !== request.customerId || !payload.order) return;
+    updateCustomerOrder(payload.order);
+    renderCustomerOrders();
+    renderHomeOrderUpdates();
+    if (!canPromptDeliveryReceipt() || state.receiptSeen.has(order.id)) return;
+    const receipt = payload.order.deliveryReceipt;
+    if (receipt?.canConfirm && receipt.promptDue && !receipt.receivedAt) {
+      state.receiptAutoPrompted = true;
+      openDeliveryReceipt(order.id);
+    }
+  } catch { /* Check again with a later Home update if confirmation is unavailable. */ }
+  finally { if (receiptPromptRequest === request) receiptPromptRequest = null; }
 }
 
 function openDeliveryReceipt(orderId) {
-  const order = state.customerOrders.find((entry) => entry.id === orderId);
+  const order = customerOrderById(orderId);
   if (!order?.deliveryReceipt?.canConfirm || !state.user) return;
   state.receiptOrderId = orderId;
   state.receiptSeen.add(orderId);
@@ -2028,8 +2362,10 @@ async function respondToDeliveryReceipt(action, { reportProblem = false } = {}) 
   qsa("button", dialog).forEach((button) => { button.disabled = true; });
   qs("#deliveryReceiptFeedback").textContent = "";
   try {
-    await api(`/api/orders/${encodeURIComponent(orderId)}/delivery-confirmation`, { method: "POST", body: JSON.stringify({ action }) });
+    const payload = await api(`/api/orders/${encodeURIComponent(orderId)}/delivery-confirmation`, { method: "POST", body: JSON.stringify({ action }) });
     if (state.user?.id !== userId) return;
+    const updated = payload.order || (await api(`/api/orders/${encodeURIComponent(orderId)}`)).order;
+    updateCustomerOrder(updated);
     dialog.close(); state.receiptOrderId = "";
     await loadCustomerOrders();
     if (reportProblem) await openCustomerSupport(orderId, { topic: "Delivery" });
@@ -2051,7 +2387,7 @@ function startCustomerPolling() {
 function refreshCustomerUpdates() {
   if (!state.user || state.admin || state.portalPaused || document.visibilityState !== "visible" || Date.now() - lastCustomerActivityAt >= customerIdleMs || Date.now() - lastCustomerPoll < 15_000 || customerUpdateInFlight) return;
   lastCustomerPoll = Date.now();
-  customerUpdateInFlight = Promise.allSettled([loadCustomerOrders(), loadCustomerSupport()]).finally(() => { customerUpdateInFlight = null; });
+  customerUpdateInFlight = Promise.allSettled([loadCustomerOrders({ quiet: true }), loadCustomerSupport()]).finally(() => { customerUpdateInFlight = null; });
 }
 
 function supportUnreadCount() {
@@ -2088,7 +2424,7 @@ async function openCustomerSupport(orderId = "", { topic = "" } = {}) {
   qs("#customerSupportForm").reset();
   if (topic) qs('#customerSupportForm select[name="topic"]').value = topic;
   qs("#supportFormFeedback").textContent = "Replies will appear in your conversations below.";
-  qs("#supportOrderId").innerHTML = `<option value="">General enquiry</option>${state.customerOrders.map((order) => `<option value="${escapeHtml(order.id)}" ${order.id === orderId ? "selected" : ""}>${escapeHtml(order.reference)}</option>`).join("")}`;
+  qs("#supportOrderId").innerHTML = `<option value="">General enquiry</option>${customerOrderCandidates().map((order) => `<option value="${escapeHtml(order.id)}" ${order.id === orderId ? "selected" : ""}>${escapeHtml(order.reference)}</option>`).join("")}`;
   renderSupportContacts();
   renderSupportHistory();
   if (!qs("#customerSupportDialog").open) qs("#customerSupportDialog").showModal();
@@ -2103,7 +2439,7 @@ async function openCustomerSupport(orderId = "", { topic = "" } = {}) {
 
 function renderSupportContacts() {
   const care = currentShopSettings().customerCare;
-  const order = state.customerOrders.find((entry) => entry.id === qs("#supportOrderId").value);
+  const order = customerOrderById(qs("#supportOrderId").value);
   const subject = `Order enquiry${order ? ` - ${order.reference}` : ""}`;
   const message = order ? `Order reference: ${order.reference}\n\n` : "";
   qs("#supportContacts").innerHTML = `${care.supportHours ? `<p class="muted small">${escapeHtml(care.supportHours)}</p>` : ""}<div>${care.supportEmail ? `<a class="secondary button-link" href="mailto:${encodeURIComponent(care.supportEmail)}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(message)}">Email support</a>` : ""}${care.whatsappNumber ? `<a class="secondary button-link" href="https://wa.me/${encodeURIComponent(care.whatsappNumber)}?text=${encodeURIComponent(message || subject)}" target="_blank" rel="noopener">WhatsApp</a>` : ""}</div>`;
@@ -2340,6 +2676,8 @@ function showPaymentIssueModal(order) {
 
 async function submitPaymentIssueForm(event) {
   event.preventDefault();
+  if (!state.user || state.admin) return;
+  const customerId = state.user.id, revision = sessionRevision;
   const form = event.target;
   const orderId = form.dataset.paymentIssue;
   const formData = new FormData(form);
@@ -2352,42 +2690,108 @@ async function submitPaymentIssueForm(event) {
       }),
     });
     toast("Payment issue reported.");
+    updateCustomerOrder(payload.order);
     await loadCustomerOrders();
+    if (revision !== sessionRevision || state.user?.id !== customerId) return;
     closeOrderFlowModal();
-    const updated = payload.order || state.customerOrders.find((order) => order.id === orderId);
+    const updated = payload.order || customerOrderById(orderId);
     if (updated) showPaymentModal(updated);
   } catch (error) {
-    toast(error.message);
+    if (revision === sessionRevision) toast(error.message);
   }
 }
 
 async function reportPaidNotice(orderId) {
+  if (!state.user || state.admin) return;
+  const customerId = state.user.id, revision = sessionRevision;
   try {
     const payload = await api(`/api/orders/${encodeURIComponent(orderId)}/paid-notice`, {
       method: "POST",
       body: "{}",
     });
     toast("Order marked as paid. We will verify it shortly.");
+    updateCustomerOrder(payload.order);
     await loadCustomerOrders();
-    const updated = payload.order || state.customerOrders.find((order) => order.id === orderId);
+    if (revision !== sessionRevision || state.user?.id !== customerId) return;
+    const updated = payload.order || customerOrderById(orderId);
     if (updated) showPaymentModal(updated);
   } catch (error) {
-    toast(error.message);
+    if (revision === sessionRevision) toast(error.message);
   }
 }
 
+function navigateAdmin({ view, queue = "", period = { period: "all" }, search = "", care = "support" }) {
+  if (!state.admin) return;
+  state.adminDashboardUi?.destroy(); state.adminDashboardUi = null;
+  state.adminEmailCleanup?.(); state.searchAdminCleanup?.();
+  clearTimeout(adminOrderSearchTimer); adminOrdersRequest++; adminAccountsRequest++;
+  state.adminView = view; state.adminOrderFilter = "all"; state.adminOrderQueue = queue;
+  state.adminOrderSearch = search; state.adminOrderPeriod = period;
+  state.adminOrdersOffset = 0; state.adminAccountsOffset = 0;
+  state.adminCareView = care === "email" ? "email" : "support"; state.adminEmailAttention = care === "email";
+  state.adminSupportFilter = "open";
+  state.adminSupportOffset = 0;
+  const work = refreshAdminView();
+  qs("#view-admin").scrollIntoView({ block: "start" });
+  return work?.catch(error => toast(error.message));
+}
+
+function loadAdminDashboard() {
+  if (!state.adminDashboardUi) state.adminDashboardUi = mountAdminDashboard({ root: qs("#adminOrders"), summary: qs("#adminOrdersSummary"), api,
+    active: () => Boolean(state.admin && state.adminView === "dashboard"), getPeriod: () => state.adminReportingPeriod,
+    setPeriod: period => { state.adminReportingPeriod = period; }, navigate: navigateAdmin, portal: () => state.portalControl, name: () => state.admin?.name || state.admin?.username || "" });
+  return state.adminDashboardUi.load({ checkSystems: true });
+}
+
 async function loadAdminOrders() {
-  const requestedView = state.adminView;
-  const container = qs("#adminOrders");
-  container.innerHTML = `<p class="muted">Loading orders...</p>`;
+  if (!state.admin || !["all", "pending", "ready", "external", "completed"].includes(state.adminView)) return;
+  clearTimeout(adminOrderSearchTimer);
+  const request = ++adminOrdersRequest, revision = sessionRevision;
+  const query = adminOrdersQuery();
+  state.adminOrders = [];
+  state.adminOrdersLoading = true;
+  state.adminOrdersError = "";
+  renderAdminOrders();
   try {
-    const [payload, settingsPayload] = await Promise.all([api("/api/admin/orders"), loadShopSettings()]);
+    const [payload, settingsPayload] = await Promise.all([api(`/api/admin/orders?${query}`), loadShopSettings()]);
+    if (revision !== sessionRevision || request !== adminOrdersRequest || query !== adminOrdersQuery()) return;
     state.shopSettings = mergeShopSettings(settingsPayload.settings || defaultShopSettings());
     state.adminOrders = payload.orders || [];
-    if (state.adminView === requestedView) renderAdminOrders();
+    state.adminOrdersTotal = Number.isFinite(payload.total) ? payload.total : null;
+    state.adminOrdersPage = responsePage(payload, state.adminOrdersOffset);
+    state.adminOrdersOffset = state.adminOrdersPage.offset;
   } catch (error) {
-    container.innerHTML = `<p class="muted">${escapeHtml(error.message)}</p>`;
+    if (revision !== sessionRevision || request !== adminOrdersRequest || query !== adminOrdersQuery()) return;
+    state.adminOrdersError = error.message;
+  } finally {
+    if (revision === sessionRevision && request === adminOrdersRequest && query === adminOrdersQuery()) {
+      state.adminOrdersLoading = false;
+      renderAdminOrders();
+    }
   }
+}
+
+function adminOrdersQuery() {
+  return new URLSearchParams({ view: state.adminView, filter: state.adminOrderFilter, search: state.adminOrderSearch.trim(), queue: state.adminOrderQueue, ...periodParams(state.adminOrderPeriod), limit: "50", offset: String(state.adminOrdersOffset) }).toString();
+}
+
+function hideAdminPagination() {
+  ["#adminPagerTop", "#adminPagerBottom"].forEach((selector) => { qs(selector).hidden = true; qs(selector).replaceChildren(); });
+}
+
+function renderAdminPagination(kind) {
+  const accounts = kind === "accounts";
+  const page = accounts ? state.adminAccountsPage : state.adminOrdersPage;
+  const offset = accounts ? state.adminAccountsOffset : state.adminOrdersOffset;
+  const loading = accounts ? state.adminAccountsLoading : state.adminOrdersLoading;
+  const error = accounts ? state.adminAccountsError : state.adminOrdersError;
+  const number = Math.floor(offset / page.limit) + 1;
+  ["#adminPagerTop", "#adminPagerBottom"].forEach((selector) => {
+    const pager = qs(selector);
+    pager.hidden = offset === 0 && !page.hasMore;
+    if (pager.hidden) { pager.replaceChildren(); return; }
+    pager.innerHTML = `<button class="secondary" type="button" data-admin-page="prev" data-page-kind="${kind}" ${loading || offset === 0 ? "disabled" : ""}>Prev</button><span class="muted small" role="status">Page ${number}</span><button class="secondary" type="button" data-admin-page="next" data-page-kind="${kind}" ${loading || error || !page.hasMore ? "disabled" : ""}>Next</button>`;
+  });
 }
 
 function renderAdminOrders() {
@@ -2411,18 +2815,22 @@ function renderAdminOrders() {
     renderSystemStatus();
     return;
   }
-  const viewOrders = adminOrdersForView(state.adminView);
-  const orders = viewOrders.filter(adminOrderMatchesFilters);
+  const searchInput = qs("#adminOrderSearch");
+  const focus = document.activeElement === searchInput && searchInput ? { start: searchInput.selectionStart, end: searchInput.selectionEnd, direction: searchInput.selectionDirection, scroll: searchInput.scrollLeft } : null;
+  const orders = state.adminOrders;
   const labels = {
+    all: "All orders",
     pending: "Awaiting confirmation",
     external: "External fulfillment",
     ready: "Ready to pack",
-    completed: "Completed",
+    completed: "Order history",
   };
   qs("#adminOrdersSummary").innerHTML = `
-    <span>${labels[state.adminView]} - ${orders.length}${orders.length === viewOrders.length ? "" : ` of ${viewOrders.length}`} order${orders.length === 1 ? "" : "s"}</span>
+    <span>${labels[state.adminView]} · ${state.adminOrdersLoading ? "Loading matching orders…" : state.adminOrdersError ? "Orders unavailable" : state.adminOrdersTotal !== null ? `${state.adminOrdersTotal} matching order${state.adminOrdersTotal === 1 ? "" : "s"}` : !orders.length ? "No orders" : `${orders.length} matching order${orders.length === 1 ? "" : "s"} on this page`}</span>
+    ${reportingControls(state.adminOrderPeriod, "adminOrderPeriodForm")}
+    ${state.adminOrderQueue ? `<div class="admin-queue-selection"><strong>${escapeHtml(adminQueueLabels[state.adminOrderQueue] || "Selected queue")}</strong><button class="dashboard-text-link" type="button" data-clear-admin-queue>Clear queue</button></div>` : ""}
     <div class="admin-order-tools">
-      <input id="adminOrderSearch" type="search" value="${escapeHtml(state.adminOrderSearch)}" placeholder="Search reference, customer, email or product">
+      <input id="adminOrderSearch" type="search" aria-label="Search orders" value="${escapeHtml(state.adminOrderSearch)}" placeholder="Search reference, customer, email or product">
       <div class="admin-order-filters" aria-label="Order filters">
         ${adminOrderFilterOptions()
           .map(
@@ -2436,10 +2844,18 @@ function renderAdminOrders() {
       </div>
     </div>
   `;
-  const hasActiveOrderFilter = state.adminOrderFilter !== "all" || Boolean(state.adminOrderSearch);
-  qs("#adminOrders").innerHTML = orders.length
-    ? orders.map(renderAdminOrder).join("")
-    : `<p class="muted">${hasActiveOrderFilter ? "No orders match this search or filter." : emptyAdminMessage(state.adminView)}</p>`;
+  const hasActiveOrderFilter = state.adminOrderFilter !== "all" || Boolean(state.adminOrderSearch) || Boolean(state.adminOrderQueue) || state.adminOrderPeriod.period !== "all";
+  qs("#adminOrders").innerHTML = state.adminOrdersLoading ? `<p class="muted" role="status">Loading orders...</p>`
+    : state.adminOrdersError ? `<p class="muted" role="status">${escapeHtml(state.adminOrdersError)}</p><button class="secondary" type="button" data-retry-admin-orders>Try again</button>`
+      : orders.length ? orders.map(renderAdminOrder).join("")
+        : `<p class="muted">${state.adminOrdersOffset > 0 ? "No matching orders on this page. Use Prev to see earlier results." : hasActiveOrderFilter ? "No orders match this search or filter." : emptyAdminMessage(state.adminView)}</p>`;
+  renderAdminPagination("orders");
+  if (focus) {
+    const input = qs("#adminOrderSearch");
+    input.focus({ preventScroll: true });
+    input.setSelectionRange(focus.start, focus.end, focus.direction);
+    input.scrollLeft = focus.scroll;
+  }
 }
 
 function adminOrderFilterOptions() {
@@ -2453,48 +2869,11 @@ function adminOrderFilterOptions() {
   ];
 }
 
-function adminOrderMatchesFilters(order) {
-  const query = normalizeSearch(state.adminOrderSearch);
-  if (query && !adminOrderSearchText(order).includes(query)) return false;
-  if (state.adminOrderFilter === "needs_payment_details") return !order.paymentLink && fulfillmentReadyForPayment(order);
-  if (state.adminOrderFilter === "payment_to_verify") return order.paymentIssue?.type === "paid_pending";
-  if (state.adminOrderFilter === "special_review") return order.specialOrder?.status === "pending";
-  if (state.adminOrderFilter === "fulfillment_review") return !fulfillmentReadyForPayment(order) && order.specialOrder?.status !== "pending";
-  if (state.adminOrderFilter === "support") return order.paymentIssue && order.paymentIssue.status !== "resolved" && order.paymentIssue.type !== "paid_pending";
-  return true;
-}
-
-function adminOrderSearchText(order) {
-  return normalizeSearch(
-    [
-      order.reference,
-      order.customer?.name,
-      order.customer?.email,
-      order.customer?.phone,
-      order.items?.map((item) => `${item.productTitle} ${item.sku || ""}`).join(" "),
-      order.paymentLink?.reference,
-      order.proof?.note,
-    ].join(" "),
-  );
-}
-
 function adminOrderView(order) {
   if (order.fulfillmentStatus === "shipped") return "completed";
   if (order.specialOrder?.status === "declined") return "completed";
   if (order.paymentStatus === "confirmed" && order.fulfillmentStatus === "not_ready") return "ready";
   return "pending";
-}
-
-function adminOrdersForView(view) {
-  if (view === "external") {
-    return state.adminOrders.filter(
-      (order) => hasExternalFulfillment(order) && order.paymentStatus === "confirmed" && order.fulfillmentStatus !== "shipped" && !order.externalTracking?.number,
-    );
-  }
-  if (view === "ready") {
-    return state.adminOrders.filter((order) => adminOrderView(order) === view && (order.officeItems || []).length > 0 && !order.officeShippedAt);
-  }
-  return state.adminOrders.filter((order) => adminOrderView(order) === view);
 }
 
 function hasExternalFulfillment(order) {
@@ -2510,7 +2889,8 @@ function fulfillmentReadyForPayment(order) {
 function emptyAdminMessage(view) {
   if (view === "ready") return "No paid orders are ready to pack.";
   if (view === "external") return "No external fulfillment orders need tracking.";
-  if (view === "completed") return "No completed orders yet.";
+  if (view === "completed") return "No orders in history yet.";
+  if (view === "all") return "No orders yet.";
   return "No orders are waiting for payment confirmation.";
 }
 
@@ -2544,27 +2924,37 @@ async function loadAdminSearch() {
 }
 
 async function loadAdminAccounts() {
-  qs("#adminOrdersSummary").innerHTML = `<span>Accounts</span>`;
-  qs("#adminOrders").innerHTML = `<p class="muted">Loading accounts...</p>`;
+  if (!state.admin || state.adminView !== "accounts") return;
+  const request = ++adminAccountsRequest, revision = sessionRevision;
+  const role = state.adminAccountFilter, offset = state.adminAccountsOffset;
+  state.adminAccountsLoading = true;
+  state.adminAccountsError = "";
+  state.adminAccounts = [];
+  state.adminAccountsCounts = null;
+  renderAdminAccounts();
   try {
-    const payload = await api("/api/admin/accounts");
+    const payload = await api(`/api/admin/accounts?${new URLSearchParams({ role, limit: "50", offset: String(offset) })}`);
+    if (revision !== sessionRevision || request !== adminAccountsRequest || state.adminView !== "accounts" || role !== state.adminAccountFilter) return;
     state.adminAccounts = payload.accounts || [];
-    renderAdminAccounts();
+    state.adminAccountsCounts = payload.counts || null;
+    state.adminAccountsPage = responsePage(payload, offset);
+    state.adminAccountsOffset = state.adminAccountsPage.offset;
   } catch (error) {
-    qs("#adminOrders").innerHTML = `<p class="muted">${escapeHtml(error.message)}</p>`;
+    if (revision !== sessionRevision || request !== adminAccountsRequest) return;
+    state.adminAccountsError = error.message;
+  } finally {
+    if (revision === sessionRevision && request === adminAccountsRequest && state.adminView === "accounts" && role === state.adminAccountFilter) {
+      state.adminAccountsLoading = false;
+      renderAdminAccounts();
+    }
   }
 }
 
 function renderAdminAccounts() {
   qsa("[data-admin-view]").forEach((button) => button.classList.toggle("is-active", button.dataset.adminView === state.adminView));
   const accounts = state.adminAccounts || [];
-  const visible = accounts.filter((account) => state.adminAccountFilter === "all" || account.role === state.adminAccountFilter);
-  const counts = {
-    all: accounts.length,
-    admin: accounts.filter((account) => account.role === "admin").length,
-    customer: accounts.filter((account) => account.role !== "admin").length,
-  };
-  qs("#adminOrdersSummary").innerHTML = `<span>Accounts - ${visible.length}${visible.length === accounts.length ? "" : ` of ${accounts.length}`}</span>`;
+  const counts = state.adminAccountsCounts;
+  qs("#adminOrdersSummary").innerHTML = `<span>Accounts · ${state.adminAccountsLoading ? "Loading…" : state.adminAccountsError ? "Accounts unavailable" : `${accounts.length} matching account${accounts.length === 1 ? "" : "s"} on this page`}</span>`;
   qs("#adminOrders").innerHTML = `
     <section class="admin-account-shell">
       <div class="account-filter-bar" aria-label="Account filters">
@@ -2573,7 +2963,7 @@ function renderAdminAccounts() {
             (role) => `
               <button class="account-filter${state.adminAccountFilter === role ? " is-active" : ""}" type="button" data-account-filter="${role}">
                 ${role === "all" ? "All" : role === "admin" ? "Admins" : "Customers"}
-                <span>${counts[role]}</span>
+                ${Number.isInteger(counts?.[role]) && counts[role] >= 0 ? `<span>${counts[role]}</span>` : ""}
               </button>
             `,
           )
@@ -2583,13 +2973,15 @@ function renderAdminAccounts() {
 
       <div class="account-admin-list">
         ${
-          visible.length
-            ? visible.map(renderAdminAccount).join("")
-            : `<p class="muted">No accounts match this filter.</p>`
+          state.adminAccountsLoading ? `<p class="muted" role="status">Loading accounts...</p>`
+            : state.adminAccountsError ? `<p class="muted" role="status">${escapeHtml(state.adminAccountsError)}</p><button class="secondary" type="button" data-retry-admin-accounts>Try again</button>`
+              : accounts.length ? accounts.map(renderAdminAccount).join("")
+                : `<p class="muted">${state.adminAccountsOffset > 0 ? "No accounts on this page. Use Prev to see earlier results." : "No accounts match this filter."}</p>`
         }
       </div>
     </section>
   `;
+  renderAdminPagination("accounts");
 }
 
 function renderAdminAccount(account) {
@@ -2605,6 +2997,8 @@ function renderAdminAccount(account) {
       </div>
       <div class="account-admin-actions">
         <span class="role-badge ${escapeHtml(account.role)}">${account.role === "admin" ? "Admin" : "Customer"}</span>
+        <span class="status-badge">${account.emailVerified ? "Email verified" : "Email unverified"}</span>
+        ${!account.emailVerified && account.email && !/@(?:admin\.local|example\.com)$/i.test(account.email) ? `<button type="button" data-account-verify="${escapeHtml(account.id)}">Send verification</button>` : ""}
         ${account.role === "admin" ? `<button type="button" data-edit-admin-account="${escapeHtml(account.id)}">Edit</button>` : ""}
         <button class="danger-button" type="button" data-remove-account="${escapeHtml(account.id)}" ${isCurrentAdmin ? "disabled" : ""}>Remove</button>
       </div>
@@ -2649,6 +3043,7 @@ function openAdminAccountModal(accountId = "") {
   state.editingAdminAccountId = account?.id || "";
   form.reset();
   qs("#adminAccountTitle").textContent = account ? "Edit admin account" : "Create account";
+  qs('button[type="submit"]', form).textContent = account ? "Save changes" : "Create account";
   form.elements.role.value = account?.role || "customer";
   form.elements.role.disabled = Boolean(account);
   form.elements.username.value = account?.username || "";
@@ -2656,6 +3051,7 @@ function openAdminAccountModal(accountId = "") {
   form.elements.email.value = account?.email && !String(account.email).endsWith("@admin.local") ? account.email : "";
   form.elements.password.required = !account;
   form.elements.password.placeholder = account ? "Leave blank to keep current password" : "";
+  qs("#adminPasswordHelp").textContent = account ? "Leave blank to keep the current password, or use 12–128 characters for a new one." : "Use 12–128 characters. A few memorable words make a strong password.";
   toggleAdminAccountFields();
   qs("#adminAccountModal").hidden = false;
   form.elements.username.focus();
@@ -2675,6 +3071,8 @@ function toggleAdminAccountFields() {
   const form = qs("#adminAccountForm");
   if (!form) return;
   const isAdmin = form.elements.role.value === "admin" || Boolean(state.editingAdminAccountId);
+  form.elements.email.required = !isAdmin;
+  qs("[data-admin-email-required]", form).hidden = isAdmin;
   qsa("[data-admin-customer-field]", form).forEach((field) => {
     field.hidden = isAdmin;
     qsa("input, select, textarea", field).forEach((input) => {
@@ -2717,14 +3115,16 @@ async function submitRemoveAccount(event) {
 }
 
 async function loadSystemStatus() {
+  if (!state.admin || state.adminView !== "system-status") return;
   qs("#adminOrdersSummary").innerHTML = `<span>System status</span>`;
   qs("#adminOrders").innerHTML = `<p class="muted">Checking systems...</p>`;
   try {
     const payload = await api("/api/admin/system-status");
+    if (!state.admin || state.adminView !== "system-status") return;
     state.systemStatus = payload;
     renderSystemStatus();
   } catch (error) {
-    qs("#adminOrders").innerHTML = `<p class="muted">${escapeHtml(error.message)}</p>`;
+    if (state.admin && state.adminView === "system-status") qs("#adminOrders").innerHTML = `<p class="muted">${escapeHtml(error.message)}</p>`;
   }
 }
 
@@ -2733,6 +3133,7 @@ function renderSystemStatus() {
   const payload = state.systemStatus || { systems: [] };
   qs("#adminOrdersSummary").innerHTML = `<span>System status${payload.checkedAt ? ` - checked ${new Date(payload.checkedAt).toLocaleString()}` : ""}</span>`;
   qs("#adminOrders").innerHTML = `
+    <div class="catalogue-refresh-tools"><p class="muted small">Refresh the catalogue here when product information needs updating.</p><button id="adminRefresh" class="secondary" type="button">Refresh catalogue</button></div>
     <section class="system-status-grid">
       ${
         payload.systems?.length
@@ -2741,6 +3142,18 @@ function renderSystemStatus() {
       }
     </section>
   `;
+}
+
+async function refreshAdminCatalog(button) {
+  if (!state.admin || button.disabled) return;
+  button.disabled = true;
+  button.textContent = "Refreshing catalogue…";
+  try {
+    const payload = await api("/api/admin/catalog/refresh", { method: "POST", body: "{}" });
+    toast(Number.isInteger(payload.products) ? `Catalogue refreshed. ${payload.products} products available.` : "Catalogue refreshed.");
+    if (state.adminView === "system-status") await loadSystemStatus();
+  } catch (error) { toast(error.message); }
+  finally { button.disabled = false; button.textContent = "Refresh catalogue"; }
 }
 
 function renderStatusCard(system) {
@@ -2757,6 +3170,7 @@ function renderStatusCard(system) {
 
 function statusLabel(status) {
   if (status === "online") return "Online";
+  if (status === "configured") return "Configured";
   if (status === "error") return "Error";
   return "Offline";
 }
@@ -2946,31 +3360,37 @@ function collectFulfillmentSettings(formData) {
 }
 
 async function loadAdminCustomerCare() {
+  const request = state.adminCareRequest = (state.adminCareRequest || 0) + 1;
+  state.adminEmailCleanup?.();
+  if (state.adminCareView === "email") {
+    const toolbar = `<div class="care-view-tabs" role="group" aria-label="Customer communication views"><button type="button" data-care-view="support">Support requests</button><button type="button" data-care-view="email" class="is-active">Email delivery</button></div>`;
+    state.adminEmailCleanup = mountAdminEmail({ root: qs("#adminOrders"), summary: qs("#adminOrdersSummary"), toolbar, api, toast,
+      active: () => Boolean(state.admin && state.adminView === "customer-care" && state.adminCareView === "email"), initialStatus: state.adminEmailAttention ? "attention" : "all" });
+    return;
+  }
   qs("#adminOrdersSummary").innerHTML = `<span>Customer support</span>`;
   qs("#adminOrders").innerHTML = `<p class="muted">Loading customer messages...</p>`;
   try {
-    const payload = await api("/api/admin/customer-care");
-    if (!state.admin || state.adminView !== "customer-care") return;
+    const payload = await api(`/api/admin/customer-care?${new URLSearchParams({ status: state.adminSupportFilter, offset: String(state.adminSupportOffset), limit: "50" })}`);
+    if (!state.admin || state.adminView !== "customer-care" || state.adminCareView === "email" || request !== state.adminCareRequest) return;
+    if (payload.page?.offset > 0 && !payload.requests?.length) { state.adminSupportOffset = Math.max(0, payload.page.offset - payload.page.limit); return loadAdminCustomerCare(); }
     state.adminCustomerCare = payload;
     renderAdminCustomerCare();
-  } catch (error) { qs("#adminOrders").innerHTML = `<p class="muted">${escapeHtml(error.message)}</p>`; }
+  } catch (error) { if (state.admin && state.adminView === "customer-care" && request === state.adminCareRequest) qs("#adminOrders").innerHTML = `<p class="muted">${escapeHtml(error.message)}</p>`; }
 }
 
 function renderAdminCustomerCare() {
+  if (state.adminCareView === "email") { loadAdminCustomerCare(); return; }
   const data = state.adminCustomerCare;
   if (!data) return;
-  qsa("[data-admin-view]").forEach((button) => button.classList.toggle("is-active", button.dataset.adminView === state.adminView));
-  const openCount = data.requests.filter((request) => request.status !== "resolved").length;
-  qs("#adminOrdersSummary").innerHTML = `<span>${openCount} open support ${openCount === 1 ? "request" : "requests"}</span>`;
-  const toolbar = `<div class="care-view-tabs" role="group" aria-label="Customer communication views"><button type="button" data-care-view="support" class="${state.adminCareView === "support" ? "is-active" : ""}">Support requests</button><button type="button" data-care-view="email" class="${state.adminCareView === "email" ? "is-active" : ""}">Email delivery</button></div>`;
-  if (state.adminCareView === "email") {
-    const labels = { disabled: "Off", setup_required: "Setup required", pending: "Queued", sending: "Sending", failed: "Failed", expired: "Expired", superseded: "No longer required", sent: "Sent to email service" };
-    const ready = data.emailSetup.enabled && data.emailSetup.configured;
-    qs("#adminOrders").innerHTML = `${toolbar}<section class="email-setup"><h3>${!data.emailSetup.enabled ? "Order emails are turned off" : data.emailSetup.configured ? "Email delivery is enabled" : "Email setup required"}</h3>${data.emailSetup.missing.length ? `<p class="muted">Required: ${data.emailSetup.missing.map(escapeHtml).join(", ")}</p>` : ""}</section><div>${data.emails.length ? data.emails.map((email) => `<details class="support-thread"><summary><span><strong>${escapeHtml(email.reference)}</strong><small>${escapeHtml(email.subject)}</small></span><span class="status-badge">${escapeHtml(labels[email.status] || email.status)}</span></summary><div class="support-thread-body"><p>To: ${escapeHtml(email.to)}</p><p class="muted">${new Date(email.createdAt).toLocaleString()} &middot; ${email.attempts} ${email.attempts === 1 ? "attempt" : "attempts"}</p>${email.lastError ? `<p>${escapeHtml(email.lastError)}</p>` : ""}${!["sent", "expired", "superseded", "sending"].includes(email.status) ? `<button class="secondary inline-add" type="button" data-retry-email="${escapeHtml(email.id)}" ${ready ? "" : "disabled"}>Retry delivery</button>` : ""}</div></details>`).join("") : `<p class="muted">No order emails yet.</p>`}</div>`;
-    return;
-  }
+  qsa("[data-admin-view]").forEach(button => button.classList.toggle("is-active", button.dataset.adminView === state.adminView));
+  const openCount = data.counts?.open ?? data.requests.filter(request => request.status !== "resolved").length;
+  qs("#adminOrdersSummary").textContent = `${openCount} open support ${openCount === 1 ? "request" : "requests"}`;
+  const toolbar = `<div class="care-view-tabs" role="group" aria-label="Customer communication views"><button type="button" data-care-view="support" class="is-active">Support requests</button><button type="button" data-care-view="email">Email delivery</button></div>`;
   const requests = data.requests.filter((request) => state.adminSupportFilter === "all" || request.status !== "resolved");
   qs("#adminOrders").innerHTML = `${toolbar}<div class="care-view-tabs" role="group" aria-label="Support request filter"><button type="button" data-support-filter="open" class="${state.adminSupportFilter === "open" ? "is-active" : ""}">Open</button><button type="button" data-support-filter="all" class="${state.adminSupportFilter === "all" ? "is-active" : ""}">All</button></div><div>${requests.length ? requests.map((request) => `<details class="support-thread"><summary><span><strong>${escapeHtml(request.reference || request.topic)}</strong><small>${escapeHtml(request.customerName)} &middot; ${escapeHtml(request.customerEmail)}</small></span><span class="status-badge">${request.status === "resolved" ? "Resolved" : "Open"}</span></summary><div class="support-thread-body"><p class="muted">${escapeHtml(request.topic)} &middot; ${new Date(request.createdAt).toLocaleString()}</p><p>${escapeHtml(request.message)}</p>${(request.replies || []).map((reply) => `<div class="support-reply"><strong>${escapeHtml(reply.author)}</strong><p>${escapeHtml(reply.message)}</p></div>`).join("")}<form class="form-stack" data-support-reply="${escapeHtml(request.id)}"><label>Reply<textarea name="reply" rows="3" minlength="2" maxlength="1500" required></textarea></label><label>Status<select name="status"><option value="resolved">Resolved</option><option value="open">Keep open</option></select></label><button class="primary inline-add" type="submit">Send reply</button></form></div></details>`).join("") : `<p class="muted">${state.adminSupportFilter === "open" ? "No open requests." : "No support requests yet."}</p>`}</div>`;
+  const page = data.page || { offset: 0, limit: 50, hasMore: false };
+  if (page.offset || page.hasMore) qs("#adminOrders").innerHTML += `<nav class="record-pager" aria-label="Support pagination"><button type="button" class="secondary" data-support-page="prev" ${!page.offset ? "disabled" : ""}>Prev</button><span>Page ${Math.floor(page.offset/page.limit)+1}</span><button type="button" class="secondary" data-support-page="next" ${!page.hasMore ? "disabled" : ""}>Next</button></nav>`;
 }
 
 async function submitSupportReply(event) {
@@ -3096,6 +3516,8 @@ function renderAdminShopSettings({ preserveDraft = false } = {}) {
           <label class="wide">Support hours<input name="supportHours" maxlength="180" value="${escapeHtml(care.supportHours || "")}"></label>
           <label>Email display name<input name="senderName" maxlength="80" value="${escapeHtml(care.senderName || "Tank Nutrition")}"></label>
           <label class="check-option"><input name="emailEnabled" type="checkbox" ${care.emailEnabled ? "checked" : ""}> Send order emails</label>
+          <label class="check-option"><input name="securityEmailsEnabled" type="checkbox" ${care.securityEmailsEnabled !== false ? "checked" : ""}> Send account verification and recovery emails</label>
+          <label class="check-option"><input name="requireVerifiedEmailForOrders" type="checkbox" ${care.requireVerifiedEmailForOrders !== false ? "checked" : ""}> Require verified email before an order is submitted</label>
           <div class="check-list wide">${[["order_received", "Order received"], ["payment_ready", "Payment details ready"], ["payment_confirmed", "Payment confirmed"], ["shipped", "Shipment updates"]].map(([key, label]) => `<label class="check-option"><input type="checkbox" name="emailEvent-${key}" ${care.events[key] !== false ? "checked" : ""}> ${label}</label>`).join("")}</div>
           <p class="muted small wide">Email delivery requires a connected service and verified sender. View setup and delivery status under Customer support.</p>
         </section>
@@ -3215,6 +3637,7 @@ async function submitShopSettings(event) {
         productContent: state.shopSettings?.productContent || {},
         deliveryConfirmation: { enabled: formData.get("deliveryConfirmationEnabled") === "on", delayDays: Number(formData.get("receiptDelayDays")), snoozeHours: Number(formData.get("receiptSnoozeHours")) },
         customerCare: {
+          securityEmailsEnabled: formData.get("securityEmailsEnabled") === "on", requireVerifiedEmailForOrders: formData.get("requireVerifiedEmailForOrders") === "on",
           supportEmail: formData.get("supportEmail"), whatsappNumber: formData.get("whatsappNumber"), supportHours: formData.get("supportHours"), senderName: formData.get("senderName"), emailEnabled: formData.get("emailEnabled") === "on",
           events: Object.fromEntries(["order_received", "payment_ready", "payment_confirmed", "shipped"].map((key) => [key, formData.get(`emailEvent-${key}`) === "on"])),
         },
@@ -3236,10 +3659,14 @@ function adminOrderStatusLabel(order) {
   if (order.deliveryReceipt?.receivedAt) return "Received by customer";
   if (order.fulfillmentStatus === "shipped") return "Completed";
   if (order.specialOrder?.status === "declined") return "Declined";
+  if (order.paymentStatus === "rejected") return "Payment rejected";
   if (order.paymentStatus === "confirmed") {
+    if ((order.officeItems || []).length && !order.shopifyOrder?.id && ["creating", "syncing"].includes(order.shopifySync?.status) && (Date.parse(order.shopifySync?.leaseExpiresAt) || 0) < Date.now()) return "Shopify order needs checking";
+    if (order.shopifySync?.status === "reconciliation_required") return "Shopify order needs checking";
     if (order.shopifySync?.status === "storage_pending") return "Storage transfer required";
     if (order.fulfillmentStatus === "back_order") return "Back order";
     if (hasExternalFulfillment(order) && !order.externalTracking?.number) return "External tracking required";
+    if ((order.officeItems || []).length && !order.officeShippedAt && !order.tracking?.number) return "Office tracking required";
     return "Ready to pack";
   }
   if (order.paymentIssue?.type === "paid_pending") return "Payment to verify";
@@ -3279,14 +3706,19 @@ function renderAdminOrder(order) {
     ? `<p class="muted"><strong>Stock transfer:</strong> This order is paused until the required units have been moved to Office. Use the check button after the transfer has been completed.</p>`
     : "";
   const statusLabel = adminOrderStatusLabel(order);
+  const statusTone = order.specialOrder?.status === "declined" || order.paymentStatus === "rejected" ? "closed"
+    : order.fulfillmentStatus === "shipped" ? "complete"
+      : order.shopifySync?.status === "reconciliation_required" || order.shopifySync?.status === "error" ? "error"
+        : order.paymentStatus === "confirmed" || order.paymentIssue?.type === "paid_pending" ? "attention" : "neutral";
   return `
     <details class="order-card admin-order-card" data-admin-order-id="${escapeHtml(order.id)}">
       <summary class="admin-order-summary">
         <div>
           <strong>${escapeHtml(order.reference)}</strong>
           <p class="muted">${escapeHtml(order.customer.name)} - ${escapeHtml(order.customer.email)}</p>
+          <small class="admin-order-meta">${new Date(order.createdAt).toLocaleString("en-ZA", { timeZone: "Africa/Johannesburg", dateStyle: "medium", timeStyle: "short" })} · ${money.format(order.total)}</small>
         </div>
-        <span class="status-badge">${escapeHtml(statusLabel)}</span>
+        <span class="status-badge admin-status-${statusTone}">${escapeHtml(statusLabel)}</span>
       </summary>
       <div class="admin-order-details">
         ${renderAdminFulfillmentLines(order)}
@@ -3303,7 +3735,7 @@ function renderAdminOrder(order) {
         ${manualTracking}
         ${
           order.proof
-            ? `<p class="muted">Legacy proof file: <a href="/api/admin/orders/${encodeURIComponent(order.id)}/proof" target="_blank" rel="noopener">${escapeHtml(order.proof.filename)}</a></p>`
+            ? `<p class="muted">Proof of payment: <a href="/api/admin/orders/${encodeURIComponent(order.id)}/proof" download>${escapeHtml(order.proof.filename)} · Download</a></p>`
             : ""
         }
         ${paymentNote}
@@ -3407,6 +3839,7 @@ function renderAdminPaymentLinkForm(order, readyForPayment) {
 }
 
 function readyWorkflowMessage(order, hasShopifyRelevantItems, hasManualItems) {
+  if (order.shopifySync?.status === "reconciliation_required") return "Payment confirmed. Check the Shopify order before packing or making any further changes.";
   if (hasShopifyRelevantItems && hasManualItems) {
     return "Payment confirmed. Retail Shark will handle its allocation; add external shipment tracking here when available.";
   }
@@ -3425,7 +3858,10 @@ function renderShopifySync(order) {
       : escapeHtml(label);
     return `<p class="muted">Processing: ${linked} (${escapeHtml(order.shopifyOrder.financialStatus || "paid")})</p>`;
   }
-  if (!sync.status || sync.status === "not_started") return `<p class="muted">Processing: Not started yet.</p>`;
+  if (!sync.status || sync.status === "not_started") return `<p class="muted">Processing: Not started yet.</p>${order.paymentStatus === "confirmed" ? `<button class="secondary" type="button" data-sync-shopify="${escapeHtml(order.id)}">Check Shopify processing</button>` : ""}`;
+  if (sync.status === "reconciliation_required" || (["creating", "syncing"].includes(sync.status) && (Date.parse(sync.leaseExpiresAt) || 0) < Date.now())) {
+    return `<div class="shopify-check-notice"><p><strong>Shopify order needs checking</strong></p><p class="muted">Shopify may have received this order, but confirmation has not arrived. No new order will be created automatically while the result is uncertain. Use Check Shopify order to look for the existing order before continuing.</p><button class="secondary" type="button" data-sync-shopify="${escapeHtml(order.id)}">Check Shopify order</button></div>`;
+  }
   const labels = {
     disabled: "Sync disabled",
     external: "Not required",
@@ -3434,7 +3870,20 @@ function renderShopifySync(order) {
     error: "Sync error",
     synced: "Synced",
   };
-  return `<p class="muted">Processing: ${escapeHtml(labels[sync.status] || sync.status)}${sync.message ? ` - ${escapeHtml(sync.message)}` : ""}</p>`;
+  const retry = order.paymentStatus === "confirmed" && ["error", "disabled"].includes(sync.status);
+  return `<p class="muted">Processing: ${escapeHtml(labels[sync.status] || sync.status)}${sync.message ? ` - ${escapeHtml(sync.message)}` : ""}</p>${retry ? `<button class="secondary" type="button" data-sync-shopify="${escapeHtml(order.id)}">Retry Shopify sync</button>` : ""}`;
+}
+
+async function syncShopifyOrder(orderId, button) {
+  if (!state.admin || button.disabled) return;
+  button.disabled = true;
+  try {
+    const payload = await api(`/api/admin/orders/${encodeURIComponent(orderId)}/sync-shopify`, { method: "POST", body: "{}" });
+    const sync = payload.order?.shopifySync;
+    toast(sync?.status === "reconciliation_required" ? "Shopify confirmation is still uncertain. No new order will be created automatically. Check the order in Shopify before continuing." : payload.order?.shopifyOrder?.id ? "Shopify order confirmed." : sync?.message || "Shopify order checked.");
+    await loadAdminOrders();
+  } catch (error) { toast(error.message); await loadAdminOrders(); }
+  finally { button.disabled = false; }
 }
 
 function renderAdminSpecialOrder(order) {
@@ -3705,7 +4154,8 @@ async function confirmPayment(orderId) {
       body: JSON.stringify({ confirmedBy: "admin" }),
     });
     const sync = payload.order?.shopifySync;
-    if (sync?.status === "storage_pending") toast("Payment confirmed. Stock transfer required before processing can continue.");
+    if (sync?.status === "reconciliation_required") toast("Payment confirmed. Shopify confirmation is uncertain. Check Shopify order before continuing; no new order will be created automatically.");
+    else if (sync?.status === "storage_pending") toast("Payment confirmed. Stock transfer required before processing can continue.");
     else toast(sync?.status === "error" ? `Payment confirmed. Shopify processing failed: ${sync.message}` : "Payment confirmed.");
     await loadAdminOrders();
   } catch (error) {
@@ -3751,7 +4201,9 @@ async function resolvePaymentIssue(orderId) {
 async function checkStockTransfer(orderId) {
   try {
     const payload = await api(`/api/admin/orders/${encodeURIComponent(orderId)}/check-stock-transfer`, { method: "POST" });
-    if (payload.order?.shopifyOrder?.name) {
+    if (payload.order?.shopifySync?.status === "reconciliation_required") {
+      toast("Shopify confirmation is uncertain. Use Check Shopify order before continuing. No new order will be created automatically.");
+    } else if (payload.order?.shopifyOrder?.name) {
       toast(`Stock transfer confirmed. Order ${payload.order.shopifyOrder.name} is ready for Retail Shark.`);
     } else {
       toast(payload.order?.shopifySync?.message || "Stock transfer is still required.");
@@ -3935,6 +4387,26 @@ async function copyText(value, label = "text") {
 }
 
 document.addEventListener("click", (event) => {
+  if (event.target.closest("[data-retry-admin-orders]")) loadAdminOrders();
+  if (event.target.closest("[data-retry-admin-accounts]")) loadAdminAccounts();
+  const adminRefresh = event.target.closest("#adminRefresh");
+  if (adminRefresh) refreshAdminCatalog(adminRefresh);
+  const syncShopify = event.target.closest("[data-sync-shopify]");
+  if (syncShopify) syncShopifyOrder(syncShopify.dataset.syncShopify, syncShopify);
+  const adminPage = event.target.closest("[data-admin-page]");
+  if (adminPage && !adminPage.disabled && state.admin) {
+    const accounts = adminPage.dataset.pageKind === "accounts";
+    const page = accounts ? state.adminAccountsPage : state.adminOrdersPage;
+    const direction = adminPage.dataset.adminPage === "next" ? 1 : -1;
+    if (accounts) {
+      state.adminAccountsOffset = Math.max(0, state.adminAccountsOffset + direction * page.limit);
+      loadAdminAccounts();
+    } else {
+      state.adminOrdersOffset = Math.max(0, state.adminOrdersOffset + direction * page.limit);
+      loadAdminOrders();
+    }
+    qs("#adminOrdersSummary").scrollIntoView({ block: "start" });
+  }
   if (event.target.closest("[data-retry-admin-search]")) loadAdminSearch();
   const suggestion = event.target.closest("[data-search-suggestion]");
   if (suggestion) {
@@ -3951,9 +4423,23 @@ document.addEventListener("click", (event) => {
   if (event.target.closest("[data-close-support]")) qs("#customerSupportDialog").close();
   if (event.target.closest("[data-retry-support]")) loadCustomerSupport();
   const careView = event.target.closest("[data-care-view]");
-  if (careView) { state.adminCareView = careView.dataset.careView; renderAdminCustomerCare(); }
+  if (careView) { state.adminCareView = careView.dataset.careView; loadAdminCustomerCare(); }
+  const accountVerification = event.target.closest("[data-account-verify]");
+  if (accountVerification && !accountVerification.disabled) {
+    accountVerification.disabled = true;
+    api(`/api/admin/accounts/${encodeURIComponent(accountVerification.dataset.accountVerify)}/verification-email`, { method: "POST", body: "{}" })
+      .then(payload => toast(payload.message)).catch(error => { toast(error.message); accountVerification.disabled = false; });
+  }
   const supportFilter = event.target.closest("[data-support-filter]");
-  if (supportFilter) { state.adminSupportFilter = supportFilter.dataset.supportFilter; renderAdminCustomerCare(); }
+  if (supportFilter) { state.adminSupportFilter = supportFilter.dataset.supportFilter; state.adminSupportOffset = 0; loadAdminCustomerCare(); }
+  const supportPage = event.target.closest("[data-support-page]");
+  if (supportPage && !supportPage.disabled) {
+    const page = state.adminCustomerCare?.page;
+    if (page && (supportPage.dataset.supportPage === "prev" || page.hasMore)) {
+      state.adminSupportOffset = Math.max(0, page.offset + (supportPage.dataset.supportPage === "prev" ? -1 : 1) * page.limit);
+      loadAdminCustomerCare();
+    }
+  }
   const retryEmail = event.target.closest("[data-retry-email]");
   if (retryEmail) retryCustomerEmail(retryEmail.dataset.retryEmail, retryEmail);
   const manualButton = event.target.closest("[data-manual]");
@@ -4046,7 +4532,7 @@ document.addEventListener("click", (event) => {
 
   const reportPaymentIssue = event.target.closest("[data-report-payment-issue]");
   if (reportPaymentIssue) {
-    const order = state.customerOrders?.find((entry) => entry.id === reportPaymentIssue.dataset.reportPaymentIssue) || state.activePaymentOrder;
+    const order = customerOrderById(reportPaymentIssue.dataset.reportPaymentIssue) || state.activePaymentOrder;
     if (order) showPaymentIssueModal(order);
   }
 
@@ -4094,24 +4580,23 @@ document.addEventListener("click", (event) => {
 
   const adminTab = event.target.closest("[data-admin-view]");
   if (adminTab) {
-    state.searchAdminCleanup?.();
-    state.adminView = adminTab.dataset.adminView;
-    state.adminOrderFilter = "all";
-    state.adminOrderSearch = "";
-    refreshAdminView()?.catch((error) => toast(error.message));
+    navigateAdmin({ view: adminTab.dataset.adminView });
   }
+  if (event.target.closest("[data-clear-admin-queue]")) { state.adminOrderQueue = ""; state.adminOrdersOffset = 0; loadAdminOrders(); }
   if (event.target.closest("[data-portal-toggle]")) openPauseConfirmation();
 
   const adminOrderFilter = event.target.closest("[data-admin-order-filter]");
   if (adminOrderFilter) {
     state.adminOrderFilter = adminOrderFilter.dataset.adminOrderFilter || "all";
-    renderAdminOrders();
+    state.adminOrdersOffset = 0;
+    loadAdminOrders();
   }
 
   const accountFilter = event.target.closest("[data-account-filter]");
   if (accountFilter) {
     state.adminAccountFilter = accountFilter.dataset.accountFilter || "all";
-    renderAdminAccounts();
+    state.adminAccountsOffset = 0;
+    loadAdminAccounts();
   }
 
   const removeAccount = event.target.closest("[data-remove-account]");
@@ -4160,13 +4645,13 @@ document.addEventListener("click", (event) => {
 
   const viewPayment = event.target.closest("[data-view-order-payment]");
   if (viewPayment) {
-    const order = state.customerOrders?.find((entry) => entry.id === viewPayment.dataset.viewOrderPayment);
+    const order = customerOrderById(viewPayment.dataset.viewOrderPayment);
     if (order) showPaymentModal(order);
   }
 
   const viewTracking = event.target.closest("[data-view-order-tracking]");
   if (viewTracking) {
-    const order = state.customerOrders?.find((entry) => entry.id === viewTracking.dataset.viewOrderTracking);
+    const order = customerOrderById(viewTracking.dataset.viewOrderTracking);
     if (order) showTrackingModal(order);
   }
 });
@@ -4278,13 +4763,14 @@ document.addEventListener("input", (event) => {
   }
 
   if (event.target.matches("#adminOrderSearch")) {
-    state.adminOrderSearch = event.target.value.trim();
-    renderAdminOrders();
-    const input = qs("#adminOrderSearch");
-    if (input) {
-      input.focus();
-      input.setSelectionRange(input.value.length, input.value.length);
-    }
+    state.adminOrderSearch = event.target.value;
+    state.adminOrdersOffset = 0;
+    adminOrdersRequest++;
+    state.adminOrdersLoading = true;
+    renderAdminPagination("orders");
+    clearTimeout(adminOrderSearchTimer);
+    // Keep this input mounted while typing; rendering preserves the live selection.
+    adminOrderSearchTimer = setTimeout(() => loadAdminOrders(), 300);
   }
 });
 
@@ -4389,12 +4875,26 @@ qs("#productQuickView").addEventListener("click", (event) => {
 });
 qs("#themeToggle").addEventListener("click", toggleTheme);
 qs("#refreshCatalog").addEventListener("click", loadCatalog);
-qs("#refreshOrders").addEventListener("click", loadCustomerOrders);
+qs("#refreshOrders").addEventListener("click", () => loadCustomerOrders());
+qs("#loadOlderOrders").addEventListener("click", () => loadCustomerOrders({ loadMore: true }));
 qs("#termsScrollBody").addEventListener("scroll", updateTermsGate);
-qs("#refreshAdminPanel").addEventListener("click", () => {
+qs("#refreshAdminPanel").addEventListener("click", async () => {
+  if (state.adminView === "dashboard") await loadPortalControl().catch(() => null);
   refreshAdminView()?.catch((error) => toast(error.message));
+});
+qs("#adminMobileNav").addEventListener("change", event => navigateAdmin({ view: event.target.value }));
+qs("#adminOrdersSummary").addEventListener("change", event => {
+  if (event.target.matches('#adminOrderPeriodForm select[name="period"]')) toggleCustomDates(event.target.closest("form"));
+});
+qs("#adminOrdersSummary").addEventListener("submit", event => {
+  if (event.target.id !== "adminOrderPeriodForm") return;
+  event.preventDefault(); state.adminOrderPeriod = readReportingControls(event.target); state.adminOrdersOffset = 0; loadAdminOrders();
 });
 
 installInputMasks();
+const accountEmailUi = mountAccountEmail({ api, toast, showScreen, showLogin: showAuth, getUser: () => state.user,
+  getSessionRevision: () => sessionRevision,
+  updateUser: user => { state.user = user; renderAccount(); }, verificationRequired: () => currentShopSettings().customerCare.requireVerifiedEmailForOrders !== false,
+  accountEmailsEnabled: () => currentShopSettings().customerCare.securityEmailsEnabled !== false });
 renderCart();
 initSession();

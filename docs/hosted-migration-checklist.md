@@ -2,6 +2,10 @@
 
 Use this when creating the Online Portal GitHub repo and Netlify project.
 
+For the current reliability patch, also follow
+[the infrastructure readiness checklist](infrastructure-readiness.md). Runtime
+requires Node 22.12+; the schema/index additions preserve existing records.
+
 ## Keep Out Of Git
 
 - `.env`
@@ -38,7 +42,6 @@ Optional when ready:
 RETAIL_SHARK_INTERNAL_URL=<Retail Shark internal API base URL>
 RETAIL_SHARK_INTERNAL_TOKEN=<Retail Shark internal token>
 MAX_JSON_BODY_BYTES=7000000
-DATA_BLOB_STORE=op-runtime-data
 PROOF_STORAGE_MODE=blobs
 PROOF_BLOB_STORE=op-payment-proofs
 ```

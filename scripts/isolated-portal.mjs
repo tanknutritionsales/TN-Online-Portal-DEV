@@ -10,6 +10,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export async function startIsolatedPortal({ photos = false, catalog = null, requestLog = false } = {}) {
   const directory = await mkdtemp(path.join(tmpdir(), "op-experience-"));
   const publicLink = path.join(directory, "public");
+  const modulesLink = path.join(directory, "node_modules");
   const listener = net.createServer();
   await new Promise((resolve, reject) => listener.once("error", reject).listen(0, "127.0.0.1", resolve));
   const port = listener.address().port;
@@ -27,6 +28,7 @@ export async function startIsolatedPortal({ photos = false, catalog = null, requ
     // Verify the exact temporary target before recursive removal; unlink the junction first.
     if (path.dirname(directory) !== path.resolve(tmpdir()) || !path.basename(directory).startsWith("op-experience-")) throw new Error("Unexpected temporary path.");
     await unlink(publicLink).catch((error) => { if (error.code !== "ENOENT") throw error; });
+    await unlink(modulesLink).catch((error) => { if (error.code !== "ENOENT") throw error; });
     await rm(directory, { recursive: true, force: true });
   }
   try {
@@ -34,6 +36,7 @@ export async function startIsolatedPortal({ photos = false, catalog = null, requ
     await cp(path.join(root, "package.json"), path.join(directory, "package.json"));
     await cp(path.join(root, "lib"), path.join(directory, "lib"), { recursive: true });
     await symlink(path.join(root, "public"), publicLink, process.platform === "win32" ? "junction" : "dir");
+    await symlink(path.join(root, "node_modules"), modulesLink, process.platform === "win32" ? "junction" : "dir");
     if (catalog) await writeFile(path.join(directory, "preview-catalog.json"), JSON.stringify(catalog));
     await writeFile(path.join(directory, "preview.mjs"), `
       import http from 'node:http';

@@ -7,7 +7,8 @@
     <link rel="icon" href="/favicon.ico" sizes="any">
     <link rel="icon" type="image/png" href="/favicon-32x32.png">
     <link rel="apple-touch-icon" href="/apple-touch-icon.png">
-    <link rel="stylesheet" href="/styles.css?v=20261029-customer-experience-1">
+    <meta name="referrer" content="no-referrer">
+    <link rel="stylesheet" href="/styles.css?v=20261110-admin-dashboard-1">
   </head>
   <body>
     <main id="portalMain" inert>
@@ -30,10 +31,41 @@
             <label>Password<input name="password" type="password" autocomplete="current-password" required></label>
             <button class="primary" type="submit">Login</button>
           </form>
+          <button id="showForgotPassword" class="ghost" type="button">Forgot password?</button>
           <button id="showCreateAccount" class="ghost" type="button">Create account</button>
         </div>
       </section>
 
+      <section id="forgotPasswordScreen" class="login-screen" hidden>
+        <div class="login-card panel">
+          <img class="login-logo" src="/assets/tank-nutrition-logo.png" alt="Tank Nutrition">
+          <p class="eyebrow">Account recovery</p><h1>Forgot your password?</h1>
+          <p class="muted">Enter your account email address. We’ll send you a link to choose a new password.</p>
+          <form id="forgotPasswordForm" class="form-stack">
+            <label>Email address<input name="email" type="email" autocomplete="email" maxlength="180" required></label>
+            <button class="primary" type="submit">Send reset link</button>
+          </form>
+          <p id="forgotPasswordFeedback" role="status" class="email-form-feedback"></p>
+          <button class="ghost" type="button" data-email-back-login>Back to login</button>
+        </div>
+      </section>
+      <section id="emailActionScreen" class="login-screen" hidden>
+        <div class="login-card panel">
+          <img class="login-logo" src="/assets/tank-nutrition-logo.png" alt="Tank Nutrition">
+          <p class="eyebrow">Your account</p><h1 id="emailActionTitle">Verify your email</h1>
+          <p id="emailActionDescription" class="muted"></p>
+          <form id="emailActionForm" class="form-stack">
+            <fieldset id="emailActionPasswords" class="email-password-fields" hidden disabled>
+              <label>New password<input name="password" type="password" minlength="12" maxlength="128" autocomplete="new-password" aria-describedby="resetPasswordHelp" required></label>
+              <label>Confirm password<input name="confirmPassword" type="password" minlength="12" maxlength="128" autocomplete="new-password" aria-describedby="resetPasswordHelp" required></label>
+              <small id="resetPasswordHelp" class="field-help">Use 12–128 characters. A few memorable words make a strong password.</small>
+            </fieldset>
+            <button id="emailActionSubmit" class="primary" type="submit">Verify email</button>
+          </form>
+          <p id="emailActionFeedback" role="status" class="email-form-feedback"></p>
+          <button class="ghost" type="button" data-email-back-login>Back to login</button>
+        </div>
+      </section>
       <section id="createAccountScreen" class="create-screen" hidden>
         <div class="panel create-card">
           <div class="screen-heading">
@@ -50,7 +82,7 @@
                 <label>Username <span>*</span><input name="username" autocomplete="username" required></label>
                 <label>Name <span>*</span><input name="name" autocomplete="name" required></label>
                 <label>Email <span>*</span><input name="email" type="email" autocomplete="email" required></label>
-                <label>Password <span>*</span><input name="password" type="password" autocomplete="new-password" minlength="4" required></label>
+                <label>Password <span>*</span><input name="password" type="password" autocomplete="new-password" minlength="12" maxlength="128" aria-describedby="registrationPasswordHelp" required><small id="registrationPasswordHelp" class="field-help">Use 12–128 characters. A few memorable words make a strong password.</small></label>
               </div>
             </section>
 
@@ -152,6 +184,10 @@
           </div>
           <button id="mobileMenuToggle" class="mobile-menu-toggle" type="button" aria-label="Open menu" aria-expanded="false" aria-controls="mainNav"><span></span><span></span><span></span></button>
         </header>
+        <aside id="emailVerificationBanner" class="email-verification-banner" hidden aria-label="Email verification">
+          <div><strong>Verify your email to place orders</strong><p>You can browse and save your basket while you check your inbox.</p></div>
+          <div class="email-banner-actions"><button class="secondary" type="button" data-resend-verification>Resend verification</button><button class="ghost" type="button" data-refresh-verification>I’ve verified</button><button class="ghost" type="button" data-correct-email>Correct email address</button></div>
+        </aside>
 
         <section class="view is-active" id="view-home">
           <div class="home-shell">
@@ -339,6 +375,10 @@
               <button id="refreshOrders" class="secondary" type="button">Refresh</button>
             </div>
             <div id="statusOrders" class="orders-list"></div>
+            <div class="order-history-footer">
+              <p id="customerOrdersFeedback" class="muted small" role="status"></p>
+              <button id="loadOlderOrders" class="secondary" type="button" hidden>Load older orders</button>
+            </div>
           </div>
         </section>
 
@@ -357,29 +397,41 @@
         </section>
 
         <section class="view" id="view-admin">
-          <div class="panel status-panel">
+          <div class="panel status-panel admin-shell">
             <div class="section-heading">
               <div>
-                <p class="eyebrow">Admin</p>
-                <h2>Operations</h2>
+                <p class="eyebrow">Tank Nutrition · Admin</p>
+                <h2 id="adminPageTitle">Dashboard</h2>
               </div>
               <button id="refreshAdminPanel" class="secondary" type="button">Refresh</button>
             </div>
             <div id="adminAvailabilityBanner" class="portal-availability-banner" hidden></div>
-            <div class="admin-tabs" aria-label="Admin order views">
-              <button class="admin-view-tab is-active" type="button" data-admin-view="pending">Awaiting confirmation</button>
+            <label class="admin-mobile-navigation">Admin navigation<select id="adminMobileNav"><option value="dashboard">Overview</option><option value="all">All orders</option><option value="pending">Awaiting confirmation</option><option value="ready">Ready to pack</option><option value="external">External fulfilment</option><option value="completed">Order history</option><option value="customer-care">Customer support</option><option value="accounts">Accounts</option><option value="system-status">System status</option><option value="portal-control">Portal availability</option><option value="shop-settings">Shop settings</option><option value="search">Product search</option></select></label>
+            <div class="admin-workspace">
+            <nav class="admin-tabs" aria-label="Admin navigation">
+              <span class="admin-nav-heading">Workspace</span>
+              <button class="admin-view-tab is-active" type="button" data-admin-view="dashboard">Overview</button>
+              <button class="admin-view-tab" type="button" data-admin-view="all">All orders</button>
+              <button class="admin-view-tab" type="button" data-admin-view="pending">Awaiting confirmation</button>
               <button class="admin-view-tab" type="button" data-admin-view="external">External fulfillment</button>
               <button class="admin-view-tab" type="button" data-admin-view="ready">Ready to pack</button>
-              <button class="admin-view-tab" type="button" data-admin-view="completed">Completed</button>
+              <button class="admin-view-tab" type="button" data-admin-view="completed">Order history</button>
+              <span class="admin-nav-heading">People & communication</span>
               <button class="admin-view-tab" type="button" data-admin-view="accounts">Accounts</button>
               <button class="admin-view-tab" type="button" data-admin-view="customer-care">Customer support</button>
-              <button class="admin-view-tab" type="button" data-admin-view="search">Product search</button>
+              <span class="admin-nav-heading">Management</span>
               <button class="admin-view-tab" type="button" data-admin-view="system-status">System status</button>
               <button class="admin-view-tab" type="button" data-admin-view="portal-control">Portal availability</button>
               <button class="admin-view-tab" type="button" data-admin-view="shop-settings">Shop settings</button>
-            </div>
+              <button class="admin-view-tab" type="button" data-admin-view="search">Product search</button>
+            </nav>
+            <div class="admin-content">
             <div id="adminOrdersSummary" class="catalog-summary"></div>
+            <nav id="adminPagerTop" class="record-pager" aria-label="Top pagination" hidden></nav>
             <div id="adminOrders" class="orders-list"></div>
+            <nav id="adminPagerBottom" class="record-pager" aria-label="Bottom pagination" hidden></nav>
+            </div>
+            </div>
           </div>
         </section>
       </section>
@@ -425,6 +477,17 @@
         <button class="primary" type="submit">Send message</button>
       </form>
       <section class="support-history-section" aria-labelledby="supportHistoryTitle"><h3 id="supportHistoryTitle">Your conversations</h3><div id="supportHistory"></div></section>
+    </dialog>
+    <dialog id="correctEmailDialog" class="email-address-dialog panel" aria-labelledby="correctEmailTitle">
+      <h2 id="correctEmailTitle">Correct your email address</h2>
+      <p class="muted">Confirm your password to update an unverified address. Earlier verification and reset links will stop working.</p>
+      <form id="correctEmailForm" class="form-stack">
+        <label>Email address<input name="email" type="email" maxlength="180" autocomplete="email" required></label>
+        <label>Current password<input name="password" type="password" autocomplete="current-password" required></label>
+        <p id="correctEmailFeedback" role="status" class="email-form-feedback"></p>
+        <button class="primary" type="submit">Update email</button>
+        <button class="ghost" type="button" data-close-correct-email>Cancel</button>
+      </form>
     </dialog>
     <div id="termsModal" class="modal-backdrop" hidden>
       <div class="confirm-modal wide-modal terms-modal" role="dialog" aria-modal="true" aria-labelledby="termsTitle">
@@ -587,8 +650,8 @@
             </label>
             <label>Username <span>*</span><input name="username" autocomplete="off" required></label>
             <label>Name <span>*</span><input name="name" autocomplete="name" required></label>
-            <label data-admin-customer-field>Email <span>*</span><input name="email" type="email" autocomplete="email" required></label>
-            <label>Password <span>*</span><input name="password" type="password" minlength="4" autocomplete="new-password" required></label>
+            <label>Email <span data-admin-email-required>*</span><input name="email" type="email" autocomplete="email" required><small class="field-help">Admins can add a recovery email. Verification is required before email recovery is available.</small></label>
+            <label>Password <span>*</span><input name="password" type="password" minlength="12" maxlength="128" autocomplete="new-password" aria-describedby="adminPasswordHelp" required><small id="adminPasswordHelp" class="field-help">Use 12–128 characters. A few memorable words make a strong password.</small></label>
             <label data-admin-customer-field>Area code
               <select name="phoneArea">
                 <option value="+27">+27 South Africa</option>
@@ -653,6 +716,6 @@
         </form>
       </div>
     </div>
-    <script src="/app.js?v=20261029-customer-experience-1" type="module"></script>
+    <script src="/app.js?v=20261109-portal-pages-2" type="module"></script>
   </body>
 </html>

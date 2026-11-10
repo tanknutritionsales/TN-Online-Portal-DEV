@@ -8,18 +8,26 @@
     "start": "node server.js",
     "dev": "node --watch server.js",
     "check": "node --check server.js",
-    "check:all": "node --check server.js && node --check public/app.js && node --check public/admin-search.js && node --check netlify/functions/app.mjs && node --check netlify/functions/customer-notifications.mjs && node --check scripts/reset-local-data.mjs && node --check scripts/smoke-local.mjs && node scripts/test-storage-availability-source.mjs && node scripts/test-fulfillment-stock.mjs && node scripts/test-courier-charge-source.mjs && node scripts/test-customer-experience.mjs && node scripts/test-search-and-receipts.mjs && node scripts/test-portal-control.mjs",
+    "check:all": "node --check server.js && node --check public/app.js && node --check public/admin-search.js && node --check public/account-email.js && node --check public/admin-email.js && node --check public/admin-dashboard.js && node --check netlify/functions/app.mjs && node --check netlify/functions/customer-notifications.mjs && node --check scripts/reset-local-data.mjs && node --check scripts/smoke-local.mjs && node scripts/test-storage-availability-source.mjs && node scripts/test-fulfillment-stock.mjs && node scripts/test-courier-charge-source.mjs && node scripts/test-customer-experience.mjs && node scripts/test-search-and-receipts.mjs && node scripts/test-portal-control.mjs && node scripts/test-catalog-cache.mjs && node scripts/test-security.mjs && node scripts/test-record-store.mjs && node scripts/test-order-sync.mjs && node scripts/test-order-notifications.mjs && node scripts/test-shopify-client.mjs && node scripts/test-infrastructure.mjs && node scripts/test-frontend-infrastructure.mjs && node scripts/test-account-email.mjs && node scripts/test-admin-dashboard.mjs && node scripts/test-capacity-guards.mjs",
     "preview:isolated": "node scripts/isolated-portal.mjs --serve",
     "preview:receipts": "node scripts/preview-receipts.mjs",
     "reset:local": "node scripts/reset-local-data.mjs",
-    "smoke:local": "node scripts/smoke-local.mjs"
+    "smoke:local": "node scripts/smoke-local.mjs",
+    "check:database": "node scripts/test-record-store-postgres.mjs && node scripts/test-order-sync-postgres.mjs && node scripts/test-security-postgres.mjs",
+    "check:bundle": "node scripts/test-netlify-bundle.mjs",
+    "check:capacity": "node scripts/test-capacity.mjs"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22.12.0"
   },
   "dependencies": {
-    "@netlify/blobs": "^8.2.0",
+    "@netlify/blobs": "^11.1.8",
     "@netlify/database": "^2.0.1",
-    "pg": "^8.23.1"
+    "pg": "^8.23.1",
+    "svix": "^2.10.0"
+  },
+  "devDependencies": {
+    "embedded-postgres": "^18.6.0-beta.19",
+    "esbuild": "^0.25.12"
   }
 }

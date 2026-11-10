@@ -7,13 +7,27 @@ import { createHash, createHmac, randomBytes, randomUUID, scryptSync, timingSafe
 import { findOfficeShortfalls } from "./lib/fulfillment-stock.mjs";
 import { normalizeProductContent, productFacts } from "./public/product-content.js";
 import { createCustomerMessageStore } from "./lib/customer-message-store.mjs";
-import { normalizeCustomerCare, emailSetupStatus, createOrderEmail, deliverQueuedEmail } from "./lib/customer-notifications.mjs";
+import { normalizeCustomerCare, emailSetupStatus, deliverQueuedEmail } from "./lib/customer-notifications.mjs";
 import { normalizeSearchSettings, anonymousSearchTerm } from "./public/catalog-search.js";
 import { normalizeDeliverySettings, deliveryReceiptView, recordDeliveryResponse } from "./lib/order-receipts.mjs";
 import { createSettingsUpdater } from "./lib/shop-settings-store.mjs";
 import { createPortalControlStore, publicPortalStatus } from "./lib/portal-control.mjs";
 import { createNotificationWorker } from "./lib/notification-worker.mjs";
 import { portalRuntimeConfig } from "./lib/netlify-runtime.mjs";
+import { portalSchemaSql } from "./lib/database-schema.mjs";
+import { createRecordStore } from "./lib/record-store.mjs";
+import { createRateLimiter, hashPasswordAsync, verifyPasswordAsync, validateNewPassword, sessionCredentialVersion, securitySchemaSql } from "./lib/security.mjs";
+import { createCatalogCache, createNetlifyCatalogStore } from "./lib/catalog-cache.mjs";
+import { createShopifyClient, verifiedCreatedOrder } from "./lib/shopify-client.mjs";
+import { createOrderSync } from "./lib/order-sync.mjs";
+import { securityHeaders } from "./lib/security-headers.mjs";
+import { createOrderNotifications } from "./lib/order-notifications.mjs";
+import { createAccountEmails, emailIsVerified, realEmail } from "./lib/account-email.mjs";
+import { createEmailWebhooks, publicEmail } from "./lib/email-webhooks.mjs";
+import { reportingPeriod } from "./lib/admin-period.mjs";
+import { createDatabasePool } from "./lib/database-pool.mjs";
+import { createEmailCapacity } from "./lib/email-capacity.mjs";
+import { parsePaymentProof, proofContentType } from "./lib/payment-proof.mjs";
 
 const moduleUrl = import.meta.url || "";
 const modulePath = moduleUrl ? fileURLToPath(moduleUrl) : "";
@@ -46,8 +60,7 @@ const sessionSecret = process.env.SESSION_SECRET || env.SESSION_SECRET || "dev-s
 const sessionCookieName = "op_session";
 const sessionMaxAge = 60 * 60 * 24 * 7;
 const maxJsonBodyBytes = Number(process.env.MAX_JSON_BODY_BYTES || env.MAX_JSON_BODY_BYTES || 7_000_000);
-const dataStorageMode = process.env.DATA_STORAGE_MODE || env.DATA_STORAGE_MODE || (isProduction && (process.env.DATABASE_URL || env.DATABASE_URL) ? "postgres" : isProduction ? "blobs" : "local");
-const dataBlobStoreName = process.env.DATA_BLOB_STORE || env.DATA_BLOB_STORE || "op-runtime-data";
+const dataStorageMode = process.env.DATA_STORAGE_MODE || env.DATA_STORAGE_MODE || (isProduction ? "postgres" : "local");
 const proofStorageMode = process.env.PROOF_STORAGE_MODE || env.PROOF_STORAGE_MODE || (isProduction ? "blobs" : "local");
 const proofBlobStoreName = process.env.PROOF_BLOB_STORE || env.PROOF_BLOB_STORE || "op-payment-proofs";
 const retailSharkInternalUrl = process.env.RETAIL_SHARK_INTERNAL_URL || env.RETAIL_SHARK_INTERNAL_URL || "";
@@ -57,13 +70,16 @@ const customerMessages = createCustomerMessageStore({
   database: async () => { await ensureDatabaseSchema(); return database(); },
   useDatabase: dataStorageUsesDatabase,
   filePath: path.join(dataDir, "customer-messages.json"),
-  localAllowed: !isProduction && !dataStorageUsesBlobs(),
+  localAllowed: !isProduction,
 });
 
 let shopifyClientCredentialsToken = null;
-let databasePool = null;
-let databaseReady = false;
-const rateLimitBuckets = new Map();
+let shopifyTokenFlight = null;
+const database = createDatabasePool({ connectionString: databaseConnectionString,
+  onIdleError: () => console.error(JSON.stringify({ event: "database_idle_connection_error" })) });
+let databaseReady = null;
+const routeLimiter = createRateLimiter({ useDatabase: dataStorageUsesDatabase, database: async () => { await ensureDatabaseSchema(); return database(); }, secret: sessionSecret });
+const reserveEmailSlot = createEmailCapacity({ limiter: routeLimiter });
 const updateShopSettings = createSettingsUpdater({ useDatabase: dataStorageUsesDatabase, database: async () => { await ensureDatabaseSchema(); return database(); }, read: readShopSettingsData, write: writeShopSettingsData, normalize: normalizeShopSettings, defaults: defaultShopSettings });
 const portalControl = createPortalControlStore({
   filePath: path.join(dataDir, "portal-control.json"),
@@ -73,6 +89,10 @@ const portalControl = createPortalControlStore({
     return getStore({ name: "op-runtime-control", consistency: "strong" });
   } : null,
   withWriteLock: withPortalControlLock,
+});
+const securityEmailRetries = createPortalControlStore({
+  filePath: path.join(dataDir, "account-email", "portal-control.json"), namespace: `${runtime.namespace}/security`,
+  blobStore: runtime.netlify ? async () => (await import("@netlify/blobs")).getStore({ name: "op-runtime-control", consistency: "strong" }) : null,
 });
 
 validateRuntimeConfig();
@@ -193,26 +213,12 @@ function defaultPaymentProviders() {
   };
 }
 
-function dataStorageUsesBlobs() {
-  return String(dataStorageMode || "").toLowerCase() === "blobs";
-}
-
 function dataStorageUsesDatabase() {
   return ["postgres", "database", "db"].includes(String(dataStorageMode || "").toLowerCase());
 }
 
-async function runtimeDataBlobStore() {
-  const { getStore } = await import("@netlify/blobs");
-  return getStore(dataBlobStoreName);
-}
-
 async function readDataJson(key, filePath, fallback) {
   if (dataStorageUsesDatabase()) return readDataFromDatabase(key, fallback);
-  if (dataStorageUsesBlobs()) {
-    const store = await runtimeDataBlobStore();
-    const payload = await store.get(`${key}.json`, { type: "json", consistency: "strong" });
-    return payload || fallback;
-  }
   await mkdir(dataDir, { recursive: true });
   if (!existsSync(filePath)) return fallback;
   return JSON.parse(await readFile(filePath, "utf8"));
@@ -220,11 +226,6 @@ async function readDataJson(key, filePath, fallback) {
 
 async function writeDataJson(key, filePath, payload) {
   if (dataStorageUsesDatabase()) return writeDataToDatabase(key, payload);
-  if (dataStorageUsesBlobs()) {
-    const store = await runtimeDataBlobStore();
-    await store.setJSON(`${key}.json`, payload, { consistency: "strong" });
-    return payload;
-  }
   await mkdir(dataDir, { recursive: true });
   await writeFile(filePath, JSON.stringify(payload, null, 2));
   return payload;
@@ -239,16 +240,6 @@ async function databaseConnectionString() {
   } catch {
     return "";
   }
-}
-
-async function database() {
-  if (databasePool) return databasePool;
-  const connectionString = await databaseConnectionString();
-  if (!connectionString) throw new Error("Database connection string is not configured.");
-  const pg = await import("pg");
-  const Pool = pg.Pool || pg.default?.Pool;
-  databasePool = new Pool({ connectionString, max: 4, idleTimeoutMillis: 10_000 });
-  return databasePool;
 }
 
 async function withPortalControlLock(work) {
@@ -267,230 +258,40 @@ async function withPortalControlLock(work) {
 }
 
 async function ensureDatabaseSchema() {
-  if (databaseReady) return;
-  const pool = await database();
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS op_users (
-      id text PRIMARY KEY,
-      username text NOT NULL UNIQUE,
-      email text NOT NULL UNIQUE,
-      role text NOT NULL,
-      data jsonb NOT NULL,
-      created_at timestamptz NOT NULL DEFAULT now(),
-      updated_at timestamptz NOT NULL DEFAULT now()
-    );
-    CREATE TABLE IF NOT EXISTS op_orders (
-      id text PRIMARY KEY,
-      reference text NOT NULL UNIQUE,
-      customer_id text,
-      payment_status text NOT NULL DEFAULT 'pending',
-      fulfillment_status text NOT NULL DEFAULT 'not_ready',
-      data jsonb NOT NULL,
-      created_at timestamptz NOT NULL DEFAULT now(),
-      updated_at timestamptz NOT NULL DEFAULT now()
-    );
-    CREATE INDEX IF NOT EXISTS op_orders_customer_id_idx ON op_orders (customer_id);
-    CREATE INDEX IF NOT EXISTS op_orders_status_idx ON op_orders (payment_status, fulfillment_status);
-    CREATE TABLE IF NOT EXISTS op_shop_settings (
-      id text PRIMARY KEY,
-      data jsonb NOT NULL,
-      updated_at timestamptz NOT NULL DEFAULT now()
-    );
-    CREATE TABLE IF NOT EXISTS op_storage_meta (
-      key text PRIMARY KEY,
-      value jsonb NOT NULL,
-      updated_at timestamptz NOT NULL DEFAULT now()
-    );
-  `);
-  databaseReady = true;
+  if (!databaseReady) databaseReady = (async () => {
+    const client = await (await database()).connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("SELECT pg_advisory_xact_lock(hashtext('op_schema_v2'))");
+      await client.query(portalSchemaSql);
+      await client.query(securitySchemaSql);
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw error;
+    } finally { client.release(); }
+  })().catch((error) => { databaseReady = null; throw error; });
+  await databaseReady;
 }
 
 async function readDataFromDatabase(key, fallback) {
   await ensureDatabaseSchema();
-  const pool = await database();
-  if (key === "orders") {
-    const { rows } = await pool.query("SELECT data, updated_at FROM op_orders ORDER BY created_at DESC");
-    return {
-      version: 1,
-      updatedAt: newestTimestamp(rows.map((row) => row.updated_at)) || fallback.updatedAt || null,
-      orders: rows.map((row) => row.data),
-    };
-  }
-  if (key === "users") {
-    const { rows } = await pool.query("SELECT data, updated_at FROM op_users ORDER BY role, lower(data->>'name'), username");
-    const migrated = await maybeMigrateLegacyUsers(rows.map((row) => row.data));
-    if (migrated) return readDataFromDatabase(key, fallback);
-    if (!rows.length) return fallback;
-    return {
-      version: 1,
-      updatedAt: newestTimestamp(rows.map((row) => row.updated_at)) || fallback.updatedAt || null,
-      users: rows.map((row) => row.data),
-    };
-  }
-  if (key === "shop-settings") {
-    const { rows } = await pool.query("SELECT data, updated_at FROM op_shop_settings WHERE id = 'default' LIMIT 1");
-    if (!rows.length) return fallback;
-    return { version: 1, updatedAt: rows[0].updated_at?.toISOString?.() || null, settings: rows[0].data };
-  }
-  return fallback;
-}
-
-function newestTimestamp(values) {
-  const newest = values
-    .map((value) => (value ? new Date(value).getTime() : 0))
-    .filter(Boolean)
-    .sort((a, b) => b - a)[0];
-  return newest ? new Date(newest).toISOString() : null;
-}
-
-async function readLegacyBlobData(key) {
-  try {
-    const store = await runtimeDataBlobStore();
-    return await store.get(`${key}.json`, { type: "json", consistency: "strong" });
-  } catch {
-    return null;
-  }
-}
-
-async function storageMetaValue(key) {
-  const pool = await database();
-  const { rows } = await pool.query("SELECT value FROM op_storage_meta WHERE key = $1 LIMIT 1", [key]);
-  return rows[0]?.value || null;
-}
-
-async function setStorageMetaValue(key, value) {
-  const pool = await database();
-  await pool.query(
-    `INSERT INTO op_storage_meta (key, value, updated_at)
-     VALUES ($1, $2::jsonb, now())
-     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at`,
-    [key, JSON.stringify(value)],
-  );
-}
-
-async function maybeMigrateLegacyUsers(existingUsers) {
-  if ((await storageMetaValue("legacy-users-migrated"))?.done) return false;
-  const legacy = await readLegacyBlobData("users");
-  if (!legacy || !Array.isArray(legacy.users)) {
-    await setStorageMetaValue("legacy-users-migrated", { done: true, migrated: 0, at: new Date().toISOString() });
-    return false;
-  }
-  const legacyUsers = normalizeUsersData(legacy || {}).users || [];
-  if (!legacyUsers.length) {
-    await setStorageMetaValue("legacy-users-migrated", { done: true, migrated: 0, at: new Date().toISOString() });
-    return false;
-  }
-  const pool = await database();
-  const onlyDefaultAdmin = existingUsers.length > 0 && existingUsers.every((user) => user.id === "demo-admin");
-  if (onlyDefaultAdmin) await pool.query("DELETE FROM op_users");
-  const baseUsers = onlyDefaultAdmin ? [] : existingUsers;
-  const existingKeys = new Set(baseUsers.flatMap((user) => [user.id, user.username, user.email].filter(Boolean)));
-  const users = [...baseUsers];
-  for (const user of legacyUsers) {
-    const keys = [user.id, user.username, user.email].filter(Boolean);
-    if (keys.some((key) => existingKeys.has(key))) continue;
-    users.push(user);
-    keys.forEach((key) => existingKeys.add(key));
-  }
-  await writeUsersToDatabase({ users });
-  await setStorageMetaValue("legacy-users-migrated", { done: true, migrated: legacyUsers.length, at: new Date().toISOString() });
-  return true;
+  if (key !== "shop-settings") throw new Error("Use the record store for accounts and orders.");
+  const { rows } = await (await database()).query("SELECT data, updated_at FROM op_shop_settings WHERE id='default' LIMIT 1");
+  return rows.length ? { version: 1, updatedAt: rows[0].updated_at?.toISOString?.() || null, settings: rows[0].data } : fallback;
 }
 
 async function writeDataToDatabase(key, payload) {
   await ensureDatabaseSchema();
-  if (key === "orders") return writeOrdersToDatabase(payload);
-  if (key === "users") return writeUsersToDatabase(payload);
-  if (key === "shop-settings") return writeShopSettingsToDatabase(payload);
+  if (key !== "shop-settings") throw new Error("Use the record store for accounts and orders.");
+  await (await database()).query("INSERT INTO op_shop_settings(id,data,updated_at) VALUES('default',$1::jsonb,now()) ON CONFLICT(id) DO UPDATE SET data=EXCLUDED.data,updated_at=now()", [JSON.stringify(payload.settings)]);
   return payload;
-}
-
-async function writeOrdersToDatabase(payload) {
-  const pool = await database();
-  const now = new Date().toISOString();
-  for (const order of payload.orders || []) {
-    await pool.query(
-      `INSERT INTO op_orders (id, reference, customer_id, payment_status, fulfillment_status, data, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6::jsonb, COALESCE($7::timestamptz, now()), $8::timestamptz)
-       ON CONFLICT (id) DO UPDATE SET
-         reference = EXCLUDED.reference,
-         customer_id = EXCLUDED.customer_id,
-         payment_status = EXCLUDED.payment_status,
-         fulfillment_status = EXCLUDED.fulfillment_status,
-         data = EXCLUDED.data,
-         updated_at = EXCLUDED.updated_at`,
-      [
-        order.id,
-        order.reference,
-        order.customer?.id || null,
-        order.paymentStatus || "pending",
-        order.fulfillmentStatus || "not_ready",
-        JSON.stringify(order),
-        order.createdAt || null,
-        order.updatedAt || now,
-      ],
-    );
-  }
-  return payload;
-}
-
-async function writeUsersToDatabase(payload) {
-  const pool = await database();
-  const now = new Date().toISOString();
-  try {
-    for (const user of payload.users || []) {
-      await pool.query(
-        `INSERT INTO op_users (id, username, email, role, data, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5::jsonb, COALESCE($6::timestamptz, now()), $7::timestamptz)
-         ON CONFLICT (id) DO UPDATE SET
-           username = EXCLUDED.username,
-           email = EXCLUDED.email,
-           role = EXCLUDED.role,
-           data = EXCLUDED.data,
-           updated_at = EXCLUDED.updated_at`,
-        [
-          user.id,
-          user.username,
-          user.email || `${user.username}@admin.local`,
-          user.role === "admin" ? "admin" : "customer",
-          JSON.stringify(user),
-          user.createdAt || null,
-          user.updatedAt || now,
-        ],
-      );
-    }
-  } catch (error) {
-    if (isUniqueViolation(error)) throw Object.assign(new Error("User already exists."), { status: 409 });
-    throw error;
-  }
-  return payload;
-}
-
-async function writeShopSettingsToDatabase(payload) {
-  const pool = await database();
-  await pool.query(
-    `INSERT INTO op_shop_settings (id, data, updated_at)
-     VALUES ('default', $1::jsonb, now())
-     ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, updated_at = EXCLUDED.updated_at`,
-    [JSON.stringify(payload.settings || defaultShopSettings())],
-  );
-  return payload;
-}
-
-async function deleteUserFromDatabase(userId) {
-  if (!dataStorageUsesDatabase()) return;
-  await ensureDatabaseSchema();
-  const pool = await database();
-  await pool.query("DELETE FROM op_users WHERE id = $1", [userId]);
-}
-
-function isUniqueViolation(error) {
-  return error?.code === "23505";
 }
 
 function validateRuntimeConfig() {
   if (!isProduction) return;
   const missing = [];
+  if (!dataStorageUsesDatabase()) missing.push("DATA_STORAGE_MODE=postgres");
   if (!sessionSecret || sessionSecret === "dev-session-secret-change-before-hosting") missing.push("SESSION_SECRET");
   if (!internalToken || internalToken === "dev-internal-token") missing.push("INTERNAL_API_TOKEN");
   if (!adminPassword || adminPassword === "admin") missing.push("ADMIN_PASSWORD");
@@ -502,6 +303,7 @@ function validateRuntimeConfig() {
 
 function json(res, status, payload, headers = {}) {
   res.writeHead(status, {
+    ...securityHeaders,
     "content-type": "application/json; charset=utf-8",
     "cache-control": "no-store",
     "x-content-type-options": "nosniff",
@@ -535,28 +337,31 @@ function cookies(req) {
 }
 
 function clientIp(req) {
-  return cleanText(String(req.headers["x-nf-client-connection-ip"] || req.headers["x-forwarded-for"] || req.socket?.remoteAddress || "unknown").split(",")[0], 80);
+  return cleanText(runtime.netlify ? req.trustedClientIp || "unknown" : req.socket?.remoteAddress || "unknown", 80);
 }
 
-function rateLimit(req, bucket, limit, windowMs) {
-  const now = Date.now();
-  const key = `${bucket}:${clientIp(req)}`;
-  const entry = rateLimitBuckets.get(key) || { count: 0, resetAt: now + windowMs };
-  if (entry.resetAt <= now) {
-    entry.count = 0;
-    entry.resetAt = now + windowMs;
-  }
-  entry.count += 1;
-  rateLimitBuckets.set(key, entry);
-  if (entry.count > limit) {
-    throw Object.assign(new Error("Too many requests. Please try again shortly."), { status: 429 });
-  }
+async function rateLimit(req, bucket, limit, windowMs, { network = false } = {}) {
+  const account = network ? null : sessionFromRequest(req)?.userId;
+  await routeLimiter.consume(account ? clientIp(req) + ":" + account : clientIp(req), bucket, limit, windowMs);
 }
 
-function applyRouteRateLimit(req, url) {
+async function applyRouteRateLimit(req, url) {
   if (req.method === "GET") return;
-  if (url.pathname === "/api/auth/login" || url.pathname === "/api/auth/admin-login") return rateLimit(req, "login", 12, 10 * 60 * 1000);
-  if (url.pathname === "/api/auth/register") return rateLimit(req, "register", 5, 60 * 60 * 1000);
+  if (url.pathname === "/api/auth/password/request") {
+    await rateLimit(req, "recovery-network", 30, 60 * 60 * 1000, { network: true });
+    const input = await bodyJson(req);
+    return routeLimiter.consume(cleanText(input.email, 180).toLowerCase() || clientIp(req), "recovery-email", 3, 60 * 60 * 1000);
+  }
+  if (["/api/auth/email/confirm", "/api/auth/password/reset"].includes(url.pathname)) return rateLimit(req, "account-email-link", 30, 10 * 60 * 1000, { network: true });
+  if (url.pathname.endsWith("/verification-email") || url.pathname === "/api/account/email/verification") return rateLimit(req, "verification-email", 10, 60 * 60 * 1000);
+  if (url.pathname === "/api/account/email") return rateLimit(req, "email-correction", 5, 60 * 60 * 1000);
+  if (url.pathname === "/api/auth/login" || url.pathname === "/api/auth/admin-login") {
+    await rateLimit(req,"login-network",300,10*60*1000,{network:true});
+    const input=await bodyJson(req);
+    const identity=cleanText(input.login || input.username || input.email,180).toLowerCase() || clientIp(req);
+    return routeLimiter.consume(identity,url.pathname.endsWith("admin-login")?"login-admin":"login-customer",12,10*60*1000);
+  }
+  if (url.pathname === "/api/auth/register") return rateLimit(req, "register", 100, 60 * 60 * 1000, {network:true});
   if (url.pathname === "/api/orders") return rateLimit(req, "orders", 20, 10 * 60 * 1000);
   if (url.pathname === "/api/support") return rateLimit(req, "support", 10, 10 * 60 * 1000);
   if (url.pathname === "/api/search/misses") return rateLimit(req, "search-feedback", 30, 10 * 60 * 1000);
@@ -616,6 +421,11 @@ function verifySessionToken(token) {
 }
 
 async function bodyJson(req) {
+  if (!req.portalJson) req.portalJson = parseBodyJson(req);
+  return req.portalJson;
+}
+
+async function parseBodyJson(req) {
   const chunks = [];
   let size = 0;
   for await (const chunk of req) {
@@ -626,61 +436,57 @@ async function bodyJson(req) {
   const raw = Buffer.concat(chunks).toString("utf8");
   if (!raw) return {};
   try {
-    return JSON.parse(raw);
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error();
+    return parsed;
   } catch {
     throw Object.assign(new Error("Invalid JSON body."), { status: 400 });
   }
 }
 
-async function readOrdersData() {
-  const data = await readDataJson("orders", ordersPath, { version: 1, updatedAt: null, orders: [] });
-  return { version: 1, updatedAt: data.updatedAt || null, orders: Array.isArray(data.orders) ? data.orders : [] };
+const records = createRecordStore({
+  database: async () => { await ensureDatabaseSchema(); return database(); },
+  useDatabase: dataStorageUsesDatabase, usersPath, ordersPath,
+  seedUsers: () => isProduction ? [demoAdmin()] : [demoUser(), demoAdmin()],
+  normalizeUser: normalizeStoredUser,
+  onOrderWrite: (client,next,previous) => notifications.record(client,next,previous),
+});
+const accountEmails = createAccountEmails({
+  users: records.users, messages: customerMessages, control: portalControl, retries: securityEmailRetries, secret: sessionSecret,
+  config: async ({ lightweight = false } = {}) => {
+    const care = lightweight ? {} : (await readShopSettingsData()).settings.customerCare;
+    return { ...emailRuntimeConfig(care), securityEnabled: care.securityEmailsEnabled !== false, local: !isProduction };
+  },
+});
+const receiveEmailWebhook = createEmailWebhooks({ messages: customerMessages, secret: () => process.env.RESEND_WEBHOOK_SECRET || env.RESEND_WEBHOOK_SECRET || "" });
+
+function afterResponse(req, work) {
+  const task = Promise.resolve().then(work).catch(() => console.error(JSON.stringify({ event: "account_email_action_failed" })));
+  if (req.waitUntil) req.waitUntil(task);
 }
 
-async function writeOrdersData(data) {
-  const payload = { version: 1, updatedAt: new Date().toISOString(), orders: data.orders || [] };
-  return writeDataJson("orders", ordersPath, payload);
+const notifications = createOrderNotifications({
+  database: async () => { await ensureDatabaseSchema(); return database(); },
+  useDatabase: dataStorageUsesDatabase, messages: customerMessages, control: portalControl,
+  readCare: async () => (await readShopSettingsData()).settings.customerCare,
+  runtimeConfig: emailRuntimeConfig, getOrder: id=>records.orders.get(id),
+  filePath:path.join(dataDir,"order-notification-retries.json"),namespace:runtime.namespace,
+  ...(runtime.netlify ? {blobStore:async()=> (await import("@netlify/blobs")).getStore({name:"op-runtime-control",consistency:"strong"})} : {}),
+});
+async function finishOrderNotifications(orderId,hint) {
+  try { await notifications.afterWrite(orderId,hint); }
+  catch { console.warn("Order saved; notification delivery will be recovered from its durable record."); }
 }
-
-async function readUsersData() {
-  const data = await readDataJson("users", usersPath, {
-    version: 1,
-    updatedAt: new Date().toISOString(),
-    users: seedUsers(),
+async function mutateOrder(orderId, transform, { customerId } = {}) {
+  const hint = await notifications.beforeWrite(orderId);
+  const updated = await records.orders.update(orderId, async (order) => {
+    if (customerId && order.customer?.id !== customerId) throw Object.assign(new Error("Order not found."), { status: 404 });
+    order.statusEvents ||= [];
+    return transform(order);
   });
-  const normalized = normalizeUsersData(data);
-  if (normalized.changed) await writeUsersData(normalized);
-  return normalized;
-}
-
-function seedUsers() {
-  return isProduction ? [demoAdmin()] : [demoUser(), demoAdmin()];
-}
-
-async function writeUsersData(data) {
-  const normalized = normalizeUsersData(data);
-  const payload = { version: 1, updatedAt: new Date().toISOString(), users: normalized.users || [] };
-  return writeDataJson("users", usersPath, payload);
-}
-
-function normalizeUsersData(data = {}) {
-  let changed = false;
-  const inputUsers = Array.isArray(data.users) ? data.users : [];
-  const users = inputUsers.map((user) => {
-    const normalized = normalizeStoredUser(user);
-    if (JSON.stringify(normalized) !== JSON.stringify(user)) changed = true;
-    return normalized;
-  });
-  if (!users.some((user) => user.role === "admin")) {
-    users.push(demoAdmin());
-    changed = true;
-  }
-  return {
-    version: 1,
-    updatedAt: data.updatedAt || null,
-    users,
-    changed,
-  };
+  if (!updated) throw Object.assign(new Error("Order not found."), { status: 404 });
+  await finishOrderNotifications(orderId,hint);
+  return updated;
 }
 
 function normalizeStoredUser(user = {}) {
@@ -888,6 +694,8 @@ function demoUser() {
     username: "user",
     name: "Test Customer",
     email: "user@example.com",
+    emailVerifiedAddress: "user@example.com",
+    emailVerifiedAt: new Date().toISOString(),
     phoneArea: "+27",
     phoneNumber: "82 123 4567",
     phone: "+27 82 123 4567",
@@ -940,14 +748,6 @@ function demoAdmin() {
   };
 }
 
-function verifyPassword(password, stored) {
-  const [salt, hash] = String(stored || "").split(":");
-  if (!salt || !hash) return false;
-  const actual = Buffer.from(hashPassword(password, salt).split(":")[1], "hex");
-  const expected = Buffer.from(hash, "hex");
-  return actual.length === expected.length && timingSafeEqual(actual, expected);
-}
-
 function secureTextEqual(left, right) {
   const actual = createHmac("sha256", sessionSecret).update(String(left || "")).digest();
   const expected = createHmac("sha256", sessionSecret).update(String(right || "")).digest();
@@ -967,6 +767,8 @@ function publicUser(user) {
     username: user.username || "",
     name: user.name,
     email: user.email,
+    emailVerified: emailIsVerified(user),
+    emailVerifiedAt: emailIsVerified(user) ? user.emailVerifiedAt : null,
     phone: user.phone || "",
     phoneArea: user.phoneArea || "+27",
     phoneNumber: user.phoneNumber || "",
@@ -991,6 +793,8 @@ function publicAdmin(user) {
     username: user.username || adminUsername,
     name: user.name || "Admin",
     email: user.email || "",
+    emailVerified: emailIsVerified(user),
+    emailVerifiedAt: emailIsVerified(user) ? user.emailVerifiedAt : null,
     preferences: normalizeCustomerPreferences(user.preferences),
   };
 }
@@ -1032,59 +836,38 @@ function termsAcceptanceFromInput(input = {}) {
 }
 
 async function registerCustomer(input) {
-  const data = await readUsersData();
   const username = cleanText(input.username, 80).toLowerCase();
   const email = cleanText(input.email, 180).toLowerCase();
   const name = cleanText(input.name, 120);
   const phoneArea = cleanText(input.phoneArea || "+27", 12);
   const phoneNumber = normalizePhoneNumber(input.phoneNumber);
-  const phone = `${phoneArea} ${phoneNumber}`.trim();
   const defaultAddress = normalizeAddress(input.defaultAddress);
   const password = String(input.password || "");
   const termsAcceptance = termsAcceptanceFromInput(input);
   if (!username) throw Object.assign(new Error("Username is required."), { status: 400 });
   if (!name) throw Object.assign(new Error("Name is required."), { status: 400 });
-  if (!email || !email.includes("@")) throw Object.assign(new Error("Use a valid email address."), { status: 400 });
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw Object.assign(new Error("Use a valid email address."), { status: 400 });
   if (!phoneNumber) throw Object.assign(new Error("Phone number is required."), { status: 400 });
   if (!addressComplete(defaultAddress)) throw Object.assign(new Error("Complete the required delivery address fields."), { status: 400 });
-  if (password.length < 4) throw Object.assign(new Error("Use at least 4 characters for now."), { status: 400 });
-  if (data.users.some((user) => user.username === username || user.email === email)) {
-    throw Object.assign(new Error("User already exists."), { status: 409 });
-  }
-  const user = {
-    id: randomUUID(),
-    role: "customer",
-    username,
-    name,
-    email,
-    phoneArea,
-    phoneNumber,
-    phone,
-    defaultAddress,
+  validateNewPassword(password);
+  return records.users.insert({ id: randomUUID(), role: "customer", username, name, email,
+    phoneArea, phoneNumber, phone: `${phoneArea} ${phoneNumber}`.trim(), defaultAddress,
     addresses: [addressRecord({ ...defaultAddress, label: "Main address", isDefault: true })],
-    preferences: { theme: "light" },
-    termsAcceptance,
-    passwordHash: hashPassword(password),
-    createdAt: new Date().toISOString(),
-  };
-  data.users.push(user);
-  await writeUsersData(data);
-  return user;
+    preferences: { theme: "light" }, termsAcceptance, passwordHash: await hashPasswordAsync(password), createdAt: new Date().toISOString() });
 }
 
 async function updateAccountPreferences(input, session) {
-  const data = await readUsersData();
-  const user = data.users.find((entry) => entry.id === session.userId);
-  if (!user) throw Object.assign(new Error("Please log in again."), { status: 401 });
-  user.preferences = normalizeCustomerPreferences({ ...user.preferences, ...input });
-  await writeUsersData(data);
-  return user;
+  return records.users.update(session.userId, (user) => {
+    if (!validSessionAccount(session, user)) throw Object.assign(new Error("Please log in again."), { status: 401 });
+    user.preferences = normalizeCustomerPreferences({ ...user.preferences, ...input });
+    return user;
+  });
 }
 
 async function saveCustomerAddress(currentUser, input, addressId = "") {
-  const data = await readUsersData();
-  const user = data.users.find((entry) => entry.id === currentUser.id && entry.role !== "admin");
-  if (!user) throw Object.assign(new Error("Please log in again."), { status: 401 });
+  let selectedAddress;
+  const user = await records.users.update(currentUser.id, (user) => {
+  if (user.role === "admin") throw Object.assign(new Error("Please log in again."), { status: 401 });
   user.addresses = normalizeAddressList(user.addresses, user.defaultAddress, user.role);
   const existing = addressId ? user.addresses.find((address) => address.id === addressId) : null;
   if (addressId && !existing) throw Object.assign(new Error("Delivery address not found."), { status: 404 });
@@ -1100,14 +883,17 @@ async function saveCustomerAddress(currentUser, input, addressId = "") {
   }
   if (!user.addresses.some((address) => address.isDefault)) user.addresses[0].isDefault = true;
   user.defaultAddress = defaultAddressFromList(user.addresses);
-  await writeUsersData(data);
-  return { user, address: nextAddress };
+  selectedAddress = nextAddress;
+  return user;
+  });
+  return { user, address: selectedAddress };
 }
 
+
 async function setDefaultCustomerAddress(currentUser, addressId) {
-  const data = await readUsersData();
-  const user = data.users.find((entry) => entry.id === currentUser.id && entry.role !== "admin");
-  if (!user) throw Object.assign(new Error("Please log in again."), { status: 401 });
+  let selectedAddress;
+  const user = await records.users.update(currentUser.id, (user) => {
+  if (user.role === "admin") throw Object.assign(new Error("Please log in again."), { status: 401 });
   user.addresses = normalizeAddressList(user.addresses, user.defaultAddress, user.role);
   const target = user.addresses.find((address) => address.id === addressId);
   if (!target) throw Object.assign(new Error("Delivery address not found."), { status: 404 });
@@ -1116,14 +902,17 @@ async function setDefaultCustomerAddress(currentUser, addressId) {
     if (address.isDefault) address.updatedAt = new Date().toISOString();
   });
   user.defaultAddress = defaultAddressFromList(user.addresses);
-  await writeUsersData(data);
-  return { user, address: target };
+  selectedAddress = target;
+  return user;
+  });
+  return { user, address: selectedAddress };
 }
 
+
 async function removeCustomerAddress(currentUser, addressId) {
-  const data = await readUsersData();
-  const user = data.users.find((entry) => entry.id === currentUser.id && entry.role !== "admin");
-  if (!user) throw Object.assign(new Error("Please log in again."), { status: 401 });
+  let selectedAddress;
+  const user = await records.users.update(currentUser.id, (user) => {
+  if (user.role === "admin") throw Object.assign(new Error("Please log in again."), { status: 401 });
   user.addresses = normalizeAddressList(user.addresses, user.defaultAddress, user.role);
   if (user.addresses.length <= 1) throw Object.assign(new Error("Keep at least one valid delivery address."), { status: 409 });
   const target = user.addresses.find((address) => address.id === addressId);
@@ -1131,26 +920,25 @@ async function removeCustomerAddress(currentUser, addressId) {
   user.addresses = user.addresses.filter((address) => address.id !== target.id);
   if (!user.addresses.some((address) => address.isDefault)) user.addresses[0].isDefault = true;
   user.defaultAddress = defaultAddressFromList(user.addresses);
-  await writeUsersData(data);
-  return { user, address: target };
+  selectedAddress = target;
+  return user;
+  });
+  return { user, address: selectedAddress };
 }
 
+
 async function loginCustomer(input) {
-  const data = await readUsersData();
   const login = cleanText(input.login || input.username || input.email, 180).toLowerCase();
-  const user = data.users.find((entry) => (entry.username === login || entry.email === login) && entry.role !== "admin");
-  if (!user || !verifyPassword(input.password, user.passwordHash)) {
-    throw Object.assign(new Error("Username or password is incorrect."), { status: 401 });
-  }
+  const user = await records.users.findLogin(login, { role: "customer" });
+  if (!user || !await verifyPasswordAsync(input.password, user.passwordHash)) throw Object.assign(new Error("Username or password is incorrect."), { status: 401 });
   return user;
 }
 
 async function loginAdmin(input) {
-  const data = await readUsersData();
   const login = cleanText(input.login || input.username || input.email, 180).toLowerCase();
-  const admin = data.users.find((entry) => entry.role === "admin" && (entry.username === login || entry.email === login));
-  if (admin && verifyPassword(input.password, admin.passwordHash)) return admin;
-  if (envAdminLoginMatches(login, input.password)) return repairEnvAdminAccount(data);
+  const admin = await records.users.findLogin(login, { role: "admin" });
+  if (admin && await verifyPasswordAsync(input.password, admin.passwordHash)) return admin;
+  if (envAdminLoginMatches(login, input.password)) return repairEnvAdminAccount();
   throw Object.assign(new Error("Admin username or password is incorrect."), { status: 401 });
 }
 
@@ -1161,56 +949,44 @@ function envAdminLoginMatches(login, password) {
   return login === configuredUsername && secureTextEqual(password, configuredPassword);
 }
 
-async function repairEnvAdminAccount(data) {
+async function repairEnvAdminAccount() {
   const username = cleanText(adminUsername, 80).toLowerCase();
-  const now = new Date().toISOString();
-  let admin =
-    data.users.find((entry) => entry.role === "admin" && entry.username === username) ||
-    data.users.find((entry) => entry.role === "admin" && entry.id === "demo-admin") ||
-    data.users.find((entry) => entry.role === "admin");
+  const existing = await records.users.findLogin(username, { role: "admin" }) || await records.users.get("demo-admin");
+  const passwordHash = await hashPasswordAsync(adminPassword);
+  if (!existing) return records.users.insert({ ...demoAdmin(), id: randomUUID(), username, email: username + "@admin.local", passwordHash });
+  return records.users.update(existing.id, (admin) => ({ ...admin, role: "admin", username, passwordHash, updatedAt: new Date().toISOString() }));
+}
 
-  if (!admin) {
-    admin = demoAdmin();
-    data.users.push(admin);
-  }
+function validSessionAccount(session, user) {
+  return Boolean(user && session && session.kind === user.role && session.credentialVersion && secureTextEqual(session.credentialVersion, sessionCredentialVersion(user, sessionSecret)));
+}
 
-  admin.role = "admin";
-  admin.username = username;
-  admin.name = cleanText(admin.name || "Admin", 120);
-  admin.email = cleanText(admin.email || `${username}@admin.local`, 180).toLowerCase();
-  admin.phoneArea = cleanText(admin.phoneArea || "+27", 12);
-  admin.phoneNumber = "";
-  admin.phone = "";
-  admin.defaultAddress = emptyAddress();
-  admin.addresses = [];
-  admin.preferences = normalizeCustomerPreferences(admin.preferences);
-  admin.passwordHash = hashPassword(adminPassword);
-  admin.updatedAt = now;
-  await writeUsersData(data);
-  return admin;
+async function sessionAccount(req) {
+  if (!req.portalAccount) req.portalAccount = (async () => {
+    const session = sessionFromRequest(req);
+    if (!session) throw Object.assign(new Error("Please log in first."), { status: 401 });
+    const user = await records.users.get(session.userId);
+    if (!validSessionAccount(session, user)) throw Object.assign(new Error("Please log in again."), { status: 401 });
+    return user;
+  })();
+  return req.portalAccount;
 }
 
 async function requireCustomer(req) {
-  const session = sessionFromRequest(req);
-  if (!session || session.kind !== "customer") throw Object.assign(new Error("Please log in first."), { status: 401 });
-  const data = await readUsersData();
-  const user = data.users.find((entry) => entry.id === session.userId);
-  if (!user) throw Object.assign(new Error("Please log in again."), { status: 401 });
+  const user = await sessionAccount(req);
+  if (user.role !== "customer") throw Object.assign(new Error("Customer login is required."), { status: 403 });
   return user;
 }
 
 async function requirePortalAccess(req) {
-  const session = sessionFromRequest(req);
-  if (!session) throw Object.assign(new Error("Please log in first."), { status: 401 });
-  if (session.kind === "admin") return { kind: "admin", username: session.username, userId: session.userId };
-  const user = await requireCustomer(req);
-  return { kind: "customer", user };
+  const user = await sessionAccount(req);
+  return user.role === "admin" ? { kind: "admin", username: user.username, userId: user.id } : { kind: "customer", user };
 }
 
-function requireAdmin(req) {
-  const session = sessionFromRequest(req);
-  if (!session || session.kind !== "admin") throw Object.assign(new Error("Admin login is required."), { status: 401 });
-  return { username: session.username, userId: session.userId };
+async function requireAdmin(req) {
+  const user = await sessionAccount(req);
+  if (user.role !== "admin") throw Object.assign(new Error("Admin login is required."), { status: 401 });
+  return { username: user.username, userId: user.id, credentialVersion: sessionCredentialVersion(user, sessionSecret) };
 }
 
 function portalControlIntent(req, admin, control, phase, previous = {}) {
@@ -1238,27 +1014,21 @@ function verifyPortalControlIntent(req, admin, token, control, phase) {
 }
 
 async function portalAdminAccount(admin) {
-  const data = await readUsersData();
-  const account = data.users.find((entry) => entry.role === "admin" && entry.id === admin.userId && entry.username === admin.username);
-  if (!account) throw Object.assign(new Error("An active admin account is required."), { status: 403 });
+  const account = await records.users.get(admin.userId);
+  if (!account || account.role !== "admin" || account.username !== admin.username || !secureTextEqual(admin.credentialVersion, sessionCredentialVersion(account, sessionSecret))) throw Object.assign(new Error("An active admin account is required."), { status: 403 });
   return account;
 }
 
 async function verifyPortalAdminPassword(admin, password) {
   const account = await portalAdminAccount(admin);
-  if (!verifyPassword(password, account.passwordHash)) throw Object.assign(new Error("Admin password is incorrect."), { status: 403 });
+  if (!await verifyPasswordAsync(password, account.passwordHash)) throw Object.assign(new Error("Admin password is incorrect."), { status: 403 });
 }
 
-async function listAccounts() {
-  const data = await readUsersData();
-  return data.users.map(publicAccount).sort((a, b) => {
-    if (a.role !== b.role) return a.role === "admin" ? -1 : 1;
-    return String(a.name || a.username).localeCompare(String(b.name || b.username));
-  });
+async function listAccounts(options = {}) {
+  return (await records.users.list(options)).map(publicAccount);
 }
 
 async function createAccountByAdmin(input) {
-  const data = await readUsersData();
   const role = input.role === "admin" ? "admin" : "customer";
   const username = cleanText(input.username, 80).toLowerCase();
   const email = role === "admin" ? cleanText(input.email || `${username}@admin.local`, 180).toLowerCase() : cleanText(input.email, 180).toLowerCase();
@@ -1275,10 +1045,7 @@ async function createAccountByAdmin(input) {
   if (role === "customer" && !addressComplete(defaultAddress)) {
     throw Object.assign(new Error("Customer delivery address is required."), { status: 400 });
   }
-  if (password.length < 4) throw Object.assign(new Error("Use at least 4 characters for now."), { status: 400 });
-  if (data.users.some((user) => user.username === username || user.email === email)) {
-    throw Object.assign(new Error("User already exists."), { status: 409 });
-  }
+  validateNewPassword(password);
   const user = {
     id: randomUUID(),
     role,
@@ -1291,56 +1058,29 @@ async function createAccountByAdmin(input) {
     defaultAddress,
     addresses: role === "customer" ? [addressRecord({ ...defaultAddress, label: "Main address", isDefault: true })] : [],
     preferences: { theme: "light" },
-    passwordHash: hashPassword(password),
+    passwordHash: await hashPasswordAsync(password),
     createdAt: new Date().toISOString(),
   };
-  data.users.push(user);
-  await writeUsersData(data);
-  return user;
+  return records.users.insert(user);
 }
 
 async function updateAccountByAdmin(accountId, input, admin) {
-  const data = await readUsersData();
-  const actor = data.users.find((user) => user.id === admin.userId && user.role === "admin");
-  if (!actor) throw Object.assign(new Error("Admin login is required."), { status: 401 });
-  const target = data.users.find((user) => user.id === accountId);
-  if (!target) throw Object.assign(new Error("Account not found."), { status: 404 });
-  if (target.role !== "admin") throw Object.assign(new Error("Only admin accounts can be edited here for now."), { status: 409 });
+  await portalAdminAccount(admin);
   const username = cleanText(input.username, 80).toLowerCase();
   const name = cleanText(input.name, 120);
   const password = String(input.password || "");
-  if (!username) throw Object.assign(new Error("Username is required."), { status: 400 });
-  if (!name) throw Object.assign(new Error("Name is required."), { status: 400 });
-  if (password && password.length < 4) throw Object.assign(new Error("Use at least 4 characters for the password."), { status: 400 });
-  const email = cleanText(input.email || target.email || `${username}@admin.local`, 180).toLowerCase();
-  if (data.users.some((user) => user.id !== target.id && (user.username === username || user.email === email))) {
-    throw Object.assign(new Error("User already exists."), { status: 409 });
-  }
-  target.username = username;
-  target.name = name;
-  target.email = email;
-  if (password) target.passwordHash = hashPassword(password);
-  target.updatedAt = new Date().toISOString();
-  await writeUsersData(data);
-  return target;
+  if (!username || !name) throw Object.assign(new Error("Name and username are required."), { status: 400 });
+  if (password) validateNewPassword(password);
+  const passwordHash = password ? await hashPasswordAsync(password) : null;
+  return records.users.update(accountId, (target) => {
+    if (target.role !== "admin") throw Object.assign(new Error("Only admin accounts can be edited here."), { status: 409 });
+    return { ...target, username, name, email: cleanText(input.email || target.email || username + "@admin.local", 180).toLowerCase(), ...(passwordHash ? {passwordHash} : {}), updatedAt: new Date().toISOString() };
+  });
 }
 
 async function removeAccountByAdmin(accountId, input, admin) {
-  const data = await readUsersData();
-  const actor = data.users.find((user) => user.id === admin.userId && user.role === "admin");
-  if (!actor || !verifyPassword(input.password, actor.passwordHash)) {
-    throw Object.assign(new Error("Admin password confirmation failed."), { status: 401 });
-  }
-  const target = data.users.find((user) => user.id === accountId);
-  if (!target) throw Object.assign(new Error("Account not found."), { status: 404 });
-  if (target.id === actor.id) throw Object.assign(new Error("You cannot remove the admin account you are signed in with."), { status: 409 });
-  if (target.role === "admin" && data.users.filter((user) => user.role === "admin").length <= 1) {
-    throw Object.assign(new Error("At least one admin account must remain."), { status: 409 });
-  }
-  data.users = data.users.filter((user) => user.id !== target.id);
-  await writeUsersData(data);
-  await deleteUserFromDatabase(target.id);
-  return target;
+  await verifyPortalAdminPassword(admin, input.password);
+  return records.users.remove(accountId, { actorId: admin.userId });
 }
 
 function money(value) {
@@ -1441,6 +1181,13 @@ function formatAddress(address) {
 
 function orderShippingRequirements(order) {
   return { officeRequired: officeFulfillmentItems(order).length > 0, externalRequired: externalFulfillmentItems(order).length > 0 };
+}
+
+async function deliveryConfirmationSettings() {
+  if (!dataStorageUsesDatabase()) return (await readShopSettingsData()).settings.deliveryConfirmation;
+  await ensureDatabaseSchema();
+  const {rows}=await (await database()).query("SELECT data->'deliveryConfirmation' AS settings FROM op_shop_settings WHERE id='default'");
+  return normalizeDeliverySettings(rows[0]?.settings || {});
 }
 
 async function withDeliveryReceipts(orders) {
@@ -1626,7 +1373,7 @@ function customerStatus(order) {
 function orderReadyForRetailShark(order) {
   if (order.paymentStatus !== "confirmed" || order.fulfillmentStatus === "shipped") return false;
   if (order.officeShippedAt) return false;
-  if (order.specialOrder && !officeFulfillmentItems(order).length) return false;
+  if (!officeFulfillmentItems(order).length) return false;
   if (!shopifyOrderSyncEnabled) return true;
   return Boolean(order.shopifyOrder?.id);
 }
@@ -1664,6 +1411,40 @@ function formatReference(template) {
     .replaceAll("{RAND4}", rand4);
 }
 
+async function liveCartProducts(inputItems, settings) {
+  const items = normalizedCartInput(inputItems);
+  const accessToken = await getShopifyAccessToken();
+  if (!accessToken && !isProduction) return mockCatalogProducts();
+  const query = `#graphql
+    query OnlinePortalCheckoutVariants($ids: [ID!]!, $courier: String!) {
+      nodes(ids: $ids) {
+        ... on ProductVariant {
+          id title sku price inventoryQuantity availableForSale
+          product { id title handle status vendor productType tags }
+        }
+      }
+      productByHandle: productByIdentifier(identifier: { handle: $courier }) {
+        id title handle status vendor productType tags
+        variants(first: 1) { nodes { id title sku price inventoryQuantity availableForSale } }
+      }
+    }
+  `;
+  const payload = await shopifyGraphql(query, { ids: items.map(item=>item.variantId), courier: settings.courier.productQuery || "pudo-courier" });
+  const products = (payload.data?.nodes || []).filter(variant=>variant?.product?.status === "ACTIVE").map(variant=>normalizeCatalogProduct({...variant.product,variants:{nodes:[variant]}}));
+  if (settings.courier.enabled && payload.data?.productByHandle) products.push(normalizeCatalogProduct(payload.data.productByHandle));
+  const officeProducts = products.filter(product=>!fulfillmentRuleForProduct(product,settings.fulfillment) && product.variant?.id && items.some(item=>item.variantId===product.variant.id));
+  if (!officeProducts.length) return products;
+  const stock = await retailSharkFulfillmentStock(officeProducts.map(product=>product.variant.id));
+  const byVariant = new Map(stock.rows.map(row=>[row.variantId,row]));
+  return products.map(product=>{
+    if (!officeProducts.includes(product)) return product;
+    const row = byVariant.get(product.variant.id);
+    if (!row || !Number.isFinite(row.officeAvailable) || !Number.isFinite(row.storageOnHand)) throw Object.assign(new Error("Product availability could not be verified. Please try again shortly."), { status: 503 });
+    const office = Math.max(0,row.officeAvailable), storage = Math.max(0,row.storageOnHand);
+    return {...product,variant:{...product.variant,officeAvailableQuantity:office,storageQuantity:storage,availableQuantity:office+storage,inStock:office+storage>0}};
+  });
+}
+
 async function validateOrderRequest(input, user, options = {}) {
   const settings = normalizeShopSettings(options.settings || defaultShopSettings());
   const courier = normalizeCourierSettings(settings.courier);
@@ -1690,14 +1471,27 @@ async function validateOrderRequest(input, user, options = {}) {
   if (allowSpecial && fulfillment.specialOrders.enabled === false) {
     throw Object.assign(new Error(fulfillment.specialOrders.unavailableMessage || "Special orders are temporarily unavailable."), { status: 409 });
   }
-  const catalog = await catalogProducts();
-  const routedProducts = applyFulfillmentSettingsToProducts(catalog.products, fulfillment);
+  const products = await liveCartProducts(input.items, settings);
+  const routedProducts = applyFulfillmentSettingsToProducts(products, fulfillment);
   const items = validateCartItems(input.items, routedProducts, { allowSpecial, courier, fulfillment });
   if (!items.length) throw new Error("Add at least one product to the order.");
   const subtotal = money(items.reduce((sum, item) => sum + item.price * item.quantity, 0));
   const courierLine = courier.enabled ? resolveCourierLine(routedProducts, courier) : null;
   const deliveryFee = courierLine ? money(courierLine.price) : 0;
   return { customer, delivery, items, subtotal, deliveryFee, courierLine, total: money(subtotal + deliveryFee) };
+}
+
+function normalizedCartInput(input) {
+  if (!Array.isArray(input) || !input.length || input.length > 100) throw Object.assign(new Error("Choose between 1 and 100 products."), { status: 400 });
+  const byVariant = new Map();
+  for (const item of input) {
+    const variantId = cleanText(item?.variantId,160), quantity = Number(item?.quantity);
+    if (!variantId || !Number.isSafeInteger(quantity) || quantity < 1 || quantity > 10_000) throw Object.assign(new Error("Use a whole-number quantity between 1 and 10,000."), { status: 400 });
+    const total = (byVariant.get(variantId) || 0) + quantity;
+    if (total > 10_000) throw Object.assign(new Error("Requested quantity is too large."), { status: 400 });
+    byVariant.set(variantId,total);
+  }
+  return [...byVariant].map(([variantId,quantity])=>({variantId,quantity}));
 }
 
 function validateCartItems(inputItems, catalogProducts, options = {}) {
@@ -1708,14 +1502,14 @@ function validateCartItems(inputItems, catalogProducts, options = {}) {
   }
   const courier = normalizeCourierSettings(options.courier || defaultShopSettings().courier);
   const courierProduct = resolveCourierProduct(catalogProducts, courier);
-  const items = (Array.isArray(inputItems) ? inputItems : [])
+  const items = normalizedCartInput(inputItems)
     .map((item) => {
       const variantId = cleanText(item.variantId, 160);
       const product = catalogByVariant.get(variantId);
-      const quantity = Math.max(0, Math.floor(Number(item.quantity || 0)));
-      if (!product || !product.variant) return null;
-      if (courierProduct?.variant?.id === product.variant.id) return null;
-      if (quantity <= 0) return null;
+      const quantity = item.quantity;
+      if (!product?.variant) throw Object.assign(new Error("A product is no longer available. Refresh your basket."), { status: 409 });
+      if (courierProduct?.variant?.id === product.variant.id) throw Object.assign(new Error("Courier is added automatically."), { status: 400 });
+      if (!Number.isFinite(product.variant.price) || product.variant.price < 0) throw Object.assign(new Error("A product price could not be verified."), { status: 503 });
       if (!allowSpecial) assertQuantityAvailable(product, quantity);
       const officeAvailableQuantity = Number.isFinite(product.variant.officeAvailableQuantity)
         ? product.variant.officeAvailableQuantity
@@ -1804,21 +1598,26 @@ function assertQuantityAvailable(product, quantity) {
 }
 
 async function createOrder(input, user) {
+  if (!emailIsVerified(user) && (await readShopSettingsData()).settings.customerCare.requireVerifiedEmailForOrders !== false) {
+    throw Object.assign(new Error("Verify your email address before submitting an order. You can resend the verification email from My account."), { status: 403, code: "EMAIL_VERIFICATION_REQUIRED" });
+  }
   const now = new Date().toISOString();
-  const data = await readOrdersData();
   const isSpecialOrder = Boolean(input.specialOrder);
   const idempotencyKey = cleanText(input.idempotencyKey, 160);
+  if (!idempotencyKey) throw Object.assign(new Error("Refresh your basket and submit the order again."), { status: 400 });
+  const requestHash = createHash("sha256").update(JSON.stringify({ items: (input.items || []).map(({ variantId, quantity }) => ({variantId, quantity: Number(quantity)})).sort((a,b) => a.variantId.localeCompare(b.variantId)), delivery: input.delivery || {}, specialOrder: Boolean(input.specialOrder), specialOrderNote: input.specialOrderNote || "" })).digest("hex");
   if (idempotencyKey) {
-    const existing = data.orders.find((order) => order.customer?.id === user.id && order.idempotencyKey === idempotencyKey);
+    const existing = await records.orders.findSubmission(user.id, idempotencyKey, requestHash);
     if (existing) return existing;
   }
   const settings = (await readShopSettingsData()).settings;
   const request = await validateOrderRequest(input, user, { allowSpecial: isSpecialOrder, settings });
+  if (input.expectedTotal != null && (!Number.isFinite(Number(input.expectedTotal)) || money(input.expectedTotal) !== request.total)) throw Object.assign(new Error("Prices have changed. Review your basket before submitting."), { status: 409 });
   const provider = activePaymentProvider(settings);
   const order = {
     id: randomUUID(),
     idempotencyKey,
-    reference: await buildUniqueReference(isSpecialOrder ? "special" : "standard", data.orders),
+    reference: await buildUniqueReference(isSpecialOrder ? "special" : "standard", []),
     ...request,
     paymentStatus: "pending",
     paymentProvider: provider,
@@ -1851,30 +1650,37 @@ async function createOrder(input, user) {
     createdAt: now,
     updatedAt: now,
   };
-  data.orders.unshift(order);
-  await writeOrdersData(data);
-  await queueOrderEmail(order, "order_received", now);
-  return order;
+  const notificationHint = await notifications.beforeWrite(order.id);
+  for (let attempt = 0; attempt < 6; attempt++) {
+    try {
+      const result = await records.orders.insert(order, { requestHash });
+      await finishOrderNotifications(order.id,notificationHint);
+
+      return result.order;
+    } catch (error) {
+      if (error.code !== "ORDER_REFERENCE_CONFLICT" || attempt === 5) throw error;
+      order.reference = await buildReference(isSpecialOrder ? "special" : "standard");
+    }
+  }
 }
 
 async function uploadProof(orderId, input, user) {
-  const data = await readOrdersData();
-  const order = data.orders.find((entry) => entry.id === orderId && entry.customer?.id === user.id);
-  if (!order) throw Object.assign(new Error("Order not found."), { status: 404 });
-  const proof = await storeProofUpload(order, input);
-  const now = new Date().toISOString();
-  order.proof = proof;
-  order.paymentStatus = "pending";
-  order.updatedAt = now;
-  order.statusEvents.push({ at: now, actor: "customer", type: "proof_uploaded", label: "Proof of payment uploaded" });
-  await writeOrdersData(data);
-  return order;
+  const snapshot = await records.orders.get(orderId, { customerId: user.id });
+  if (!snapshot) throw Object.assign(new Error("Order not found."), { status: 404 });
+  if (snapshot.paymentStatus === "confirmed") throw Object.assign(new Error("Payment has already been confirmed."), { status: 409 });
+  const proof = await storeProofUpload(snapshot, input);
+  return mutateOrder(orderId, (order) => {
+    if (order.paymentStatus === "confirmed") throw Object.assign(new Error("Payment has already been confirmed."), { status: 409 });
+    const now = new Date().toISOString();
+    order.proof = proof; order.updatedAt = now;
+    order.statusEvents.push({ at: now, actor: "customer", type: "proof_uploaded", label: "Proof of payment uploaded" });
+    return order;
+  }, { customerId: user.id });
 }
 
+
 async function reportPaymentIssue(orderId, input, user) {
-  const data = await readOrdersData();
-  const order = data.orders.find((entry) => entry.id === orderId && entry.customer?.id === user.id);
-  if (!order) throw Object.assign(new Error("Order not found."), { status: 404 });
+  return mutateOrder(orderId, async (order) => {
   if (order.paymentStatus === "confirmed") throw Object.assign(new Error("Payment has already been confirmed."), { status: 409 });
   const type = cleanText(input.type || "other", 40);
   const allowedTypes = new Set(["link_not_opening", "amount_wrong", "payment_failed", "paid_pending", "other"]);
@@ -1890,8 +1696,8 @@ async function reportPaymentIssue(orderId, input, user) {
   };
   order.updatedAt = now;
   order.statusEvents.push({ at: now, actor: "customer", type: "payment_issue_reported", label: paymentIssueLabel(order.paymentIssue.type) });
-  await writeOrdersData(data);
   return order;
+  }, { customerId: user.id });
 }
 
 async function reportCustomerPaid(orderId, user) {
@@ -1899,9 +1705,7 @@ async function reportCustomerPaid(orderId, user) {
 }
 
 async function resolvePaymentIssue(orderId, admin) {
-  const data = await readOrdersData();
-  const order = data.orders.find((entry) => entry.id === orderId);
-  if (!order) throw Object.assign(new Error("Order not found."), { status: 404 });
+  return mutateOrder(orderId, async (order) => {
   if (!order.paymentIssue || order.paymentIssue.status === "resolved") return order;
   const now = new Date().toISOString();
   order.paymentIssue.status = "resolved";
@@ -1909,8 +1713,8 @@ async function resolvePaymentIssue(orderId, admin) {
   order.paymentIssue.resolvedBy = cleanText(admin.username || "admin", 120);
   order.updatedAt = now;
   order.statusEvents.push({ at: now, actor: "admin", type: "payment_issue_resolved", label: "Payment issue resolved" });
-  await writeOrdersData(data);
   return order;
+  });
 }
 
 function paymentIssueLabel(type) {
@@ -1925,61 +1729,31 @@ function paymentIssueLabel(type) {
 }
 
 async function confirmPayment(orderId, input, admin) {
-  const data = await readOrdersData();
-  const order = data.orders.find((entry) => entry.id === orderId);
-  if (!order) throw Object.assign(new Error("Order not found."), { status: 404 });
-  if (order.specialOrder?.status === "pending") throw Object.assign(new Error("Review the special order before confirming payment."), { status: 409 });
-  if (order.specialOrder?.status === "declined") throw Object.assign(new Error("Declined special orders cannot be confirmed."), { status: 409 });
-  if (!fulfillmentReadyForPayment(order)) throw Object.assign(new Error("Review fulfillment before confirming payment."), { status: 409 });
-  if (!orderPaymentReady(order)) throw Object.assign(new Error("Attach payment instructions before confirming payment."), { status: 409 });
   const settings = (await readShopSettingsData()).settings;
-  const provider = paymentProviderSettings(settings, order.paymentProvider);
-  const now = new Date().toISOString();
-  const wasConfirmed = order.paymentStatus === "confirmed";
-  if (!wasConfirmed) {
+  const order = await mutateOrder(orderId, (order) => {
+    if (order.specialOrder?.status === "pending" || order.specialOrder?.status === "declined") throw Object.assign(new Error("Review the special order before confirming payment."), { status: 409 });
+    if (!fulfillmentReadyForPayment(order) || !orderPaymentReady(order)) throw Object.assign(new Error("Review fulfillment and attach payment instructions first."), { status: 409 });
+    if (order.paymentStatus === "confirmed") return order;
+    const now = new Date().toISOString();
     order.paymentStatus = "confirmed";
     order.fulfillmentStatus = order.fulfillmentStatus === "back_order" ? "back_order" : "not_ready";
-    order.paymentConfirmedAt = now;
-    order.paymentConfirmedBy = cleanText(input.confirmedBy || admin.username || "admin", 120);
-    if (order.paymentIssue && order.paymentIssue.status !== "resolved") {
-      order.paymentIssue.status = "resolved";
-      order.paymentIssue.resolvedAt = now;
-      order.paymentIssue.resolvedBy = order.paymentConfirmedBy;
-    }
-    order.statusEvents.push({ at: now, actor: "admin", type: "payment_confirmed", label: provider.confirmationLabel || "Payment confirmed" });
-  }
-  if (shopifyOrderSyncEnabled && !order.shopifyOrder?.id) {
-    await syncOrderToShopify(order, admin, { throwOnError: false });
-  } else if (!shopifyFulfillmentItems(order).length) {
-    order.shopifySync = {
-      status: "external",
-      message: "No Retail Shark / Shopify items. Shopify order creation skipped.",
-      attemptedAt: null,
-      syncedAt: new Date().toISOString(),
-    };
-  } else if (!shopifyOrderSyncEnabled && !order.shopifyOrder?.id) {
-    order.shopifySync = {
-      status: "disabled",
-      message: "Shopify order sync is disabled. Enable SHOPIFY_ORDER_SYNC_ENABLED to create Shopify orders after payment confirmation.",
-      attemptedAt: null,
-      syncedAt: null,
-    };
-  }
-  order.updatedAt = new Date().toISOString();
-  await writeOrdersData(data);
-  if (!wasConfirmed) await queueOrderEmail(order, "payment_confirmed", order.paymentConfirmedAt);
-  return order;
+    order.paymentConfirmedAt = now; order.paymentConfirmedBy = cleanText(admin.username, 120);
+    if (order.paymentIssue && order.paymentIssue.status !== "resolved") Object.assign(order.paymentIssue, { status: "resolved", resolvedAt: now, resolvedBy: admin.username });
+    order.statusEvents.push({ at: now, actor: "admin", type: "payment_confirmed", label: paymentProviderSettings(settings, order.paymentProvider).confirmationLabel || "Payment confirmed" });
+    order.updatedAt = now;
+    return order;
+  });
+
+  return syncOrderToShopify(orderId, admin);
 }
 
 async function attachPaymentLink(orderId, input, admin) {
-  const data = await readOrdersData();
-  const order = data.orders.find((entry) => entry.id === orderId);
-  if (!order) throw Object.assign(new Error("Order not found."), { status: 404 });
+  const settings = (await readShopSettingsData()).settings;
+  const updated = await mutateOrder(orderId, async (order) => {
   if (order.paymentStatus === "confirmed") throw Object.assign(new Error("Payment has already been confirmed."), { status: 409 });
   if (order.specialOrder?.status === "pending") throw Object.assign(new Error("Review the special order before attaching a payment link."), { status: 409 });
   if (order.specialOrder?.status === "declined") throw Object.assign(new Error("Declined special orders cannot receive a payment link."), { status: 409 });
   if (!fulfillmentReadyForPayment(order)) throw Object.assign(new Error("Review fulfillment before attaching payment details."), { status: 409 });
-  const settings = (await readShopSettingsData()).settings;
   const providerId = cleanText(input.provider || order.paymentProvider || activePaymentProvider(settings), 30);
   const provider = paymentProviderSettings(settings, providerId);
   const url = cleanText(input.url, 800);
@@ -1987,6 +1761,9 @@ async function attachPaymentLink(orderId, input, admin) {
   if (url && !/^https:\/\/.+/i.test(url) && !/^http:\/\/localhost[:/]/i.test(url) && !/^http:\/\/127\.0\.0\.1[:/]/i.test(url)) {
     throw Object.assign(new Error("Enter a valid payment link."), { status: 400 });
   }
+  const reference = cleanText(input.reference || order.reference,160);
+  const note = cleanText(input.note || provider.customerInstructions,700);
+  if (order.paymentLink && order.paymentLink.provider === providerId && order.paymentLink.url === url && order.paymentLink.reference === reference && order.paymentLink.note === note && order.paymentLink.amount === money(order.total)) return order;
   const now = new Date().toISOString();
   order.paymentProvider = providerId;
   order.paymentLink = {
@@ -2000,31 +1777,23 @@ async function attachPaymentLink(orderId, input, admin) {
   };
   order.updatedAt = now;
   order.statusEvents.push({ at: now, actor: "admin", type: "payment_link_attached", label: `${provider.label || "Payment"} attached` });
-  await writeOrdersData(data);
-  await queueOrderEmail(order, "payment_ready", now);
   return order;
+  });
+
+  return updated;
 }
 
 async function syncConfirmedOrder(orderId, admin) {
-  const data = await readOrdersData();
-  const order = data.orders.find((entry) => entry.id === orderId);
-  if (!order) throw Object.assign(new Error("Order not found."), { status: 404 });
-  await syncOrderToShopify(order, admin, { throwOnError: true });
-  order.updatedAt = new Date().toISOString();
-  await writeOrdersData(data);
-  return order;
+  if (!shopifyOrderSyncEnabled) throw Object.assign(new Error("Shopify order sync is disabled."), { status: 409 });
+  return syncOrderToShopify(orderId, admin);
 }
 
 async function checkStorageTransfer(orderId, admin) {
-  const data = await readOrdersData();
-  const order = data.orders.find((entry) => entry.id === orderId);
+  const order = await records.orders.get(orderId);
   if (!order) throw Object.assign(new Error("Order not found."), { status: 404 });
   if (order.paymentStatus !== "confirmed") throw Object.assign(new Error("Payment must be confirmed first."), { status: 409 });
-  if (order.shopifySync?.status !== "storage_pending") throw Object.assign(new Error("This order is not waiting for a stock transfer."), { status: 409 });
-  await syncOrderToShopify(order, admin, { throwOnError: true });
-  order.updatedAt = new Date().toISOString();
-  await writeOrdersData(data);
-  return order;
+  if (order.shopifySync?.status !== "storage_pending" && order.shopifySync?.status !== "syncing") throw Object.assign(new Error("This order is not waiting for a stock transfer."), { status: 409 });
+  return syncConfirmedOrder(orderId, admin);
 }
 
 function storageTransferShortfalls(order, stock) {
@@ -2032,9 +1801,8 @@ function storageTransferShortfalls(order, stock) {
 }
 
 async function reviewSpecialOrder(orderId, input, admin) {
-  const data = await readOrdersData();
-  const order = data.orders.find((entry) => entry.id === orderId);
-  if (!order) throw Object.assign(new Error("Order not found."), { status: 404 });
+  return mutateOrder(orderId, async (order) => {
+  if (order.paymentLink || order.paymentStatus === "confirmed") throw Object.assign(new Error("Payment instructions have already been issued. Review cannot be changed."), { status: 409 });
   if (!order.specialOrder) throw Object.assign(new Error("This is not a special order."), { status: 409 });
   const action = cleanText(input.action, 20);
   const now = new Date().toISOString();
@@ -2075,14 +1843,12 @@ async function reviewSpecialOrder(orderId, input, admin) {
     throw Object.assign(new Error("Choose a valid special order action."), { status: 400 });
   }
   order.updatedAt = now;
-  await writeOrdersData(data);
   return order;
+  });
 }
 
 async function reviewFulfillment(orderId, input, admin) {
-  const data = await readOrdersData();
-  const order = data.orders.find((entry) => entry.id === orderId);
-  if (!order) throw Object.assign(new Error("Order not found."), { status: 404 });
+  return mutateOrder(orderId, async (order) => {
   if (order.paymentLink || order.paymentStatus === "confirmed") {
     throw Object.assign(new Error("Fulfillment must be reviewed before payment details are attached."), { status: 409 });
   }
@@ -2103,8 +1869,8 @@ async function reviewFulfillment(orderId, input, admin) {
   };
   order.updatedAt = now;
   order.statusEvents.push({ at: now, actor: "admin", type: "fulfillment_reviewed", label: "Fulfillment reviewed" });
-  await writeOrdersData(data);
   return order;
+  });
 }
 
 function counterOrderItems(currentItems, inputItems, allocations = []) {
@@ -2125,6 +1891,7 @@ function normalizeFulfillmentAllocations(items, inputAllocations, options = {}) 
   );
   return (items || []).map((item) => {
     const raw = allocationByVariant.get(item.variantId) || {};
+    for (const key of ["officeQuantity", "externalQuantity"]) if (raw[key] != null && (!Number.isSafeInteger(Number(raw[key])) || Number(raw[key]) < 0 || Number(raw[key]) > 10_000)) throw Object.assign(new Error("Fulfillment quantities must be whole numbers between 0 and 10,000."), { status: 400 });
     const requestedQuantity = Math.max(0, Math.floor(Number(item.quantity || 0)));
     const defaultAllocation = defaultFulfillmentAllocation(item);
     const officeQuantity = Math.max(0, Math.floor(Number(raw.officeQuantity ?? defaultAllocation.officeQuantity)));
@@ -2208,85 +1975,84 @@ function externalFulfillmentItems(order) {
 }
 
 async function updateTracking(orderId, input) {
-  const data = await readOrdersData();
-  const order = data.orders.find((entry) => entry.id === orderId);
-  if (!order) throw Object.assign(new Error("Order not found."), { status: 404 });
+  return mutateOrder(orderId, async (order) => {
   if (order.paymentStatus !== "confirmed") throw Object.assign(new Error("Payment must be confirmed first."), { status: 409 });
+  ensureOfficeFulfillmentAllowed(order);
   const now = new Date().toISOString();
-  order.tracking = {
-    courier: cleanText(input.courier, 120),
-    number: cleanText(input.number, 180),
-    url: cleanText(input.url, 500),
-    addedAt: now,
-  };
+  const tracking = { courier: cleanText(input.courier,120), number: cleanText(input.number,180), url: safeTrackingUrl(input.url) };
+  if (order.tracking && Object.entries(tracking).every(([key,value])=>order.tracking[key] === value)) return order;
+  order.tracking = { ...tracking, addedAt: now };
   if (!order.tracking.number) throw new Error("Tracking number is required.");
   order.updatedAt = now;
   order.statusEvents.push({ at: now, actor: "staff", type: "tracking_added", label: "Tracking added" });
-  await writeOrdersData(data);
   return order;
+  });
 }
 
 async function updateExternalTracking(orderId, input, admin) {
-  const data = await readOrdersData();
-  const order = data.orders.find((entry) => entry.id === orderId);
-  if (!order) throw Object.assign(new Error("Order not found."), { status: 404 });
-  if (order.paymentStatus !== "confirmed") throw Object.assign(new Error("Payment must be confirmed first."), { status: 409 });
-  if (!externalFulfillmentItems(order).length) throw Object.assign(new Error("This order does not have external fulfillment items."), { status: 409 });
-  const now = new Date().toISOString();
-  order.externalTracking = {
-    courier: cleanText(input.courier, 120),
-    number: cleanText(input.number, 180),
-    url: cleanText(input.url, 500),
-    note: cleanText(input.note, 500),
-    addedAt: now,
-    addedBy: cleanText(admin?.username || "admin", 120),
-  };
-  if (!order.externalTracking.number) throw new Error("Tracking number is required.");
-  if (!officeFulfillmentItems(order).length || order.officeShippedAt) {
-    const alreadyShipped = order.fulfillmentStatus === "shipped";
-    order.fulfillmentStatus = "shipped";
-    if (!alreadyShipped || !order.shippedAt) order.shippedAt = now;
-  }
-  order.updatedAt = now;
-  order.statusEvents.push({ at: now, actor: "admin", type: "external_tracking_added", label: "External shipment tracking added" });
-  await writeOrdersData(data);
-  await queueOrderEmail(order, "shipped", `external:${now}`);
-  return order;
+  const updated = await mutateOrder(orderId, (order) => {
+    if (order.paymentStatus !== "confirmed") throw Object.assign(new Error("Payment must be confirmed first."), { status: 409 });
+    if (!externalFulfillmentItems(order).length) throw Object.assign(new Error("This order does not have external fulfillment items."), { status: 409 });
+    const values = { courier: cleanText(input.courier,120), number: cleanText(input.number,180), url: safeTrackingUrl(input.url), note: cleanText(input.note,500) };
+    if (!values.number) throw Object.assign(new Error("Tracking number is required."), { status: 400 });
+    if (order.externalTracking && Object.entries(values).every(([key,value])=>order.externalTracking[key] === value)) return order;
+    const now = new Date().toISOString();
+    order.externalTracking = { ...values, addedAt: now, addedBy: admin.username };
+    if (!officeFulfillmentItems(order).length || order.officeShippedAt) {
+      const alreadyShipped = order.fulfillmentStatus === "shipped";
+      order.fulfillmentStatus = "shipped";
+      if (!alreadyShipped || !order.shippedAt) order.shippedAt = now;
+    }
+    order.updatedAt = now;
+    order.statusEvents.push({ at: now, actor: "admin", type: "external_tracking_added", label: "External shipment tracking added" });
+    return order;
+  });
+
+  return updated;
 }
 
 async function markBackOrder(orderId, input) {
-  const data = await readOrdersData();
-  const order = data.orders.find((entry) => entry.id === orderId);
-  if (!order) throw Object.assign(new Error("Order not found."), { status: 404 });
+  return mutateOrder(orderId, async (order) => {
+  ensureOfficeFulfillmentAllowed(order);
+  if (order.officeShippedAt) throw Object.assign(new Error("A dispatched order cannot be moved to back orders."), { status: 409 });
   const now = new Date().toISOString();
   order.fulfillmentStatus = "back_order";
   order.backOrderReason = cleanText(input.reason, 500);
   order.updatedAt = now;
   order.statusEvents.push({ at: now, actor: "staff", type: "back_order", label: "Sent to back orders" });
-  await writeOrdersData(data);
   return order;
+  });
+}
+
+function ensureOfficeFulfillmentAllowed(order) {
+  if (order.paymentStatus !== "confirmed") throw Object.assign(new Error("Payment must be confirmed first."), { status: 409 });
+  if (!officeFulfillmentItems(order).length) throw Object.assign(new Error("This order has no Office fulfillment."), { status: 409 });
+  if (shopifyOrderSyncEnabled && !order.shopifyOrder?.id) throw Object.assign(new Error("This order must complete stock transfer and Shopify processing before it can be marked as shipped."), { status: 409 });
+}
+
+function safeTrackingUrl(value) {
+  const url = cleanText(value, 500);
+  if (!url) return "";
+  try { if (new URL(url).protocol === "https:") return url; } catch {}
+  throw Object.assign(new Error("Use a valid HTTPS tracking URL."), { status: 400 });
 }
 
 async function markShipped(orderId) {
-  const data = await readOrdersData();
-  const order = data.orders.find((entry) => entry.id === orderId);
-  if (!order) throw Object.assign(new Error("Order not found."), { status: 404 });
-  if (order.paymentStatus !== "confirmed") throw Object.assign(new Error("Payment must be confirmed first."), { status: 409 });
-  if (shopifyFulfillmentItems(order).length && shopifyOrderSyncEnabled && !order.shopifyOrder?.id) {
-    throw Object.assign(new Error("This order must complete stock transfer and Shopify processing before it can be marked as shipped."), { status: 409 });
-  }
-  if (order.officeShippedAt) return order;
-  const now = new Date().toISOString();
-  order.officeShippedAt = now;
-  if (!externalFulfillmentItems(order).length || order.externalTracking?.number) {
-    order.fulfillmentStatus = "shipped";
-    order.shippedAt = now;
-  }
-  order.updatedAt = now;
-  order.statusEvents.push({ at: now, actor: "staff", type: "shipped", label: "Order shipped" });
-  await writeOrdersData(data);
-  await queueOrderEmail(order, "shipped", `office:${now}`);
-  return order;
+  const updated = await mutateOrder(orderId, (order) => {
+    ensureOfficeFulfillmentAllowed(order);
+    if (order.officeShippedAt) return order;
+    if (!order.tracking?.number) throw Object.assign(new Error("Add tracking before marking the order shipped."), { status: 409 });
+    const now = new Date().toISOString();
+    order.officeShippedAt = now;
+    if (!externalFulfillmentItems(order).length || order.externalTracking?.number) {
+      order.fulfillmentStatus = "shipped"; order.shippedAt ||= now;
+    }
+    order.updatedAt = now;
+    order.statusEvents.push({ at: now, actor: "staff", type: "shipped", label: "Order shipped" });
+    return order;
+  });
+
+  return updated;
 }
 
 function emailRuntimeConfig(care = {}) {
@@ -2294,40 +2060,24 @@ function emailRuntimeConfig(care = {}) {
     apiKey: process.env.RESEND_API_KEY || env.RESEND_API_KEY || "",
     from: String(process.env.EMAIL_FROM || env.EMAIL_FROM || "").trim(),
     portalUrl: process.env.PORTAL_PUBLIC_URL || env.PORTAL_PUBLIC_URL || process.env.URL || "https://online-portal-tn.netlify.app/",
-    senderName: care.senderName,
-    replyTo: care.supportEmail,
-    allowed: Boolean(isProduction && dataStorageUsesDatabase() && (!runtime.netlify || runtime.productionDeploy)),
+    senderName: care.senderName || "Tank Nutrition",
+    replyTo: care.supportEmail || process.env.EMAIL_REPLY_TO || env.EMAIL_REPLY_TO || "",
+    allowed: Boolean(runtime.netlify && runtime.productionDeploy && dataStorageUsesDatabase()),
+    reserveSendSlot: reserveEmailSlot,
   };
 }
 
-async function queueOrderEmail(order, kind, eventId, { send = true, care: suppliedCare } = {}) {
-  try {
-    const care = suppliedCare || (await readShopSettingsData()).settings.customerCare;
-    if (!care.events[kind]) return;
-    const config = emailRuntimeConfig(care);
-    const setup = emailSetupStatus(config);
-    const message = createOrderEmail(order, kind, { portalUrl: config.portalUrl, care, eventId });
-    message.status = !care.emailEnabled ? "disabled" : !setup.configured ? "setup_required" : "pending";
-    const inserted = await customerMessages.insert(message);
-    if (inserted.created && message.status === "pending") {
-      // Persist the retry hint before delivery so an interrupted invocation can recover.
-      await portalControl.syncRetry(message).catch(() => console.warn("The email retry hint could not be saved; the notification remains recorded."));
-      if (send && !(await portalControl.read()).paused) {
-        await portalControl.syncRetry(await deliverQueuedEmail(customerMessages, message.id, config));
-      }
-    }
-  } catch {
-    console.warn("Customer notification could not be queued; the order was saved.");
-  }
-}
-
 export async function flushCustomerNotifications() {
-  return createNotificationWorker({
+  const deadline = Date.now() + 18000;
+  const accountResult = await accountEmails.flush({ deadline });
+  const recovered = await notifications.recover({ deadline });
+  const result = await createNotificationWorker({
     control: portalControl, runtimeConfig: emailRuntimeConfig,
     readCare: async () => (await readShopSettingsData()).settings.customerCare,
-    messages: customerMessages, readOrders: async () => (await readOrdersData()).orders,
-    deliver: (id, config) => deliverQueuedEmail(customerMessages, id, config),
-  })();
+    messages: customerMessages, readOrders: async (ids) => records.orders.list({ids,limit:100}),
+    deliver: (id, config) => deliverQueuedEmail(customerMessages, id, { ...config, waitForCapacity: true, deadline }),
+  })({ deadline });
+  return { ...result, recovered: recovered.recovered || 0, securityProcessed: accountResult.processed || 0, sent: (result.sent || 0) + (recovered.sent || 0) + (accountResult.sent || 0) };
 }
 
 function publicSupportRequest(message) {
@@ -2338,7 +2088,7 @@ async function createSupportRequest(input, user) {
   const text = cleanText(input.message, 1500);
   if (text.length < 5) throw Object.assign(new Error("Please enter a message of at least 5 characters."), { status: 400 });
   const orderId = cleanText(input.orderId, 180);
-  const order = orderId ? (await readOrdersData()).orders.find((entry) => entry.id === orderId && entry.customer?.id === user.id) : null;
+  const order = orderId ? await records.orders.get(orderId, {customerId:user.id}) : null;
   if (orderId && !order) throw Object.assign(new Error("Order not found."), { status: 404 });
   const topic = ["Order enquiry", "Payment", "Delivery", "Other"].includes(input.topic) ? input.topic : "Other";
   const requestKey = cleanText(input.idempotencyKey, 180) || randomUUID();
@@ -2362,83 +2112,36 @@ async function replyToSupportRequest(id, input, admin) {
   return updated;
 }
 
-async function syncOrderToShopify(order, admin, options = {}) {
-  const now = new Date().toISOString();
-  if (!shopifyOrderSyncEnabled) {
-    throw Object.assign(new Error("Shopify order sync is disabled. Set SHOPIFY_ORDER_SYNC_ENABLED=true before retrying."), { status: 409 });
-  }
-  if (order.paymentStatus !== "confirmed") {
-    throw Object.assign(new Error("Payment must be confirmed before creating a Shopify order."), { status: 409 });
-  }
-  if (order.specialOrder?.status === "pending" || order.specialOrder?.status === "declined") {
-    throw Object.assign(new Error("This special order is not ready for Shopify sync."), { status: 409 });
-  }
-  if (!shopifyFulfillmentItems(order).length) {
-    order.shopifySync = {
-      status: "external",
-      attemptedAt: now,
-      attemptedBy: cleanText(admin?.username || "admin", 120),
-      syncedAt: new Date().toISOString(),
-      message: "No Retail Shark / Shopify items. Shopify order creation skipped.",
-    };
-    order.statusEvents.push({
-      at: new Date().toISOString(),
-      actor: "system",
-      type: "shopify_order_skipped",
-      label: "Shopify order skipped for external fulfillment",
-    });
-    return { created: false, order: null };
-  }
-  if (order.shopifyOrder?.id) return { created: false, order: order.shopifyOrder };
-  order.shopifySync = {
-    status: "syncing",
-    attemptedAt: now,
-    attemptedBy: cleanText(admin?.username || "admin", 120),
-    message: "Creating Shopify order.",
-  };
-  try {
-    const stock = await retailSharkFulfillmentStock(officeFulfillmentItems(order).map((item) => item.variantId));
-    const missingItems = storageTransferShortfalls(order, stock);
-    if (missingItems.length) {
-      order.shopifySync = {
-        status: "storage_pending",
-        attemptedAt: now,
-        attemptedBy: cleanText(admin?.username || "admin", 120),
-        syncedAt: null,
-        message: `Office stock needed: ${missingItems.map((item) => `${item.productTitle} needs ${item.required}, available ${item.officeAvailable}`).join("; ")}. Transfer stock to Office, then check again.`,
-      };
-      return { created: false, order: null };
+const runOrderSync = createOrderSync({
+  orders: records.orders, enabled: () => shopifyOrderSyncEnabled,
+  officeItems: officeFulfillmentItems,
+  checkStock: async (order) => storageTransferShortfalls(order, await retailSharkFulfillmentStock(officeFulfillmentItems(order).map(item=>item.variantId))),
+  createRemote: createShopifyOrder,
+  findRemote: findShopifyOrder,
+});
+
+async function syncOrderToShopify(orderId, admin) {
+  return runOrderSync(orderId, admin);
+}
+
+async function findShopifyOrder(order) {
+  const query = `#graphql
+    query OnlinePortalFindCreatedOrder($query: String!) {
+      orders(first: 5, query: $query) {
+        nodes {
+          id legacyResourceId name createdAt cancelledAt displayFinancialStatus sourceIdentifier
+          totalPriceSet { shopMoney { amount currencyCode } }
+          lineItems(first: 101) { nodes { quantity variant { id } originalUnitPriceSet { shopMoney { amount currencyCode } } } pageInfo { hasNextPage } }
+        }
+        pageInfo { hasNextPage }
+      }
     }
-    const shopifyOrder = await createShopifyOrder(order);
-    order.shopifyOrder = shopifyOrder;
-    order.shopifySync = {
-      status: "synced",
-      attemptedAt: now,
-      attemptedBy: cleanText(admin?.username || "admin", 120),
-      syncedAt: new Date().toISOString(),
-      message: `Created ${shopifyOrder.name || shopifyOrder.id}.`,
-    };
-    order.statusEvents.push({
-      at: new Date().toISOString(),
-      actor: "system",
-      type: "shopify_order_created",
-      label: `Shopify order ${shopifyOrder.name || shopifyOrder.id} created`,
-    });
-    order.items = (order.items || []).map((item) => {
-      const { storageBackedQuantity, ...rest } = item;
-      return rest;
-    });
-    return { created: true, order: shopifyOrder };
-  } catch (error) {
-    order.shopifySync = {
-      status: "error",
-      attemptedAt: now,
-      attemptedBy: cleanText(admin?.username || "admin", 120),
-      message: friendlyStatusError(error),
-    };
-    if (options.throwOnError) throw error;
-    return { created: false, error };
-  }
+  `;
+  const payload = await shopifyGraphql(query, {query: `source_identifier:"${String(order.id).replaceAll('"','')}"`});
+  const expected = [...officeFulfillmentItems(order), ...(order.courierLine?.variantId && money(order.deliveryFee)>0 ? [{variantId:order.courierLine.variantId,quantity:1,price:money(order.deliveryFee)}] : [])];
+  const remote = verifiedCreatedOrder(payload.data?.orders, order.id, expected);
+  if (!remote) return null;
+  return { id: remote.id, legacyResourceId: remote.legacyResourceId || "", name: remote.name || "", adminUrl: shopifyAdminOrderUrl(remote.legacyResourceId), financialStatus: remote.displayFinancialStatus || "", total: remote.totalPriceSet?.shopMoney?.amount || "", currencyCode: remote.totalPriceSet?.shopMoney?.currencyCode || "ZAR", createdAt: remote.createdAt };
 }
 
 async function createShopifyOrder(order) {
@@ -2479,11 +2182,11 @@ async function createShopifyOrder(order) {
       sendFulfillmentReceipt: false,
     },
   };
-  const payload = await shopifyGraphql(mutation, variables);
+  const payload = await shopifyGraphql(mutation, variables, { mutation: true });
   const result = payload.data?.orderCreate;
   const userErrors = result?.userErrors || [];
   if (userErrors.length) {
-    throw new Error(userErrors.map((entry) => `${entry.field?.join(".") || "order"}: ${entry.message}`).join("; "));
+    throw Object.assign(new Error(userErrors.map((entry) => `${entry.field?.join(".") || "order"}: ${entry.message}`).join("; ")), { noOrderCreated: true });
   }
   if (!result?.order?.id) throw new Error("Shopify did not return a created order.");
   return {
@@ -2511,6 +2214,7 @@ function buildShopifyOrderInput(order, lineItems = shopifyFulfillmentItems(order
     ...lineItems.map((item) => ({
       variantId: item.variantId,
       quantity: item.quantity,
+      priceSet: moneyBag(item.price),
       properties: [
         { name: "Online Portal reference", value: order.reference },
         ...(order.specialOrder ? [{ name: "Order type", value: "Special order" }] : []),
@@ -2552,7 +2256,7 @@ function buildShopifyOrderInput(order, lineItems = shopifyFulfillmentItems(order
       { key: "Online Portal order ID", value: order.id },
       { key: "Payment method", value: providerLabel },
     ],
-    tags: ["Online Portal", "Payment Confirmed", providerLabel, order.reference, ...(order.specialOrder ? ["Special Order"] : [])],
+    tags: ["Online Portal", "op-order-" + order.id, "Payment Confirmed", providerLabel, order.reference, ...(order.specialOrder ? ["Special Order"] : [])],
   };
   if (money(order.deliveryFee) > 0 && !courierLine) {
     input.shippingLines = [
@@ -2667,9 +2371,21 @@ function shopifyAdminOrderUrl(legacyResourceId) {
   return `https://admin.shopify.com/store/${shopifyStoreSubdomain}/orders/${legacyResourceId}`;
 }
 
+const catalogueCache = createCatalogCache({
+  load: loadShopifyCatalog,
+  namespace: runtime.netlify ? [process.env.OP_RUNTIME_CONTEXT, process.env.OP_RUNTIME_DEPLOY_ID, shopifyStoreSubdomain].join(":") : "local",
+  ttlMs: 60_000, staleMs: 300_000, waitMs: 20_000, leaseMs: 35_000, loadTimeoutMs: 28_000,
+  ...(runtime.netlify ? {store: createNetlifyCatalogStore({ sdkVersion: "11.1.8", getStore: async (options) => (await import("@netlify/blobs")).getStore(options) })} : {}),
+});
+
 async function catalogProducts() {
-  const accessToken = await getShopifyAccessToken();
+  return catalogueCache.get({ allowStale: true });
+}
+
+async function loadShopifyCatalog({ signal } = {}) {
+  const accessToken = await getShopifyAccessToken({ signal });
   if (!accessToken) {
+    if (isProduction) throw Object.assign(new Error("Shopify is not configured."), { status: 503 });
     const products = mockCatalogProducts();
     return { source: "mock", products, filters: buildCatalogFilters(products) };
   }
@@ -2738,7 +2454,7 @@ async function catalogProducts() {
   `;
   const productByHandleQuery = `#graphql
     query OnlinePortalProductByHandle($handle: String!) {
-      productByHandle(handle: $handle) {
+      productByHandle: productByIdentifier(identifier: { handle: $handle }) {
         id
         title
         handle
@@ -2767,11 +2483,11 @@ async function catalogProducts() {
     }
   `;
   const [productNodes, collectionNodes] = await Promise.all([
-    fetchShopifyConnection(endpoint, accessToken, productsQuery, "products", { query: "status:active" }, 20),
-    fetchShopifyConnection(endpoint, accessToken, collectionsQuery, "collections", {}, 10),
+    fetchShopifyConnection(endpoint, accessToken, productsQuery, "products", { query: "status:active" }, 20, signal),
+    fetchShopifyConnection(endpoint, accessToken, collectionsQuery, "collections", {}, 10, signal),
   ]);
   const collectionImages = buildCollectionImageLookup(collectionNodes);
-  const courierProduct = await fetchShopifyProductByHandle(endpoint, accessToken, productByHandleQuery, defaultShopSettings().courier.productQuery);
+  const courierProduct = await fetchShopifyProductByHandle(endpoint, accessToken, productByHandleQuery, defaultShopSettings().courier.productQuery, signal);
   const productMap = new Map();
   for (const product of [...productNodes, courierProduct].filter(Boolean)) {
     productMap.set(product.id, product);
@@ -2783,23 +2499,9 @@ async function catalogProducts() {
   return { source: "shopify", products: cachedProducts, filters: buildCatalogFilters(cachedProducts) };
 }
 
-async function fetchShopifyProductByHandle(endpoint, accessToken, query, handle) {
-  if (!handle) return null;
-  try {
-    const response = await fetch(endpoint, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-shopify-access-token": accessToken,
-      },
-      body: JSON.stringify({ query, variables: { handle } }),
-    });
-    const payload = await response.json();
-    if (!response.ok || payload.errors) return null;
-    return payload.data?.productByHandle || null;
-  } catch {
-    return null;
-  }
+async function fetchShopifyProductByHandle(endpoint, accessToken, query, handle, signal) {
+  const payload = await shopifyGraphql(query, { handle }, { signal });
+  return payload.data?.productByHandle || null;
 }
 
 async function retailSharkStorageAvailability() {
@@ -2865,46 +2567,23 @@ function mergeStorageAvailability(products, storageAvailability) {
   });
 }
 
-async function fetchShopifyConnection(endpoint, accessToken, query, connectionName, variables = {}, pageLimit = 5) {
+async function fetchShopifyConnection(endpoint, accessToken, query, connectionName, variables = {}, pageLimit = 5, signal) {
   const nodes = [];
   let after = null;
-  for (let page = 0; page < pageLimit; page += 1) {
-    const response = await fetch(endpoint, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-shopify-access-token": accessToken,
-      },
-      body: JSON.stringify({ query, variables: { ...variables, after } }),
-    });
-    const payload = await response.json();
-    if (!response.ok || payload.errors) {
-      throw new Error(payload.errors?.[0]?.message || `Shopify ${connectionName} request failed with ${response.status}.`);
-    }
+  for (let page = 0; page < pageLimit; page++) {
+    const payload = await shopifyGraphql(query, { ...variables, after }, { signal });
     const connection = payload.data?.[connectionName];
-    nodes.push(...(connection?.nodes || []));
-    if (!connection?.pageInfo?.hasNextPage) break;
+    if (!connection?.pageInfo) throw new Error("Shopify returned an incomplete catalogue.");
+    nodes.push(...(connection.nodes || []));
+    if (!connection.pageInfo.hasNextPage) return nodes;
     after = connection.pageInfo.endCursor;
   }
-  return nodes;
+  throw Object.assign(new Error("The catalogue is larger than the configured fetch limit."), { status: 503 });
 }
 
-async function shopifyGraphql(query, variables = {}) {
-  const accessToken = await getShopifyAccessToken();
-  if (!accessToken) throw Object.assign(new Error("Shopify access token is not configured."), { status: 409 });
-  const response = await fetch(`https://${shopifyStoreSubdomain}.myshopify.com/admin/api/${shopifyApiVersion}/graphql.json`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-shopify-access-token": accessToken,
-    },
-    body: JSON.stringify({ query, variables }),
-  });
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok || payload.errors) {
-    throw new Error(payload.errors?.map((entry) => entry.message).join("; ") || `Shopify request failed with ${response.status}.`);
-  }
-  return payload;
+const shopifyRequest = createShopifyClient({ endpoint: `https://${shopifyStoreSubdomain}.myshopify.com/admin/api/${shopifyApiVersion}/graphql.json`, getAccessToken: getShopifyAccessToken });
+async function shopifyGraphql(query, variables = {}, options = {}) {
+  return shopifyRequest(query, variables, options);
 }
 
 async function fetchJsonWithTimeout(url, options = {}, timeoutMs = 3500) {
@@ -2922,7 +2601,15 @@ async function fetchJsonWithTimeout(url, options = {}, timeoutMs = 3500) {
 async function systemStatus() {
   const checkedAt = new Date().toISOString();
   const [retailShark, shopify, orders] = await Promise.all([checkRetailSharkStatus(checkedAt), checkShopifyStatus(checkedAt), checkOrdersStatus(checkedAt)]);
-  return { checkedAt, systems: [retailShark, shopify, orders] };
+  const cache = catalogueCache.status();
+  const cacheState = cache.lastErrorCode && !cache.fresh ? "error" : "online";
+  const detail = cache.loadedAt ? `Last refreshed ${new Date(cache.loadedAt).toISOString()}. Shared cache lifetime: 60 seconds.` : "Ready. The catalogue loads on demand without background refreshes.";
+  let care = null;
+  try { care = (await readShopSettingsData()).settings.customerCare; } catch { /* Preserve other system checks when settings cannot load. */ }
+  const emailReady = care && emailSetupStatus(emailRuntimeConfig(care)).configured;
+  return { checkedAt, systems: [retailShark, shopify, orders, statusEntry("catalog-cache","Catalogue cache",cacheState,detail,checkedAt),
+    statusEntry("email", "Email delivery", !care ? "error" : emailReady ? "configured" : "offline", !care ? "Email settings could not be loaded." : emailReady ? "Sending configuration is present. Check Email delivery for actual delivery outcomes." : "Email sending is not configured for this environment.", checkedAt)], cache,
+    capabilities: { shopifySyncEnabled: shopifyOrderSyncEnabled, orderEmailsEnabled: care?.emailEnabled ?? null, accountEmailsEnabled: care?.securityEmailsEnabled ?? null } };
 }
 
 async function checkRetailSharkStatus(checkedAt) {
@@ -2967,9 +2654,8 @@ async function checkShopifyStatus(checkedAt) {
 
 async function checkOrdersStatus(checkedAt) {
   try {
-    const data = await readOrdersData();
-    const storeLabel = dataStorageUsesDatabase() ? "Postgres" : dataStorageUsesBlobs() ? "Netlify Blobs" : "local storage";
-    return statusEntry("orders", "Orders database", "online", `${data.orders.length} order${data.orders.length === 1 ? "" : "s"} available in ${storeLabel}.`, checkedAt);
+    const count = await records.orders.count();
+    return statusEntry("orders", "Orders database", "online", `${count} orders available in ${dataStorageUsesDatabase() ? "Postgres" : "local storage"}.`, checkedAt);
   } catch (error) {
     return statusEntry("orders", "Orders database", "error", friendlyStatusError(error), checkedAt);
   }
@@ -2987,7 +2673,7 @@ function friendlyStatusError(error) {
 function normalizeCatalogProduct(product, collectionImages = new Map()) {
   const variant = product.variants?.nodes?.[0];
   const inventoryQuantity = Number(variant?.inventoryQuantity);
-  const hasQuantity = Number.isFinite(inventoryQuantity);
+  const hasQuantity = variant?.inventoryQuantity != null && Number.isFinite(inventoryQuantity);
   const brandImage = collectionImageForVendor(product.vendor, collectionImages);
   const featuredImage = product.featuredMedia?.preview?.image;
   const images = [...new Map([featuredImage, ...(product.media?.nodes || []).map((media) => media.image)].filter((image) => image?.url).map((image) => [image.url, { url: image.url, alt: image.altText || product.title }])).values()].slice(0, 8);
@@ -3095,12 +2781,7 @@ async function paymentProofBlobStore() {
 }
 
 function parseProofDataUrl(input) {
-  const match = String(input || "").match(/^data:([^;]+);base64,(.+)$/);
-  if (!match) throw new Error("Proof upload was not a valid file.");
-  return {
-    contentType: cleanText(match[1] || "application/octet-stream", 120) || "application/octet-stream",
-    buffer: Buffer.from(match[2], "base64"),
-  };
+  return parsePaymentProof(input);
 }
 
 function proofBlobKey(order, filename) {
@@ -3150,31 +2831,22 @@ async function readProofFile(proof) {
   return readFile(proofPath);
 }
 
-async function getShopifyAccessToken() {
+async function getShopifyAccessToken({ signal } = {}) {
   if (shopifyToken) return shopifyToken;
   if (!shopifyClientId || !shopifyClientSecret) return "";
-  const now = Date.now();
-  if (shopifyClientCredentialsToken && shopifyClientCredentialsToken.expiresAt > now + 60_000) {
+  if (shopifyClientCredentialsToken?.expiresAt > Date.now()+60_000) return shopifyClientCredentialsToken.token;
+  if (!shopifyTokenFlight) shopifyTokenFlight = (async () => {
+    const response = await fetch(`https://${shopifyStoreSubdomain}.myshopify.com/admin/oauth/access_token`, {
+      method:"POST",headers:{"content-type":"application/json"},signal:AbortSignal.timeout(7_000),
+      body:JSON.stringify({client_id:shopifyClientId,client_secret:shopifyClientSecret,grant_type:"client_credentials"}),
+    });
+    const payload=await response.json();
+    if (!response.ok || !payload.access_token) throw Object.assign(new Error("Shopify access could not be refreshed."),{status:503,noOrderCreated:true});
+    shopifyClientCredentialsToken={token:payload.access_token,expiresAt:Date.now()+Math.max(1,Number(payload.expires_in||3600))*1000};
     return shopifyClientCredentialsToken.token;
-  }
-  const response = await fetch(`https://${shopifyStoreSubdomain}.myshopify.com/admin/oauth/access_token`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      client_id: shopifyClientId,
-      client_secret: shopifyClientSecret,
-      grant_type: "client_credentials",
-    }),
-  });
-  const payload = await response.json();
-  if (!response.ok || !payload.access_token) {
-    throw new Error(payload.error_description || payload.error || `Shopify token request failed with ${response.status}.`);
-  }
-  shopifyClientCredentialsToken = {
-    token: payload.access_token,
-    expiresAt: now + Math.max(1, Number(payload.expires_in || 3600)) * 1000,
-  };
-  return shopifyClientCredentialsToken.token;
+  })().finally(()=>{shopifyTokenFlight=null;});
+  if (signal?.aborted) throw signal.reason;
+  return shopifyTokenFlight;
 }
 
 function buildCatalogFilters(products) {
@@ -3266,7 +2938,7 @@ function mockCatalogProducts() {
     {
       id: "mock-courier",
       title: "Courier",
-      handle: "courier",
+      handle: "pudo-courier",
       vendor: "Tank Nutrition",
       productType: "Service",
       tags: ["Courier"],
@@ -3303,23 +2975,46 @@ function publicCatalogProduct(product) {
 }
 
 function requireInternal(req) {
-  if (req.headers["x-internal-token"] !== internalToken) {
+  if (!secureTextEqual(req.headers["x-internal-token"], internalToken)) {
     throw Object.assign(new Error("Internal token is required."), { status: 401 });
   }
 }
 
+function pageRequest(url) {
+  const parse=(key,fallback,max)=>{const value=Number(url.searchParams.get(key) ?? fallback);return Number.isFinite(value)?Math.min(max,Math.max(0,Math.floor(value))):fallback;};
+  return {limit:Math.max(1,parse("limit",50,100)),offset:parse("offset",0,1_000_000)};
+}
+function pageResult(rows, {limit,offset}) {
+  const hasMore=rows.length>limit;
+  if (hasMore) rows.length=limit;
+  return {limit,offset,hasMore};
+}
+async function listSharkOrders(history) {
+  const result=[];
+  for(let offset=0;;offset+=500) {
+    const batch=await records.orders.list({internal:history?"history":"confirmed",shopifySyncRequired:shopifyOrderSyncEnabled,limit:500,offset});
+    result.push(...batch.filter(history?orderCompletedForRetailShark:orderReadyForRetailShark));
+    if(batch.length<500) return result;
+  }
+}
+
 async function handleApi(req, res, url) {
-  applyRouteRateLimit(req, url);
+  if (req.method === "POST" && url.pathname === "/api/webhooks/resend") {
+    const chunks = []; let size = 0;
+    for await (const chunk of req) { size += chunk.length; if (size > 256000) throw Object.assign(new Error("Webhook body is too large."), { status: 413 }); chunks.push(chunk); }
+    const result = await receiveEmailWebhook(Buffer.concat(chunks).toString("utf8"), req.headers);
+    return json(res, 200, { ok: true, ...result });
+  }
   requirePortalClientHeader(req, url);
   if (req.method === "GET" && url.pathname === "/api/portal-status") {
     return json(res, 200, { ok: true, ...publicPortalStatus(await portalControl.read()) });
   }
   if (url.pathname.startsWith("/api/admin/portal-control")) {
-    const admin = requireAdmin(req);
+    const admin = await requireAdmin(req);
     const control = await portalControl.read();
     if (req.method === "GET" && url.pathname === "/api/admin/portal-control") return json(res, 200, { ok: true, control });
     if (req.method === "POST") {
-      rateLimit(req, "portal-control", 12, 10 * 60 * 1000);
+      await rateLimit(req, "portal-control", 12, 10 * 60 * 1000);
       const body = await bodyJson(req);
       if (url.pathname === "/api/admin/portal-control/review") {
         if (body.acknowledged !== true || body.revision !== control.revision || control.paused) throw Object.assign(new Error("Review the current portal availability before continuing."), { status: 409 });
@@ -3348,6 +3043,63 @@ async function handleApi(req, res, url) {
     if (url.pathname.startsWith("/api/internal/")) requireInternal(req);
     if ((await portalControl.read()).paused) throw Object.assign(new Error("Portal paused. Customer access and background updates are temporarily unavailable."), { status: 503, code: "PORTAL_PAUSED" });
   }
+  await applyRouteRateLimit(req, url);
+  if (req.method === "POST" && url.pathname === "/api/auth/password/request") {
+    const input = await bodyJson(req);
+    const address = cleanText(input.email, 180).toLowerCase();
+    afterResponse(req, () => accountEmails.requestByEmail(address));
+    return json(res, 202, { ok: true, message: "If an eligible account uses this email address, a password reset link will arrive shortly. Check your spam folder too." });
+  }
+  if (req.method === "POST" && ["/api/auth/email/confirm", "/api/auth/password/reset"].includes(url.pathname)) {
+    const input = await bodyJson(req), purpose = url.pathname.endsWith("/reset") ? "reset" : "verify";
+    const result = await accountEmails.consume({ ...input, purpose });
+    if (result.noticeId) afterResponse(req, () => accountEmails.send(result.noticeId));
+    return json(res, 200, { ok: true, message: purpose === "reset" ? "Your password has been updated. Sign in with your new password." : "Your email address is verified. You can now place orders." }, purpose === "reset" ? { "set-cookie": clearSession() } : {});
+  }
+  if (req.method === "GET" && url.pathname === "/api/account/email-status") {
+    const user = await sessionAccount(req), care = (await readShopSettingsData()).settings.customerCare;
+    return json(res, 200, { ok: true, emailVerified: emailIsVerified(user), eligibleEmail: realEmail(user.email),
+      requiredForOrders: care.requireVerifiedEmailForOrders, ready: care.securityEmailsEnabled && emailSetupStatus(emailRuntimeConfig(care)).configured });
+  }
+  if (req.method === "POST" && url.pathname === "/api/account/email") {
+    const user = await requireCustomer(req), input = await bodyJson(req);
+    if (emailIsVerified(user)) throw Object.assign(new Error("Contact support to change a verified email address."), { status: 409 });
+    const email = cleanText(input.email, 180).toLowerCase();
+    if (!realEmail(email)) throw Object.assign(new Error("Enter a working email address."), { status: 400 });
+    if (!await verifyPasswordAsync(input.password, user.passwordHash)) throw Object.assign(new Error("Your current password is incorrect."), { status: 400 });
+    const updated = await records.users.update(user.id, current => {
+      if (current.role !== "customer" || current.passwordHash !== user.passwordHash || emailIsVerified(current)) throw Object.assign(new Error("Your account changed. Sign in again before updating your email."), { status: 409 });
+      if (current.email === email) return null;
+      return { ...current, email, emailVerifiedAt: null, emailVerifiedAddress: null, emailActions: {}, updatedAt: new Date().toISOString() };
+    });
+    if (!updated) throw Object.assign(new Error("Please sign in again."), { status: 401 });
+    afterResponse(req, () => accountEmails.request(updated.id, "verify"));
+    return json(res, 200, { ok: true, user: publicUser(updated), message: "Email address updated. Check the new address for verification." });
+  }
+  if (req.method === "POST" && url.pathname === "/api/account/email/verification") {
+    const user = await sessionAccount(req);
+    if (!realEmail(user.email)) throw Object.assign(new Error("Add a working email address to your account before requesting verification."), { status: 400 });
+    if (emailIsVerified(user)) return json(res, 200, { ok: true, message: "Your email address is already verified." });
+    if ((await readShopSettingsData()).settings.customerCare.securityEmailsEnabled === false) throw Object.assign(new Error("Account emails are temporarily unavailable. Please contact support."), { status: 409 });
+    afterResponse(req, () => accountEmails.request(user.id, "verify"));
+    return json(res, 202, { ok: true, message: "Verification requested. Check your inbox and spam folder. You can request another email after one minute." });
+  }
+  const adminVerificationMatch = url.pathname.match(/^\/api\/admin\/accounts\/([^/]+)\/verification-email$/);
+  if (req.method === "POST" && adminVerificationMatch) {
+    await requireAdmin(req);
+    const user = await records.users.get(decodeURIComponent(adminVerificationMatch[1]));
+    if (!user || !realEmail(user.email)) throw Object.assign(new Error("This account needs a working email address first."), { status: 400 });
+    if ((await readShopSettingsData()).settings.customerCare.securityEmailsEnabled === false) throw Object.assign(new Error("Enable account emails in Customer communication before requesting verification."), { status: 409 });
+    afterResponse(req, () => accountEmails.request(user.id, "verify"));
+    return json(res, 202, { ok: true, message: "Verification email requested for the account's saved address." });
+  }
+  if (req.method === "GET" && url.pathname === "/api/admin/notifications") {
+    await requireAdmin(req);
+    const paging = pageRequest(url), care = (await readShopSettingsData()).settings.customerCare;
+    const result = await customerMessages.emailPage({ ...paging, search: url.searchParams.get("search"), event: url.searchParams.get("event") || "all", status: url.searchParams.get("status") || "all" });
+    await Promise.all(result.emails.filter(message => ["pending", "failed", "sending"].includes(message.status)).map(message => (message.category === "security" ? securityEmailRetries : portalControl).syncRetry(message)));
+    return json(res, 200, { ok: true, ...result, emails: result.emails.map(publicEmail), emailSetup: { ...emailSetupStatus(emailRuntimeConfig(care)), enabled: care.emailEnabled, securityEnabled: care.securityEmailsEnabled, webhookConfigured: Boolean(process.env.RESEND_WEBHOOK_SECRET || env.RESEND_WEBHOOK_SECRET) } });
+  }
   if (req.method === "GET" && url.pathname === "/api/catalog") {
     await requirePortalAccess(req);
     const settings = (await readShopSettingsData()).settings;
@@ -3373,14 +3125,14 @@ async function handleApi(req, res, url) {
     return json(res, 200, { ok: true });
   }
   if (req.method === "GET" && url.pathname === "/api/admin/search") {
-    requireAdmin(req);
+    await requireAdmin(req);
     await customerMessages.pruneSearchMisses(new Date(Date.now() - 30 * 86400000).toISOString());
     const misses = await customerMessages.list({ kind: "search_miss", limit: 300 });
     return json(res, 200, { ok: true, misses: misses.map(({ id, query, count, status, updatedAt }) => ({ id, query, count, status, updatedAt })) });
   }
   const searchMissMatch = url.pathname.match(/^\/api\/admin\/search\/([^/]+)\/resolve$/);
   if (req.method === "POST" && searchMissMatch) {
-    requireAdmin(req);
+    await requireAdmin(req);
     await customerMessages.update(decodeURIComponent(searchMissMatch[1]), (entry) => entry.kind === "search_miss" ? { ...entry, status: "resolved", updatedAt: new Date().toISOString() } : null);
     return json(res, 200, { ok: true });
   }
@@ -3395,35 +3147,32 @@ async function handleApi(req, res, url) {
     return json(res, 201, { ok: true, request });
   }
   if (req.method === "GET" && url.pathname === "/api/admin/customer-care") {
-    requireAdmin(req);
-    const care = (await readShopSettingsData()).settings.customerCare;
-    const [requests, emails] = await Promise.all([customerMessages.list({ kind: "support", limit: 200 }), customerMessages.list({ kind: "email", limit: 80 })]);
-    // Recover existing pending records during this deliberate admin read, never
-    // through an idle database scan. Also repairs an interrupted hint write.
-    await Promise.all(emails.filter((message) => ["pending", "failed", "sending"].includes(message.status)).map((message) => portalControl.syncRetry(message)))
-      .catch(() => console.warn("Email retry hints could not be refreshed; delivery records remain available."));
-    return json(res, 200, { ok: true, requests, emails: emails.map(({ id, reference, event, to, subject, status, attempts, lastError, sentAt, createdAt }) => ({ id, reference, event, to, subject, status, attempts, lastError, sentAt, createdAt })), emailSetup: { ...emailSetupStatus(emailRuntimeConfig(care)), enabled: care.emailEnabled } });
+    await requireAdmin(req);
+    return json(res, 200, { ok: true, ...(await customerMessages.supportPage({ ...pageRequest(url), status: url.searchParams.get("status") || "open" })) });
   }
   const supportReplyMatch = url.pathname.match(/^\/api\/admin\/support\/([^/]+)\/reply$/);
   if (req.method === "POST" && supportReplyMatch) {
-    const admin = requireAdmin(req);
+    const admin = await requireAdmin(req);
     const request = await replyToSupportRequest(decodeURIComponent(supportReplyMatch[1]), await bodyJson(req), admin);
     return json(res, 200, { ok: true, request });
   }
   const emailRetryMatch = url.pathname.match(/^\/api\/admin\/notifications\/([^/]+)\/retry$/);
   if (req.method === "POST" && emailRetryMatch) {
-    requireAdmin(req);
+    await requireAdmin(req);
     if ((await portalControl.read()).paused) throw Object.assign(new Error("Open the portal before retrying email delivery."), { status: 409 });
     const care = (await readShopSettingsData()).settings.customerCare;
     const config = emailRuntimeConfig(care);
     if (!care.emailEnabled || !emailSetupStatus(config).configured) throw Object.assign(new Error("Configure and enable email delivery first."), { status: 409 });
     const id = decodeURIComponent(emailRetryMatch[1]);
-    const orders = (await readOrdersData()).orders;
+    const email = (await customerMessages.getMany([id]))[0];
+    if (email?.category === "security") throw Object.assign(new Error("Request a new verification or recovery email instead of resending an old security link."), { status: 409 });
+    if (email?.deliveryStatus) throw Object.assign(new Error("The email service has already reported an outcome for this message. Review its delivery history instead of resending it."), { status: 409 });
+    const associatedOrder = email?.orderId ? await records.orders.get(email.orderId) : null;
     const message = await customerMessages.update(id, (entry) => {
       if (entry.kind !== "email" || ["sent", "expired", "superseded"].includes(entry.status) || (entry.status === "sending" && Date.parse(entry.lockedUntil || 0) > Date.now())) return null;
-      const order = orders.find((item) => item.id === entry.orderId);
+      const order = associatedOrder;
       if (!order || !care.events[entry.event] || Date.now() - Date.parse(entry.createdAt) >= 23 * 60 * 60 * 1000 || (entry.event === "payment_ready" && (order.paymentStatus === "confirmed" || order.specialOrder?.status === "declined"))) return null;
-      return { ...entry, status: "pending", attempts: 0, nextAttemptAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+      return { ...entry, status: "pending", permanentFailure: false, attempts: 0, nextAttemptAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
     });
     if (!message) throw Object.assign(new Error("This notification is not available for retry."), { status: 409 });
     await portalControl.syncRetry(message);
@@ -3434,35 +3183,36 @@ async function handleApi(req, res, url) {
   if (req.method === "POST" && url.pathname === "/api/cart/check") {
     await requireCustomer(req);
     const input = await bodyJson(req);
-    const catalog = await catalogProducts();
     const settings = (await readShopSettingsData()).settings;
-    const routedProducts = applyFulfillmentSettingsToProducts(catalog.products, settings.fulfillment);
-    validateCartItems(input.items, routedProducts, { allowSpecial: Boolean(input.specialOrder), courier: settings.courier, fulfillment: settings.fulfillment });
-    return json(res, 200, { ok: true });
+    const products = await liveCartProducts(input.items, settings);
+    const routedProducts = applyFulfillmentSettingsToProducts(products, settings.fulfillment);
+    const items = validateCartItems(input.items, routedProducts, { allowSpecial: Boolean(input.specialOrder), courier: settings.courier, fulfillment: settings.fulfillment });
+    const subtotal = money(items.reduce((sum,item)=>sum+item.price*item.quantity,0));
+    const deliveryFee = settings.courier.enabled ? money(settings.courier.amount) : 0;
+    return json(res, 200, { ok: true, items: publicOrderItems(items), subtotal, deliveryFee, total: money(subtotal+deliveryFee) });
   }
   if (req.method === "GET" && url.pathname === "/api/auth/me") {
-    const session = sessionFromRequest(req);
-    if (!session) return json(res, 200, { ok: true, user: null, admin: null });
-    if (session.kind === "admin") {
-      const data = await readUsersData();
-      const admin = data.users.find((entry) => entry.id === session.userId && entry.role === "admin");
-      if (!admin) return json(res, 200, { ok: true, user: null, admin: null }, { "set-cookie": clearSession() });
-      return json(res, 200, { ok: true, user: null, admin: publicAdmin(admin) });
+    if (!sessionFromRequest(req)) return json(res,200,{ok:true,user:null,admin:null});
+    try {
+      const user = await sessionAccount(req);
+      return json(res,200,{ok:true,user:user.role === "customer" ? publicUser(user) : null,admin:user.role === "admin" ? publicAdmin(user) : null});
+    } catch (error) {
+      if (error.status !== 401) throw error;
+      return json(res,200,{ok:true,user:null,admin:null},{"set-cookie":clearSession()});
     }
-    const user = await requireCustomer(req);
-    return json(res, 200, { ok: true, user: publicUser(user), admin: null });
   }
   if (req.method === "POST" && url.pathname === "/api/auth/register") {
     const user = await registerCustomer(await bodyJson(req));
-    return json(res, 201, { ok: true, user: publicUser(user) }, { "set-cookie": createSession({ kind: "customer", userId: user.id }) });
+    afterResponse(req, () => accountEmails.request(user.id, "verify"));
+    return json(res, 201, { ok: true, user: publicUser(user) }, { "set-cookie": createSession({ kind: "customer", userId: user.id, credentialVersion: sessionCredentialVersion(user, sessionSecret) }) });
   }
   if (req.method === "POST" && url.pathname === "/api/auth/login") {
     const user = await loginCustomer(await bodyJson(req));
-    return json(res, 200, { ok: true, user: publicUser(user) }, { "set-cookie": createSession({ kind: "customer", userId: user.id }) });
+    return json(res, 200, { ok: true, user: publicUser(user) }, { "set-cookie": createSession({ kind: "customer", userId: user.id, credentialVersion: sessionCredentialVersion(user, sessionSecret) }) });
   }
   if (req.method === "POST" && url.pathname === "/api/auth/admin-login") {
     const admin = await loginAdmin(await bodyJson(req));
-    return json(res, 200, { ok: true, admin: publicAdmin(admin) }, { "set-cookie": createSession({ kind: "admin", username: admin.username, userId: admin.id }) });
+    return json(res, 200, { ok: true, admin: publicAdmin(admin) }, { "set-cookie": createSession({ kind: "admin", username: admin.username, userId: admin.id, credentialVersion: sessionCredentialVersion(admin, sessionSecret) }) });
   }
   if (req.method === "POST" && url.pathname === "/api/auth/logout") {
     return json(res, 200, { ok: true }, { "set-cookie": clearSession() });
@@ -3502,18 +3252,28 @@ async function handleApi(req, res, url) {
   }
   if (req.method === "GET" && url.pathname === "/api/orders") {
     const user = await requireCustomer(req);
-    const data = await readOrdersData();
-    const orders = (await withDeliveryReceipts(data.orders.filter((order) => order.customer?.id === user.id))).map(publicOrder);
-    return json(res, 200, { ok: true, orders });
+    const paging = pageRequest(url);
+    const [rows,activeRows] = await Promise.all([records.orders.list({ customerId:user.id,limit:paging.limit+1,offset:paging.offset }), records.orders.list({customerId:user.id,active:true,limit:10})]);
+    const page = pageResult(rows,paging);
+    const decorated = await withDeliveryReceipts([...new Map([...rows,...activeRows].map(order=>[order.id,order])).values()]);
+    const byId = new Map(decorated.map(order=>[order.id,order]));
+    return json(res,200,{ok:true,orders:rows.map(order=>publicOrder(byId.get(order.id))),activeOrders:activeRows.map(order=>publicOrder(byId.get(order.id))),page});
+  }
+  const ownOrderMatch = url.pathname.match(/^\/api\/orders\/([^/]+)$/);
+  if (req.method === "GET" && ownOrderMatch) {
+    const user = await requireCustomer(req);
+    const order = await records.orders.get(decodeURIComponent(ownOrderMatch[1]), {customerId:user.id});
+    if (!order) throw Object.assign(new Error("Order not found."),{status:404});
+    return json(res,200,{ok:true,order:publicOrder((await withDeliveryReceipts([order]))[0])});
   }
   const deliveryConfirmationMatch = url.pathname.match(/^\/api\/orders\/([^/]+)\/delivery-confirmation$/);
   if (req.method === "POST" && deliveryConfirmationMatch) {
     const user = await requireCustomer(req);
     const orderId = decodeURIComponent(deliveryConfirmationMatch[1]);
-    const order = (await readOrdersData()).orders.find((entry) => entry.id === orderId && entry.customer?.id === user.id);
+    const order = await records.orders.get(orderId, {customerId:user.id});
     if (!order) throw Object.assign(new Error("Order not found."), { status: 404 });
     const input = await bodyJson(req);
-    const settings = (await readShopSettingsData()).settings.deliveryConfirmation;
+    const settings = await deliveryConfirmationSettings();
     await recordDeliveryResponse(customerMessages, order, user.id, input.action, settings, orderShippingRequirements(order));
     return json(res, 200, { ok: true, order: publicOrder((await withDeliveryReceipts([order]))[0]) });
   }
@@ -3537,103 +3297,136 @@ async function handleApi(req, res, url) {
   }
   const adminConfirmMatch = url.pathname.match(/^\/api\/admin\/orders\/([^/]+)\/confirm-payment$/);
   if (req.method === "POST" && adminConfirmMatch) {
-    const admin = requireAdmin(req);
+    const admin = await requireAdmin(req);
     const order = await confirmPayment(decodeURIComponent(adminConfirmMatch[1]), await bodyJson(req), admin);
     return json(res, 200, { ok: true, order: staffOrder(order) });
   }
   const adminPaymentLinkMatch = url.pathname.match(/^\/api\/admin\/orders\/([^/]+)\/payment-link$/);
   if (req.method === "POST" && adminPaymentLinkMatch) {
-    const admin = requireAdmin(req);
+    const admin = await requireAdmin(req);
     const order = await attachPaymentLink(decodeURIComponent(adminPaymentLinkMatch[1]), await bodyJson(req), admin);
     return json(res, 200, { ok: true, order: staffOrder(order) });
   }
   const adminPaymentIssueResolveMatch = url.pathname.match(/^\/api\/admin\/orders\/([^/]+)\/payment-issue\/resolve$/);
   if (req.method === "POST" && adminPaymentIssueResolveMatch) {
-    const admin = requireAdmin(req);
+    const admin = await requireAdmin(req);
     const order = await resolvePaymentIssue(decodeURIComponent(adminPaymentIssueResolveMatch[1]), admin);
     return json(res, 200, { ok: true, order: staffOrder(order) });
   }
   const adminStockTransferCheckMatch = url.pathname.match(/^\/api\/admin\/orders\/([^/]+)\/check-stock-transfer$/);
   if (req.method === "POST" && adminStockTransferCheckMatch) {
-    const admin = requireAdmin(req);
+    const admin = await requireAdmin(req);
     const order = await checkStorageTransfer(decodeURIComponent(adminStockTransferCheckMatch[1]), admin);
     return json(res, 200, { ok: true, order: staffOrder(order) });
   }
   const adminShopifySyncMatch = url.pathname.match(/^\/api\/admin\/orders\/([^/]+)\/sync-shopify$/);
   if (req.method === "POST" && adminShopifySyncMatch) {
-    const admin = requireAdmin(req);
+    const admin = await requireAdmin(req);
     const order = await syncConfirmedOrder(decodeURIComponent(adminShopifySyncMatch[1]), admin);
     return json(res, 200, { ok: true, order: staffOrder(order) });
   }
   const adminSpecialOrderMatch = url.pathname.match(/^\/api\/admin\/orders\/([^/]+)\/special-order$/);
   if (req.method === "POST" && adminSpecialOrderMatch) {
-    const admin = requireAdmin(req);
+    const admin = await requireAdmin(req);
     const order = await reviewSpecialOrder(decodeURIComponent(adminSpecialOrderMatch[1]), await bodyJson(req), admin);
     return json(res, 200, { ok: true, order: staffOrder(order) });
   }
   const adminFulfillmentMatch = url.pathname.match(/^\/api\/admin\/orders\/([^/]+)\/fulfillment$/);
   if (req.method === "POST" && adminFulfillmentMatch) {
-    const admin = requireAdmin(req);
+    const admin = await requireAdmin(req);
     const order = await reviewFulfillment(decodeURIComponent(adminFulfillmentMatch[1]), await bodyJson(req), admin);
     return json(res, 200, { ok: true, order: staffOrder(order) });
   }
   const adminStockMatch = url.pathname.match(/^\/api\/admin\/orders\/([^/]+)\/stock$/);
   if (req.method === "GET" && adminStockMatch) {
-    requireAdmin(req);
-    const data = await readOrdersData();
-    const order = data.orders.find((entry) => entry.id === decodeURIComponent(adminStockMatch[1]));
+    await requireAdmin(req);
+    const order = await records.orders.get(decodeURIComponent(adminStockMatch[1]));
     if (!order) throw Object.assign(new Error("Order not found."), { status: 404 });
     return json(res, 200, { ok: true, stock: await retailSharkFulfillmentStock((order.items || []).map((item) => item.variantId)) });
   }
   const adminExternalTrackingMatch = url.pathname.match(/^\/api\/admin\/orders\/([^/]+)\/external-tracking$/);
   if (req.method === "POST" && adminExternalTrackingMatch) {
-    const admin = requireAdmin(req);
+    const admin = await requireAdmin(req);
     const order = await updateExternalTracking(decodeURIComponent(adminExternalTrackingMatch[1]), await bodyJson(req), admin);
     return json(res, 200, { ok: true, order: staffOrder(order) });
   }
+  if (req.method === "GET" && url.pathname === "/api/admin/dashboard") {
+    await requireAdmin(req);
+    const period = reportingPeriod(url.searchParams);
+    const results = await Promise.allSettled([
+      records.orders.overview({ ...period, shopifySyncRequired: shopifyOrderSyncEnabled }),
+      customerMessages.overview(),
+      records.orders.list({ ...period, limit: 8 }),
+    ]);
+    const value = index => results[index].status === "fulfilled" ? results[index].value : null;
+    return json(res, 200, { ok: true, checkedAt: new Date().toISOString(), period, orders: value(0), messages: value(1),
+      recent: value(2)?.map(order => ({ id: order.id, reference: order.reference, customerName: order.customer?.name || "Customer", createdAt: order.createdAt, total: order.total,
+        paymentStatus: order.paymentStatus, fulfillmentStatus: order.fulfillmentStatus, specialStatus: order.specialOrder?.status || null })),
+      unavailable: ["orders", "messages", "recent"].filter((_, index) => results[index].status === "rejected"),
+      shopifySyncEnabled: shopifyOrderSyncEnabled });
+  }
   if (req.method === "GET" && url.pathname === "/api/admin/orders") {
-    requireAdmin(req);
-    const data = await readOrdersData();
-    return json(res, 200, { ok: true, orders: (await withDeliveryReceipts(data.orders)).map(staffOrder) });
+    await requireAdmin(req);
+    const paging=pageRequest(url);
+    const period = reportingPeriod(url.searchParams, { defaultPeriod: "all" });
+    const options = { ...period, view:url.searchParams.get("view") || "all", filter:url.searchParams.get("filter") || "all", search:cleanText(url.searchParams.get("search"),180), queue: url.searchParams.get("queue") || undefined, shopifySyncRequired: shopifyOrderSyncEnabled };
+    const [rows, total] = await Promise.all([records.orders.list({ ...options, ...paging, limit:paging.limit+1 }), records.orders.count(options)]);
+    const page=pageResult(rows,paging);
+    return json(res,200,{ok:true,orders:(await withDeliveryReceipts(rows)).map(staffOrder),page,total,period});
   }
   if (req.method === "GET" && url.pathname === "/api/admin/accounts") {
-    requireAdmin(req);
-    return json(res, 200, { ok: true, accounts: await listAccounts() });
+    await requireAdmin(req);
+    const paging=pageRequest(url);
+    const role=url.searchParams.get("role") || "all";
+    if (!["all","admin","customer"].includes(role)) throw Object.assign(new Error("Choose a valid account type."),{status:400});
+    const [rows,counts]=await Promise.all([records.users.list({ ...paging,limit:paging.limit+1,...(role!=="all"?{role}:{}) }),records.users.counts()]);
+    const page=pageResult(rows,paging);
+    return json(res,200,{ok:true,accounts:rows.map(publicAccount),counts,page});
   }
   if (req.method === "POST" && url.pathname === "/api/admin/accounts") {
-    requireAdmin(req);
+    await requireAdmin(req);
     const account = await createAccountByAdmin(await bodyJson(req));
     return json(res, 201, { ok: true, account: publicAccount(account) });
   }
   const adminAccountMatch = url.pathname.match(/^\/api\/admin\/accounts\/([^/]+)$/);
   if (req.method === "PUT" && adminAccountMatch) {
-    const admin = requireAdmin(req);
+    const admin = await requireAdmin(req);
     const account = await updateAccountByAdmin(decodeURIComponent(adminAccountMatch[1]), await bodyJson(req), admin);
-    return json(res, 200, { ok: true, account: publicAccount(account), admin: admin.userId === account.id ? publicAdmin(account) : null });
+    return json(res, 200, { ok: true, account: publicAccount(account), admin: admin.userId === account.id ? publicAdmin(account) : null }, admin.userId === account.id ? { "set-cookie": createSession({ kind: "admin", username: account.username, userId: account.id, credentialVersion: sessionCredentialVersion(account, sessionSecret) }) } : {});
   }
   if (req.method === "DELETE" && adminAccountMatch) {
-    const admin = requireAdmin(req);
+    const admin = await requireAdmin(req);
     const account = await removeAccountByAdmin(decodeURIComponent(adminAccountMatch[1]), await bodyJson(req), admin);
     return json(res, 200, { ok: true, account: publicAccount(account) });
   }
+  if (req.method === "POST" && url.pathname === "/api/admin/catalog/refresh") {
+    await requireAdmin(req);
+    await rateLimit(req,"catalog-refresh",6,60_000);
+    const catalog = await catalogueCache.get({forceRefresh:true});
+    return json(res,200,{ok:true,cache:catalogueCache.status(),products:catalog.products.length});
+  }
   if (req.method === "GET" && url.pathname === "/api/admin/system-status") {
-    requireAdmin(req);
+    await requireAdmin(req);
     return json(res, 200, { ok: true, ...(await systemStatus()) });
   }
   if (req.method === "POST" && url.pathname === "/api/admin/shop-settings") {
-    requireAdmin(req);
+    await requireAdmin(req);
     const input = await bodyJson(req);
     const save = async () => {
       const data = await updateShopSettings((existing) => {
         const patch = { ...input };
         if (patch.customerCare) {
           const care = normalizeCustomerCare({ ...existing.customerCare, ...patch.customerCare, events: { ...existing.customerCare.events, ...patch.customerCare.events } });
+          if (care.requireVerifiedEmailForOrders && !care.securityEmailsEnabled) throw Object.assign(new Error("Keep account emails enabled while email verification is required for orders."), { status: 400 });
           care.emailEnabledAt = care.emailEnabled && (!existing.customerCare.emailEnabled || !existing.customerCare.emailEnabledAt) ? new Date().toISOString() : existing.customerCare.emailEnabledAt;
           patch.customerCare = care;
         }
         return { ...existing, ...patch };
       });
-      if (input.customerCare) await portalControl.setEmailEnabled(data.settings.customerCare.emailEnabled);
+      if (input.customerCare) {
+        await portalControl.setEmailEnabled(data.settings.customerCare.emailEnabled);
+        await securityEmailRetries.setEmailEnabled(data.settings.customerCare.securityEmailsEnabled);
+      }
       return data;
     };
     const data = await (input.customerCare ? withPortalControlLock(save) : save());
@@ -3641,15 +3434,15 @@ async function handleApi(req, res, url) {
   }
   const adminProofMatch = url.pathname.match(/^\/api\/admin\/orders\/([^/]+)\/proof$/);
   if (req.method === "GET" && adminProofMatch) {
-    requireAdmin(req);
-    const data = await readOrdersData();
-    const order = data.orders.find((entry) => entry.id === decodeURIComponent(adminProofMatch[1]));
+    await requireAdmin(req);
+    const order = await records.orders.get(decodeURIComponent(adminProofMatch[1]));
     const body = await readProofFile(order?.proof);
     if (!body) throw Object.assign(new Error("Proof of payment was not found."), { status: 404 });
-    const filename = order.proof.filename || "proof-of-payment";
+    const filename = String(order.proof.filename || "proof-of-payment").replace(/[^\w.\- ]/g,"_").slice(0,160);
     res.writeHead(200, {
-      "content-type": order.proof.contentType || contentTypes[path.extname(filename).toLowerCase()] || "application/octet-stream",
-      "content-disposition": `inline; filename="${filename.replaceAll('"', "")}"`,
+      "content-type": proofContentType(body) || "application/octet-stream",
+      "content-disposition": `attachment; filename="${filename}"`,
+      "content-security-policy": "sandbox; default-src 'none'; frame-ancestors 'none'",
       "cache-control": "no-store",
       "x-content-type-options": "nosniff",
     });
@@ -3658,14 +3451,12 @@ async function handleApi(req, res, url) {
   }
   if (req.method === "GET" && url.pathname === "/api/internal/orders/confirmed") {
     requireInternal(req);
-    const data = await readOrdersData();
-    const orders = data.orders.filter(orderReadyForRetailShark).map(retailSharkOrder);
+    const orders = (await listSharkOrders(false)).map(retailSharkOrder);
     return json(res, 200, { ok: true, orders });
   }
   if (req.method === "GET" && url.pathname === "/api/internal/orders/history") {
     requireInternal(req);
-    const data = await readOrdersData();
-    const orders = data.orders.filter(orderCompletedForRetailShark).map(retailSharkOrder);
+    const orders = (await listSharkOrders(true)).map(retailSharkOrder);
     return json(res, 200, { ok: true, orders });
   }
   const trackingMatch = url.pathname.match(/^\/api\/internal\/orders\/([^/]+)\/tracking$/);
@@ -3697,7 +3488,7 @@ async function serveStatic(res, pathname) {
     const body = await readFile(filePath);
     const ext = path.extname(filePath).toLowerCase();
     const cache = requested.startsWith("/product-images/") || requested.startsWith("/assets/") ? "public, max-age=86400" : "no-store";
-    res.writeHead(200, { "content-type": contentTypes[ext] || "application/octet-stream", "cache-control": cache });
+    res.writeHead(200, { ...securityHeaders, "content-type": contentTypes[ext] || "application/octet-stream", "cache-control": cache });
     res.end(body);
   } catch {
     text(res, 404, "Not found");
@@ -3711,7 +3502,9 @@ export async function handleRequest(req, res) {
     return await serveStatic(res, url.pathname);
   } catch (error) {
     if (url.pathname === "/api/support" && !error.status) return json(res, 503, { ok: false, error: "Customer support is temporarily unavailable. Please try again shortly." });
-    json(res, error.status || 500, { ok: false, error: error.message || "Something went wrong.", ...(error.code ? { code: error.code } : {}) });
+    const status = error.status || 500;
+    if (status >= 500) console.error(JSON.stringify({ event: "request_failed", path: url.pathname, status, code: /^[A-Z_0-9]+$/.test(error.code || "") ? error.code : "INTERNAL_ERROR" }));
+    json(res, status, { ok: false, error: status >= 500 && !["PORTAL_PAUSED", "PORTAL_CONTROL_UNAVAILABLE"].includes(error.code) ? "The service is temporarily unavailable. Please try again shortly." : error.message || "Something went wrong.", ...(["PORTAL_PAUSED", "PORTAL_CONTROL_UNAVAILABLE", "EMAIL_VERIFICATION_REQUIRED", "EMAIL_LINK_INVALID"].includes(error.code) ? { code: error.code } : {}) }, error.retryAfterSeconds ? { "retry-after": String(error.retryAfterSeconds) } : {});
   }
 }
 

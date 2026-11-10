@@ -9,4 +9,4 @@ export default async (_request, context) => {
 };
 
 // Idle runs inspect only the lightweight control/retry store, never Postgres.
-export const config = { schedule: "*/5 * * * *" };
+export const config = { schedule: "* * * * *" };

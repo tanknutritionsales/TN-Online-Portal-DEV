@@ -137,7 +137,7 @@ try {
   const smoke = spawnSync(process.execPath, [path.join(path.dirname(fileURLToPath(import.meta.url)), "smoke-local.mjs")], { env: { ...process.env, ONLINE_PORTAL_URL: portal.url, INTERNAL_API_TOKEN: "dev-internal-token" }, encoding: "utf8", windowsHide: true });
   assert.equal(smoke.status, 0, smoke.stdout + smoke.stderr);
   console.log("Existing order/fulfillment smoke passed on isolated local data.");
-  const care = await admin.request("/api/admin/customer-care");
+  const care = await admin.request("/api/admin/notifications");
   assert.equal(care.emailSetup.configured, false);
   assert.ok(care.emails.length >= 3);
   assert.ok(care.emails.every((email) => email.status === "setup_required"));
@@ -146,9 +146,11 @@ try {
   assert.equal(ownOrders[0].customerStatus, "Processing");
   await second.post("/api/support", { orderId: ownOrders[0].id, message: "Cross-customer order test" }, 404);
   const shipOptions = { method: "POST", body: "{}", headers: { "x-internal-token": "dev-internal-token" } };
+  await admin.request(`/api/internal/orders/${ownOrders[0].id}/ship`, { ...shipOptions, status: 409 });
+  await admin.request(`/api/internal/orders/${ownOrders[0].id}/tracking`, { ...shipOptions, body: JSON.stringify({courier:"Courier Guy",number:"QA-TRACK",url:"https://example.com/track"}) });
   await admin.request(`/api/internal/orders/${ownOrders[0].id}/ship`, shipOptions);
-  const firstShipmentCount = (await admin.request("/api/admin/customer-care")).emails.length;
+  const firstShipmentCount = (await admin.request("/api/admin/notifications")).emails.length;
   await admin.request(`/api/internal/orders/${ownOrders[0].id}/ship`, shipOptions);
-  assert.equal((await admin.request("/api/admin/customer-care")).emails.length, firstShipmentCount);
+  assert.equal((await admin.request("/api/admin/notifications")).emails.length, firstShipmentCount);
   console.log("Customer experience checks passed: basket isolation, catalog facts, message concurrency, safe email retries, support ownership, settings preservation and order flow.");
 } finally { await portal.close(); }
